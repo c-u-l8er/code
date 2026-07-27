@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# State never lives in this repo - it defaults to ../.amp (see AMP_HOME).
+# These entries are belt-and-braces in case someone points AMP_HOME here.
+.amp/
+.secrets.json
+.board.json
+config.json
+packets/
+rulings/

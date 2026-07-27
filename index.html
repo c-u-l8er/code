@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>code &mdash; [&amp;] orchestration console</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="amp">[&amp;]</span>
+    <span class="title">code</span>
+    <span class="sub">orchestration console</span>
+  </div>
+  <div class="health" id="health"></div>
+  <div class="actions">
+    <span class="credit" id="credit"></span>
+    <button id="btn-poll" class="primary">Poll</button>
+  </div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<main>
+  <section class="lanes">
+    <div class="section-head">
+      <h2>Lanes</h2>
+      <span class="muted" id="polled">never polled</span>
+    </div>
+    <div id="lane-list" class="lane-list"></div>
+  </section>
+
+  <section class="detail">
+    <nav class="tabs">
+      <button class="tab active" data-tab="dispatch">Dispatch</button>
+      <button class="tab" data-tab="diff">Diff</button>
+      <button class="tab" data-tab="ask">Ask GPT-5.6</button>
+      <button class="tab" data-tab="rulings">Rulings</button>
+    </nav>
+
+    <div class="pane active" id="pane-dispatch">
+      <div class="pane-head">
+        <h3>Dispatch to <span class="lane-chip" id="d-lane">&mdash;</span></h3>
+        <div class="row">
+          <label>branch <input id="d-branch" type="text" placeholder="main"></label>
+          <label>best-of <input id="d-attempts" type="number" min="1" max="5" value="1"></label>
+        </div>
+      </div>
+      <textarea id="d-prompt" rows="14" placeholder="Task for the Codex Cloud worker.
+
+Write it self-contained: the cloud CLI has no message/answer channel, so a task
+that stops to ask a question cannot be replied to headlessly."></textarea>
+      <div class="pane-foot">
+        <button id="btn-dispatch" class="primary">Dispatch</button>
+        <span class="muted" id="d-status"></span>
+      </div>
+    </div>
+
+    <div class="pane" id="pane-diff">
+      <div class="pane-head">
+        <h3>Diff for <span class="lane-chip" id="f-lane">&mdash;</span></h3>
+        <div class="row">
+          <label>attempt <input id="f-attempt" type="number" min="1" max="5" placeholder="1"></label>
+          <button id="btn-loaddiff">Load</button>
+          <button id="btn-apply" class="danger">Apply locally</button>
+        </div>
+      </div>
+      <pre id="f-out" class="diff">Poll a lane, then Load.</pre>
+    </div>
+
+    <div class="pane" id="pane-ask">
+      <div class="pane-head">
+        <h3>Escalate <span class="lane-chip" id="a-lane">&mdash;</span> to GPT-5.6</h3>
+        <div class="row">
+          <label>model <select id="a-model"></select></label>
+        </div>
+      </div>
+      <textarea id="a-question" rows="8" placeholder="What is blocking, and what ruling do you need?
+
+The packet auto-includes: recent commits, working-tree status, the uncommitted
+diff, recent dispatches, and the lane's cloud tasks."></textarea>
+      <div class="pane-foot">
+        <button id="btn-ask" class="primary">Ask</button>
+        <span class="muted" id="a-status"></span>
+      </div>
+      <pre id="a-out" class="ruling"></pre>
+    </div>
+
+    <div class="pane" id="pane-rulings">
+      <div class="pane-head"><h3>Saved rulings</h3></div>
+      <div id="r-list" class="ruling-list"></div>
+      <pre id="r-out" class="ruling"></pre>
+    </div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
