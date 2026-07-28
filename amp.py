@@ -4828,6 +4828,46 @@ def goal_dispatch(gid: str) -> dict:
                     task_id=out.get("task_id"), goal_task=nxt["id"])
 
 
+def run_check(cmd: str, cwd: Path) -> tuple[int | None, str]:
+    """Run one done-item's check. Returns (exit code or None if it timed out, output).
+
+    Not `subprocess.run(..., timeout=)`, which is a hang waiting to happen here.
+    On timeout that kills the shell and then drains the pipes again with NO
+    second timeout - so a check that started anything outliving its shell (a dev
+    server, a watcher, a stray build daemon) leaves a grandchild holding the
+    write end, and the drain blocks forever. The review thread never returns, so
+    the goal keeps a live `reviewing_pid`, so `idle_goals` skips it on purpose,
+    and the one goal that can never be recovered is the one that hung.
+
+    So: own process group, kill the GROUP, and give the drain a deadline of its
+    own. A check that will not die is reported as a check that would not die.
+    """
+    p = subprocess.Popen(cmd, shell=True, cwd=cwd, text=True, start_new_session=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         env={**os.environ, **claude_env()})
+    try:
+        body, _ = p.communicate(timeout=GOAL_CHECK_TIMEOUT)
+        return p.returncode, (body or "").strip()
+    except subprocess.TimeoutExpired:
+        pass
+    for sig, grace in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(p.pid, sig)
+        except OSError:
+            pass
+        try:
+            body, _ = p.communicate(timeout=grace)
+            return None, (f"(no result after {GOAL_CHECK_TIMEOUT}s - timed out)\n"
+                          + (body or "").strip())
+        except subprocess.TimeoutExpired:
+            continue
+    # Killing the group did not free the pipe, so something outside it holds the
+    # write end. Reading further would block for good; say so and let go.
+    return None, (f"(no result after {GOAL_CHECK_TIMEOUT}s - timed out, and it "
+                  f"survived SIGKILL of its process group with the pipe still "
+                  f"held. Output is unreadable; treat this check as unrun.)")
+
+
 def run_goal_checks(gid: str) -> list[dict]:
     """Run every done-item's check in the lane worktree. Exit code is the answer."""
     g = load_goal(gid)
@@ -4840,14 +4880,9 @@ def run_goal_checks(gid: str) -> list[dict]:
         if not cmd:
             continue
         try:
-            p = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True, text=True,
-                               timeout=GOAL_CHECK_TIMEOUT, env={**os.environ, **claude_env()})
-            body = ((p.stdout or "") + (p.stderr or "")).strip()
-            out.append({"text": d["text"], "check": cmd, "exit": p.returncode,
+            code, body = run_check(cmd, wt)
+            out.append({"text": d["text"], "check": cmd, "exit": code,
                         "output": body[-1500:]})
-        except subprocess.TimeoutExpired:
-            out.append({"text": d["text"], "check": cmd, "exit": None,
-                        "output": f"(no result after {GOAL_CHECK_TIMEOUT}s - timed out)"})
         except OSError as e:
             out.append({"text": d["text"], "check": cmd, "exit": None,
                         "output": f"(could not run: {e})"})
