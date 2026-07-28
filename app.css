@@ -47,9 +47,52 @@ header {
 .health .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
 .health .dot.ok { background: var(--ok); }
 .health .dot.bad { background: var(--bad); }
+/* Off is not broken. A role you switched off is hollow and dim; a role that is
+   on and cannot answer is solid red. The two want different things from you. */
+.health .dot.off { background: transparent; border: 1px solid var(--muted); }
+.health .h.off { opacity: .5; }
+.health .h b { color: var(--fg); font-weight: 600; }
 
 .actions { display: flex; align-items: center; gap: 10px; }
 .credit { color: var(--muted); font-size: 11px; }
+
+/* Why the workspace select will not move, beside the select itself. */
+.ws-why { font-size: 11px; color: var(--muted); }
+.ws-why:empty { display: none; }
+.ws-why.locked { color: var(--warn, #d3a03c); }
+.ws-why.err { color: var(--bad); }
+#ws-pick.blocked { border-color: var(--warn, #d3a03c); }
+
+/* The three roles in Settings. */
+/* Two lines, not four columns. Every option now carries its own reason for
+   being unpickable and every status is a sentence, and four columns in a
+   ~570px sheet squeezed the last one until it wrapped one word per line. The
+   name and the control are what you act on, so they get the top line; the
+   description and the reason are what you read, so they get the second. */
+.role-row {
+  display: grid;
+  /* Wide enough for "answers when a worker escalates" to sit on two lines
+     rather than six. The left column carries the description now, not just
+     the name, so it is sized for the longer of the two. */
+  grid-template-columns: 152px minmax(0, 1fr);
+  grid-template-areas:
+    "name  model"
+    "does  status";
+  align-items: center;
+  gap: 4px 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+.role-row .switch { grid-area: name; }
+.role-row .role-model { grid-area: model; width: 100%; min-width: 0; }
+.role-row .role-does { grid-area: does; }
+.role-row .role-status { grid-area: status; }
+.role-row .role-model option:disabled { color: var(--muted); }
+.role-row.off { opacity: .6; }
+.role-row .role-name { font-weight: 600; text-transform: capitalize; }
+.role-row .role-does { color: var(--muted); }
+.role-row .switch { margin: 0; }
 
 button {
   background: var(--panel2);
@@ -81,6 +124,47 @@ button.danger:hover:not(:disabled) { background: #450a0a; }
 .banner.bad { background: #3f1414; border-color: #7f1d1d; color: #fca5a5; }
 .hidden { display: none; }
 
+/* ---------- running work ---------- */
+
+.running {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  align-items: center;
+  padding: 7px 16px;
+  background: var(--panel2);
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+.run { display: flex; align-items: center; gap: 7px; }
+.run .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.run.near .dot { background: var(--bad); animation-duration: .6s; }
+.run.near .muted { color: var(--warn); }
+@keyframes pulse { 50% { opacity: .25; } }
+.run .stop { padding: 2px 9px; font-size: 11px; border-color: #7f1d1d; color: #fca5a5; }
+.run .stop:hover:not(:disabled) { background: #450a0a; }
+.run .restart { padding: 2px 9px; font-size: 11px; border-color: #78350f; color: var(--warn); }
+.run .restart:hover:not(:disabled) { background: #451a03; }
+
+/* What the worker is doing gets the width; what it costs the machine trails
+   after it, because the cost is only ever the second question. */
+.run .what {
+  color: var(--fg); font-family: var(--mono); font-size: 10.5px;
+  max-width: 46ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: inline-block; vertical-align: bottom;
+}
+.run .cost { opacity: .75; }
+/* A hung worker has to read differently from a busy one at a glance - the
+   whole point of the row is that "running" stopped meaning anything. */
+.run.stalled { color: var(--bad); }
+.run.stalled .dot { background: var(--bad); animation: none; }
+.run.stalled .what { color: var(--warn); }
+
 /* ---------- layout ---------- */
 
 main {
@@ -107,6 +191,19 @@ main {
 }
 .section-head h2 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
 .muted { color: var(--muted); font-size: 11px; }
+
+.section-head #btn-lane-add { padding: 2px 8px; font-size: 11px; }
+
+/* Sits under the header rather than over the list: adding a lane is rare, and
+   nothing about it should cover the lanes you already have. */
+.lane-add {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel2);
+}
+.lane-add input { width: 100%; }
+.lane-add .row { display: flex; gap: 6px; }
+.lane-add .msg { font-size: 11px; color: var(--muted); line-height: 1.45; }
+.lane-add .msg.err { color: var(--bad); }
 
 .lane-list { overflow-y: auto; flex: 1 1 auto; }
 
@@ -135,10 +232,17 @@ main {
 .pill.completed, .pill.succeeded { color: var(--ok); border-color: #14532d; }
 .pill.failed, .pill.error, .pill.cancelled { color: var(--bad); border-color: #7f1d1d; }
 .pill.running, .pill.pending, .pill.queued { color: var(--accent); border-color: #1e3a8a; }
+.pill.be-claude { color: var(--amp); border-color: #7c4a12; }
+.pill.be-codex { color: var(--muted); }
+.lane .n { gap: 6px; }
+.lane .n .name { margin-right: auto; }
+.lane .t .cost { color: var(--muted); font-variant-numeric: tabular-nums; }
 
 /* ---------- detail ---------- */
 
-.detail { display: flex; flex-direction: column; min-height: 0; }
+/* min-width:0 for the same reason as min-height:0 - a grid item will not
+   shrink below its content, so one wide table widens the whole column. */
+.detail { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 
 .tabs { display: flex; gap: 2px; padding: 8px 14px 0; border-bottom: 1px solid var(--line); }
 .tab {
@@ -176,7 +280,7 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 
 .pane-foot { display: flex; align-items: center; gap: 12px; }
 
-pre.diff, pre.ruling {
+pre.diff, .ruling {
   flex: 1 1 auto;
   overflow: auto;
   margin: 0;
@@ -189,7 +293,7 @@ pre.diff, pre.ruling {
   font-size: 12px;
   min-height: 120px;
 }
-pre.ruling { line-height: 1.65; }
+.ruling { line-height: 1.65; }
 .diff .add { color: var(--ok); }
 .diff .del { color: var(--bad); }
 .diff .hunk { color: var(--accent); }
@@ -206,7 +310,673 @@ pre.ruling { line-height: 1.65; }
 }
 .ruling-item:hover { background: var(--panel2); }
 
+/* ---------- transcript ---------- */
+
+.log {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 4px;
+}
+
+.turn {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 8px 10px;
+  background: var(--panel);
+}
+.turn .who {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+/* Inside the label row rather than over the body: a long first line of output
+   must never end up underneath the time it arrived. */
+.turn .at { flex: none; text-transform: none; letter-spacing: 0; opacity: .65; }
+
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 8px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--amp);
+}
+.live .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amp);
+  animation: pulse 1.4s infinite;
+}
+.turn .body { white-space: pre-wrap; word-break: break-word; }
+
+.turn.you { border-left: 3px solid var(--accent); }
+.turn.worker { border-left: 3px solid var(--amp); }
+.turn.thinking { border-left: 3px solid var(--line); color: var(--muted); font-style: italic; }
+.turn.tool { border-left: 3px solid #7c3aed; background: var(--panel2); }
+.turn.tool .who { color: #a78bfa; }
+.turn.result { border-left: 3px solid var(--line); background: var(--bg); color: var(--muted); }
+.turn.result.bad { border-left-color: #7f1d1d; color: #fca5a5; }
+.log .empty.err { color: var(--bad); }
+
+/* ---------- consult thread ---------- */
+
+.turn.ct-gpt { border-left: 3px solid var(--amp); }
+.turn.ct-you { border-left: 3px solid var(--accent); }
+.turn.ct-packet { border-left: 3px solid var(--line); background: var(--bg); color: var(--muted); }
+.turn.ct-supplied { border-left: 3px solid #7c3aed; background: var(--panel2); color: var(--muted); }
+.turn.ct-worker { border-left: 3px solid var(--ok); background: var(--panel2); }
+.turn.ct-note { border-left: 3px solid var(--line); color: var(--muted); font-style: italic; }
+.turn .who .dm-open { padding: 0 6px; font-size: 10px; margin-left: 6px; }
+
+/* What the architect says it is still missing, after everything findable on
+   disk has been fetched and everything observable has been sent for. */
+.needs {
+  border: 1px solid var(--warn);
+  border-left-width: 3px;
+  border-radius: 4px;
+  padding: 7px 10px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--warn);
+  flex: 0 0 auto;
+}
+.needs b {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 3px;
+}
+.needs b ~ b { margin-top: 7px; }
+/* Waiting on a worker is not the same as waiting on you, and the colour is the
+   fastest way to say which of the two this is. */
+.needs.busy { border-color: var(--line); color: var(--muted); }
+
+/* ---------- earlier chats ---------- */
+
+.hist-list {
+  flex: 0 0 auto;
+  max-height: 46%;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+  padding-right: 4px;
+}
+.hist {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line);
+  border-radius: 4px;
+  padding: 7px 10px;
+  font-size: 12px;
+}
+.hist.bad { border-left-color: var(--warn); }
+.h-top { display: flex; justify-content: space-between; gap: 10px; font-size: 11px; }
+.h-q { margin: 3px 0; color: var(--fg); word-break: break-word; }
+.h-sym { color: var(--warn); font-size: 11px; }
+.h-acts { display: flex; gap: 6px; margin-top: 6px; }
+.h-acts button { padding: 2px 8px; font-size: 11px; }
+
+/* ---------- orchestrator dock ---------- */
+
+.dock {
+  position: fixed;
+  right: 18px;
+  bottom: 0;
+  width: 460px;
+  max-width: 94vw;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 -4px 24px rgba(0, 0, 0, .45);
+  z-index: 5;
+}
+
+.dock-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  cursor: default;
+}
+.dock-title { color: var(--amp); font-weight: 700; flex: 0 0 auto; white-space: nowrap; }
+.dock-head .muted { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dock-toggle { cursor: pointer; color: var(--muted); padding: 0 4px; }
+.dock-toggle:hover { color: var(--fg); }
+
+.dock-feed {
+  /* This is the window everything is meant to be run from, so it gets real
+     room to hold an answer rather than a ticker's worth. */
+  height: min(52vh, 520px);
+  overflow-y: auto;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dock.collapsed .dock-feed,
+.dock.collapsed .dock-compose { display: none; }
+
+.dm { display: flex; align-items: baseline; gap: 7px; font-size: 12px; line-height: 1.5; }
+.dm-at { color: var(--muted); font-size: 10px; flex: 0 0 auto; }
+.dm-body {
+  flex: 1 1 auto;
+  padding: 6px 9px;
+  border-radius: 8px;
+  background: var(--panel2);
+  word-break: break-word;
+}
+.dm-lane { color: var(--amp); }
+.dm.out .dm-body { background: #16233b; }
+.dm.in .dm-body { background: #14251a; }
+.dm.in.bad .dm-body { background: #2a1414; }
+.dm.note .dm-body { background: transparent; border: 1px dashed var(--line); color: var(--muted); }
+.dm.esc .dm-body { background: #2b2410; border-left: 3px solid var(--warn); }
+.dm.rule .dm-body { background: #241a33; border-left: 3px solid #a78bfa; }
+
+/* The orchestrator conversation. It is the only part of the feed that is a
+   conversation rather than a summary, so it is the only part that gets width. */
+.dm.said .dm-body { background: #16233b; }
+.dm.amp .dm-body { background: var(--panel2); border-left: 3px solid var(--amp); }
+.dm.amp.bad .dm-body { background: #2a1414; border-left-color: var(--bad); }
+.dm.amp .dm-body.md { padding: 8px 11px; }
+.dm.amp .spend { display: block; margin-top: 6px; font-size: 10px; }
+.dm.working .dm-body { color: var(--muted); }
+.dm.working .dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amp);
+  animation: pulse 1.1s infinite;
+}
+.pill.auto { color: var(--warn); border-color: #6b4c12; }
+.pill.needs { color: var(--bad); border-color: #7f1d1d; }
+.dm-open {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  font-size: 10px;
+  border-radius: 8px;
+}
+
+.dock-compose { display: flex; gap: 6px; padding: 8px 10px; border-top: 1px solid var(--line); }
+.dock-compose #dock-text { flex: 1 1 auto; width: auto; }
+.dock-compose select { max-width: 96px; }
+
+/* ---------- sign-in ---------- */
+
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, .6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+.modal.hidden { display: none; }
+.sheet {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 20px 22px;
+  width: 520px;
+  max-width: 92vw;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.sheet h3 { margin: 0; font-size: 14px; }
+.sheet p { margin: 0; line-height: 1.6; }
+.sheet #si-code { flex: 1 1 auto; width: auto; }
+.sheet a { color: var(--accent); }
+.sheet.wide { width: 620px; }
+
+.switch { display: flex; align-items: center; gap: 9px; cursor: pointer; }
+.switch input { width: auto; margin: 0; cursor: pointer; }
+
+/* The backend choice sits above the switches because it decides whether they
+ * are relevant at all, and its readiness note reads on the same line. */
+.setrow { align-items: center; gap: 10px; }
+.setrow select { width: auto; }
+
+/* The point of the list is the difference between "you clicked it" and "it
+ * happened while you were elsewhere", so that is what the styling separates. */
+.spend { display: flex; flex-direction: column; gap: 1px; max-height: 300px; overflow: auto; }
+.spend .s {
+  display: grid; grid-template-columns: 150px 1fr; gap: 10px;
+  padding: 6px 8px; border-left: 2px solid var(--line); font-size: 11.5px;
+}
+.spend .s.auto { border-left-color: var(--warn); }
+.spend .s .n { color: var(--fg); }
+.spend .s .w { color: var(--muted); line-height: 1.5; }
+.spend .s .tag { color: var(--warn); }
+.spend.off .s { opacity: 0.45; text-decoration: line-through; }
+.spend.off .s .tag { text-decoration: none; }
+
+/* The device code is the one thing on the sheet that has to be read off the
+ * screen and typed somewhere else, so it is set to be copied by eye. */
+.pairing {
+  font-family: var(--mono);
+  font-size: 22px;
+  letter-spacing: 3px;
+  text-align: center;
+  padding: 10px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  color: var(--accent);
+  user-select: all;
+  cursor: copy;
+}
+.pairing.hidden { display: none; }
+
+.banner button { margin-left: 10px; padding: 3px 10px; font-size: 11px; }
+
 .empty { color: var(--muted); padding: 20px 14px; font-size: 12px; }
 .spin { color: var(--accent); }
 .err { color: var(--bad); }
+.warnt { color: var(--warn); }
 .good { color: var(--ok); }
+
+/* ---------- rendered markdown ---------- */
+/*
+ * Rulings and worker reports arrive as markdown. Rendering them is not
+ * decoration: a verdict table read as raw pipes is unreadable exactly when it
+ * matters most.
+ */
+/* .turn .body already sets pre-wrap and outranks a bare class. */
+.md, .turn .body.md { white-space: normal; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 8px; }
+.md h3, .md h4, .md h5, .md h6 {
+  margin: 14px 0 6px;
+  font-weight: 600;
+  color: var(--fg);
+  line-height: 1.3;
+}
+.md h3 { font-size: 15px; color: var(--amp); }
+.md h4 { font-size: 13px; }
+.md h5, .md h6 { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
+.md ul, .md ol { margin: 0 0 8px; padding-left: 20px; }
+.md li { margin: 2px 0; }
+.md hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
+.md blockquote {
+  margin: 0 0 8px;
+  padding: 2px 0 2px 10px;
+  border-left: 2px solid var(--line);
+  color: var(--muted);
+}
+.md code {
+  font-family: var(--mono);
+  font-size: .92em;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 4px;
+  word-break: break-word;
+}
+.md pre.code {
+  margin: 0 0 8px;
+  padding: 9px 11px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow-x: auto;
+}
+.md pre.code code { background: none; border: 0; padding: 0; white-space: pre; }
+/* A flex item defaults to min-width:auto, so a wide code block or table
+   pushes the whole pane sideways instead of scrolling inside itself. */
+.turn, .turn .body { min-width: 0; }
+.md pre.code, .md table { max-width: 100%; }
+.md a { color: var(--accent); }
+.md strong { color: var(--fg); font-weight: 600; }
+.md table {
+  border-collapse: collapse;
+  margin: 0 0 8px;
+  font-size: 12px;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+.md th, .md td {
+  border: 1px solid var(--line);
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+.md th { background: var(--panel2); color: var(--muted); font-weight: 600; white-space: nowrap; }
+
+/* ---------------------------------------------------------------- findings
+   What the work said about the doctrine. Deliberately not styled as an error:
+   most of these are good news, and the one kind that is not says so in a word. */
+
+.findings {
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.fi {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 7px 14px;
+  font-size: 12px;
+  border-left: 3px solid var(--amp);
+}
+.fi.contradicted { border-left-color: var(--bad); }
+.fi.proposed { border-left-color: var(--warn); }
+.fi b { color: var(--amp); font-weight: 600; }
+.fi-tag {
+  flex: none;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  font-size: 10px;
+  color: var(--muted);
+}
+.fi.contradicted .fi-tag { color: var(--bad); }
+.fi-x {
+  margin-left: auto;
+  flex: none;
+  padding: 1px 8px;
+  border-radius: 10px;
+  cursor: pointer;
+  background: none;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+}
+.fi-x:hover { color: var(--fg); border-color: var(--muted); }
+.fi.more { color: var(--muted); border-left-color: transparent; font-size: 11px; cursor: pointer; }
+.fi.more:hover { color: var(--fg); }
+
+/* ---------------------------------------------------------- obligations
+   Standing chores whose check currently says no. Deliberately quieter than a
+   finding: this is a queue, not an alarm. */
+.obligations {
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.ob {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 7px 14px;
+  font-size: 12px;
+  border-left: 3px solid var(--warn);
+}
+/* A check that could not run has no verdict at all, so it reads as a fault in
+   the harness rather than as drift in the thing being checked. */
+.ob.broken { border-left-color: var(--muted); }
+.ob b { color: var(--fg); font-weight: 600; }
+.ob-tag {
+  flex: none;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  font-size: 10px;
+  color: var(--warn);
+}
+.ob.broken .ob-tag { color: var(--muted); }
+.ob .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* No `margin-left: auto`. The dock is fixed over the right 460px of the window
+   with a higher z-index, so anything flushed right in one of these strips is
+   painted and then swallowed - it looks like a button and does nothing. */
+.ob-x {
+  flex: none;
+  padding: 1px 8px;
+  border-radius: 10px;
+  cursor: pointer;
+  background: none;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+}
+.ob-x:hover { color: var(--fg); border-color: var(--muted); }
+.ob-x:disabled { opacity: .5; cursor: default; }
+
+/* ---------------------------------------------------------------- watch
+   What the harness can see is wrong. Above everything, because a problem you
+   have to click to find is one you find late. */
+
+.watch {
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.ob {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 7px 14px;
+  font-size: 12px;
+  border-left: 3px solid var(--muted);
+  cursor: pointer;
+}
+.ob:hover { background: var(--panel2); }
+.ob.high { border-left-color: var(--bad); }
+.ob.medium { border-left-color: var(--warn); }
+.ob b { color: var(--amp); font-weight: 600; }
+.ob .muted { font-style: italic; }
+.ob-x {
+  margin-left: auto;
+  padding: 0 6px;
+  background: none;
+  border: 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* ---------------------------------------------------------------- goals */
+
+.goal-list { display: flex; flex-direction: column; gap: 9px; padding: 4px 0 14px; }
+.goal {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel);
+  padding: 10px 12px;
+  cursor: pointer;
+}
+.goal:hover { border-color: var(--muted); }
+.goal.open { border-color: var(--accent); cursor: default; }
+.goal.done { opacity: .72; }
+.goal-head { display: flex; gap: 9px; align-items: baseline; }
+.goal-head b { font-size: 13px; }
+.goal-sub { color: var(--muted); font-size: 11px; margin-top: 5px; }
+.goal-body { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.goal-body h4 {
+  margin: 12px 0 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--muted);
+}
+.goal-body h4:first-child { margin-top: 0; }
+/* The case for the goal, in the architect's own words. Muted because it is
+   background: the conditions below it are what actually decide anything. */
+.gwhy { font-size: 12px; color: var(--muted); line-height: 1.6; }
+.gwhy code { color: var(--fg); }
+/* The publish dry run: what would be pushed, and the evidence for it. */
+.gpub { font-size: 11px; line-height: 1.6; }
+.gpub:not(:empty) { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
+.gpub code { color: var(--fg); }
+.prlink { color: var(--accent); font-size: 11px; }
+.goal-acts { margin-top: 14px; gap: 8px; }
+
+.tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  text-transform: lowercase;
+}
+.tag.running { color: var(--accent); border-color: #1e3a5f; }
+.tag.blocked { color: var(--bad); border-color: #7f1d1d; }
+.tag.done { color: var(--ok); border-color: #14532d; }
+.tag.dropped { text-decoration: line-through; }
+
+.bar {
+  display: inline-block;
+  width: 74px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--line);
+  vertical-align: middle;
+  overflow: hidden;
+}
+.bar i { display: block; height: 100%; background: var(--ok); }
+
+.cond { display: flex; gap: 8px; padding: 4px 0; font-size: 12px; }
+.cond .box { color: var(--muted); width: 12px; flex: none; }
+.cond.met .box { color: var(--ok); }
+.cond .check {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+.cond .ev { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.gtask { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; font-size: 12px; }
+.gtask.done { color: var(--muted); }
+.gl { font-size: 11px; color: var(--muted); padding: 1px 0; }
+.gq {
+  border: 1px solid #7f1d1d;
+  background: #2a1414;
+  border-radius: 6px;
+  padding: 9px 11px;
+  margin-bottom: 12px;
+  font-size: 12px;
+}
+.gq b { color: var(--bad); display: block; margin-bottom: 5px; }
+.gq .row { margin-top: 8px; }
+.gq input { flex: 1; }
+
+.ob.more { color: var(--muted); border-left-color: transparent; font-size: 11px; }
+.ob.more:hover { color: var(--fg); }
+
+/* An armed session: what "Reply to last" will actually continue. */
+.resume {
+  margin: 0 0 6px; padding: 6px 10px; border-radius: 6px;
+  background: #1d2a1d; border: 1px solid #2f4a2f; color: #b7d3b7;
+  font-size: 12px; display: flex; align-items: center; gap: 6px;
+}
+.resume b { color: #d8ecd8; font-weight: 600; }
+.ob-go {
+  margin-left: 8px; padding: 1px 8px; border-radius: 10px; cursor: pointer;
+  background: #23303f; border: 1px solid #3a5570; color: #cfe2f5; font-size: 11px;
+}
+.ob-go:hover { background: #2c3d51; }
+
+/* ------------------------------------------------------------- direction
+   The tab about what the work is for. Sections are separated by rule rather
+   than boxed: this is a document to be read top to bottom, not a dashboard of
+   independent widgets, and boxing each part would invite skimming one. */
+.direction { padding: 4px 2px 40px; overflow: auto; }
+.dsec { border-top: 1px solid var(--line); padding: 14px 0 4px; }
+.dsec:first-child { border-top: none; }
+.dsec h4 { margin: 0 0 8px; font-size: 12px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.dsec h5 { margin: 16px 0 6px; font-size: 11px; color: var(--muted); font-weight: 600; }
+.dsec .md { font-size: 12.5px; line-height: 1.7; }
+/* The thesis is the one thing on this page that is not a list of items. */
+.dsec.thesis .md { font-size: 13px; color: var(--fg); }
+.dfoot { font-size: 11px; padding: 16px 0 0; border-top: 1px solid var(--line); margin-top: 18px; }
+
+/* A proposed objective. Bordered, because unlike everything above it this is a
+   thing that will spend money and start a worker the moment it is adopted. */
+.dprop {
+  border: 1px solid var(--line); border-left: 2px solid var(--accent);
+  border-radius: 6px; padding: 9px 11px; margin-bottom: 8px; font-size: 12px;
+}
+.dprop b { color: var(--fg); font-weight: 600; display: block; margin-bottom: 4px; }
+.dprop .row { margin-top: 8px; align-items: center; }
+.dprop .muted { line-height: 1.6; }
+
+/* An open question is not an objective and does not get the accent border -
+   nothing here can be adopted, only answered, and only by Travis. */
+.dq { border-left: 2px solid var(--line); padding: 6px 0 6px 10px; margin-bottom: 8px; font-size: 12px; }
+.dq b { color: var(--fg); font-weight: 600; }
+.dq .settle { color: var(--muted); font-size: 11px; margin-top: 3px; }
+.dq .settle::first-line { color: var(--muted); }
+.dqs { margin-top: 12px; }
+.dq-x, .dp-x {
+  margin-left: 6px; padding: 1px 8px; border-radius: 10px; cursor: pointer;
+  background: transparent; border: 1px solid var(--line); color: var(--muted); font-size: 11px;
+}
+.dq-x:hover, .dp-x:hover { color: var(--fg); border-color: var(--muted); }
+
+.drev { border-left: 2px solid var(--line); padding: 6px 0 6px 10px; margin: 10px 0; font-size: 12px; }
+.drev .md { font-size: 12px; line-height: 1.6; }
+/* A rung move is the only claim on this page with a shape, so it gets one. */
+.dladder { font-size: 11px; padding: 4px 0; }
+.dladder code { color: var(--accent); }
+
+/* -------------------------------------------------- workspace, mission, alignment
+   The header select and badge. Both are deliberately quiet: which workspace you
+   are in is not news, it is context, and it should read as a label until the
+   moment the supervisor says the work has stopped serving it. */
+#ws-pick {
+  padding: 3px 6px; font-size: 11px; max-width: 190px;
+  background: var(--panel2); border: 1px solid var(--line); color: var(--fg);
+  border-radius: 5px;
+}
+.align { font-size: 11px; color: var(--muted); }
+.align:empty { display: none; }
+.align b { font-weight: 600; }
+.align.aligned b { color: #7fbf7f; }
+.align.drifting b { color: #d8b46a; }
+.align.off_mission b { color: #e06c75; }
+.align.unknown b, .align.none b { color: var(--muted); }
+.align.stale { opacity: .65; }
+
+/* A reading. `drift` is the only part with a border, because it is the only
+   part that is a claim about a specific piece of work being wrong. */
+.supervisor { font-size: 12px; line-height: 1.6; max-height: 320px; overflow: auto; }
+.supervisor .verdict { font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+.supervisor .verdict.aligned { color: #7fbf7f; }
+.supervisor .verdict.drifting { color: #d8b46a; }
+.supervisor .verdict.off_mission { color: #e06c75; }
+.supervisor .verdict.unknown { color: var(--muted); }
+.supervisor h5 { margin: 12px 0 6px; font-size: 11px; color: var(--muted); font-weight: 600; }
+.sv-item { border-left: 2px solid var(--line); padding: 4px 0 4px 10px; margin-bottom: 6px; }
+.sv-item b { color: var(--fg); font-weight: 600; }
+.sv-item.drift { border-left-color: #d8b46a; }
+.sv-item .where { color: var(--amp); font-size: 11px; }
+.sv-item .rec { color: var(--muted); font-size: 11px; margin-top: 3px; }
+/* The mission being silent on something real is a question for Travis, not a
+   finding about the work, so it does not sit in either list. */
+.sv-gap {
+  margin-top: 12px; padding: 8px 10px; border-radius: 6px;
+  background: #22201a; border: 1px solid #3f3826; color: #d8cba6; font-size: 12px;
+}
+
+.ws-list { font-size: 12px; }
+.ws-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 0; border-top: 1px solid var(--line);
+}
+.ws-row:first-child { border-top: none; }
+.ws-row .nm { flex: 1; color: var(--fg); }
+.ws-row.cur .nm { color: var(--amp); font-weight: 600; }
+.ws-row .no-mission { color: #d8b46a; font-size: 11px; }
+.ws-row button {
+  padding: 1px 8px; border-radius: 10px; font-size: 11px;
+  background: transparent; border: 1px solid var(--line); color: var(--muted);
+}
+.ws-row button:hover { color: var(--fg); border-color: var(--muted); }

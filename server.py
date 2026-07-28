@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """code - browser console for the amp orchestration harness.
 
-Runs LOCALLY. It shells out to the `codex` CLI (which needs your ~/.codex auth),
-reads your git worktrees, and holds your OpenRouter key, so it cannot be served
-as a static site from code.traaviis.com. Run it here, open localhost.
+Runs LOCALLY. It shells out to the `claude` and `codex` CLIs (which need your
+local auth), reads your git worktrees, and holds your OpenRouter key, so it
+cannot be served as a static site from code.traaviis.com. Run it here, open
+localhost.
 
     ./amp serve            # or: python3 code/server.py --port 8787
 
@@ -19,6 +20,7 @@ import mimetypes
 import socket
 import sys
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,9 +36,114 @@ ROOT = amp.ROOT  # workspace holding the lane worktrees
 HOST = "127.0.0.1"
 PORT = 8787
 
+# Where the orchestrator reaches this console. It drives the board over the
+# same HTTP API the browser uses, so every guard behind those endpoints - the
+# per-lane lock, the worker cap, budgets, timeouts - applies to it too.
+BASE_URL = f"http://{HOST}:{PORT}"
+
 # codex cloud exec can block for a while; serialize dispatches so two clicks
 # do not race the same lane.
 _DISPATCH_LOCK = threading.Lock()
+
+# One claude worker per lane at a time - two workers in the same worktree would
+# overwrite each other's edits.
+_LANE_LOCKS: dict[str, threading.Lock] = {}
+_LANE_LOCKS_GUARD = threading.Lock()
+
+
+def lane_lock(name: str) -> threading.Lock:
+    with _LANE_LOCKS_GUARD:
+        return _LANE_LOCKS.setdefault(name, threading.Lock())
+
+
+# A dispatch that arrives with no slot free used to be refused outright, which
+# put the whole burden of coming back later on whoever asked - and the
+# orchestrator, whose turn ends the moment it replies, structurally cannot come
+# back later. So a blocked dispatch waits here instead, and is started by the
+# worker whose finishing freed the slot.
+#
+# It is written to disk on every change, because a queue that only exists in
+# this process is dropped by every restart - and this file is restarted for
+# every change to it. That would be the same bug the queue was built to fix,
+# arriving by a different road: work reported as queued, then silently gone.
+_QUEUE: list[dict] = []
+_QUEUE_LOCK = threading.Lock()
+
+
+def _save_queue():
+    """Call with _QUEUE_LOCK held."""
+    amp.save_json(amp.QUEUE_PATH, {"queued": _QUEUE})
+
+
+def _load_queue():
+    with _QUEUE_LOCK:
+        _QUEUE[:] = amp.load_json(amp.QUEUE_PATH, {}).get("queued") or []
+        return len(_QUEUE)
+
+
+# The queue is the one piece of workspace state this process holds in memory, so
+# it is the one thing a workspace switch could carry across a boundary it must
+# not cross: tasks queued against one set of lanes, started against another.
+# `amp.use_workspace` refuses while anything is running, so this only ever swaps
+# a list nobody is draining.
+amp.WORKSPACE_HOOKS.append(lambda _slug: _load_queue())
+
+
+def queued_view() -> list[dict]:
+    with _QUEUE_LOCK:
+        return [{"lane": b.get("lane"), "queued_at": b.get("queued_at"),
+                 "prompt": (b.get("prompt") or "")[:160]} for b in _QUEUE]
+
+
+def _enqueue(body: dict, why: str) -> dict:
+    with _QUEUE_LOCK:
+        body = {**body, "queued_at": amp.now()}
+        _QUEUE.append(body)
+        _save_queue()
+        pos = len(_QUEUE)
+    return {"ok": True, "queued": True, "position": pos, "lane": body.get("lane"),
+            "reason": why}
+
+
+def _hold_lane_for_adopted(lane_name: str, task_id: str, lk: threading.Lock):
+    """Keep an adopted worker's lane held until it actually finishes.
+
+    The lane lock is what stops two workers sharing one worktree, and it lives
+    in this process - so a console restart releases it while the worker it was
+    protecting is still running. The queue then sees a free lane and starts a
+    second agent in the same directory as the first. The lock is re-taken
+    synchronously at boot, before any drain; this thread only gives it back.
+    """
+    try:
+        while task_id in amp.adopted_task_ids():
+            time.sleep(2.0)
+    finally:
+        lk.release()
+        _drain_queue()
+
+
+def _drain_queue():
+    """Start whatever now fits. Called whenever a worker settles.
+
+    Head-of-line blocking is deliberate at the cap but not per lane: one busy
+    lane must not hold up a queued task for a different, idle one.
+    """
+    while True:
+        with _QUEUE_LOCK:
+            if not _QUEUE or amp.live_workers() >= amp.limits()["max_workers"]:
+                return
+            i = next((i for i, b in enumerate(_QUEUE)
+                      if not lane_lock(b.get("lane") or "").locked()), None)
+            if i is None:
+                return
+            body = _QUEUE.pop(i)
+            _save_queue()
+        out = do_dispatch(body, queue=False)
+        if not out.get("ok"):
+            # Dropping it silently would repeat the bug this queue exists to
+            # fix, so the reason lands in the thread where it can be seen.
+            amp.add_note(f"queued task for {body.get('lane')} could not start: "
+                         f"{out.get('error')}", lane=body.get("lane"))
 
 
 # ---------------------------------------------------------------- payloads
@@ -45,40 +152,157 @@ _DISPATCH_LOCK = threading.Lock()
 def state_payload() -> dict:
     cfg = amp.config()
     b = amp.board()
-    logged_in = amp.codex_logged_in()
     key = amp.find_openrouter_key()
+    codex_installed = amp.codex_available()
 
     lanes = []
     for name in sorted(cfg["lanes"]):
         lane = cfg["lanes"][name]
-        tasks = b.get("remote", {}).get(name, [])
+        backend = amp.lane_backend(lane)
         history = b.get("tasks", {}).get(name, [])
+        if backend == "claude":
+            tasks = [
+                {
+                    "task_id": t.get("task_id"),
+                    "status": t.get("status"),
+                    "dispatched_at": t.get("dispatched_at"),
+                    "title": t.get("result") or t.get("error") or t.get("prompt"),
+                    "cost_usd": t.get("cost_usd"),
+                    "resumed": bool(t.get("resume_of")),
+                }
+                for t in history
+                if t.get("backend") == "claude"
+            ][:5]
+        else:
+            tasks = b.get("remote", {}).get(name, [])[:5]
         lanes.append(
             {
                 "name": name,
                 "repo": lane.get("repo"),
                 "path": lane.get("path"),
                 "branch": lane.get("branch", "main"),
+                "backend": backend,
                 "env_id": lane.get("env_id"),
-                "bound": bool(lane.get("env_id")),
-                "tasks": tasks[:5],
+                "bound": backend == "claude" or bool(lane.get("env_id")),
+                "running": any(t.get("status") == "running" for t in tasks),
+                "tasks": tasks,
                 "dispatch_count": len(history),
                 "last_dispatch": history[0]["dispatched_at"] if history else None,
             }
         )
 
+    uses_codex = any(l["backend"] == "codex" for l in lanes)
+    # The whole board in four numbers, so the dock can say where things stand
+    # without you opening a single lane.
+    threads = [c for c in amp.consults() if c["status"] == "open"]
+    goals = amp.goals()
+    live_goals = [g for g in goals if g["state"] in ("planning", "running", "blocked")]
+    try:
+        seen = amp.observations()
+    except Exception:
+        # A diagnostic that can take the console down with it is worse than no
+        # diagnostic - it shells out to git in trees it does not control.
+        traceback.print_exc()
+        seen = []
+    try:
+        found = amp.findings_summary()
+    except Exception:
+        traceback.print_exc()
+        found = {"unread": 0, "contradicted": 0, "top": None}
+    try:
+        standing = amp.obligations_summary()
+    except Exception:
+        traceback.print_exc()
+        standing = {"total": 0, "drifted": 0, "broken": 0, "unchecked": 0}
+    try:
+        ws = amp.workspace_view()
+        # Cheap: the last reading off disk, not a new one. Taking a reading
+        # costs an architect call and happens only when it is asked for.
+        sup = amp.supervisor_view()
+    except Exception:
+        traceback.print_exc()
+        ws = {"current": None, "mission": "", "blocked": None, "list": []}
+        sup = {"mission": "", "last": None, "stale": False, "since": 0, "history": []}
     return {
         "lanes": lanes,
+        # Which set of lanes, goals and history this whole payload is about.
+        # Every number below is scoped to it, so it is not an aside.
+        "workspace": ws,
+        "supervisor": sup,
+        "goals": goals[:12],
+        "observations": seen,
+        "findings": found,
+        "obligations": standing,
+        "summary": {
+            "goals": len(live_goals),
+            # Things that have to keep being true and currently are not. Not
+            # counted as `problems`: drift in a published artifact is expected
+            # after work lands, and is a queue rather than an alarm.
+            "drifted": standing["drifted"] + standing["broken"],
+            # What the work has said about the doctrine and nobody has been told
+            # yet. A contradiction is counted separately because it means
+            # something we believed and acted on is false.
+            "findings": found["unread"],
+            "contradicted": found["contradicted"],
+            "goals_stuck": sum(1 for g in live_goals if g["state"] == "blocked"),
+            # A goal that is running with nobody on it. The heartbeat restarts
+            # these, so a number here that does not fall within a minute means
+            # the restart itself is failing - which is worth seeing, and used to
+            # be invisible because a quiet goal counted as a healthy one.
+            "goals_idle": len(amp.idle_goals()),
+            # What is currently stopping the pipeline from feeding itself. Empty
+            # is the normal, running state; anything here is waiting on you.
+            "escalations": amp.escalations(),
+            "problems": sum(1 for o in seen if o.get("severity") == "high"),
+            # Workers, not lanes. This is shown against the cap, and the cap
+            # counts workers - a lane can hold more than one (a restart, a
+            # resume), so counting lanes reads as spare capacity that is not
+            # there.
+            "running": amp.live_workers(),
+            "cap": amp.limits()["max_workers"],
+            "failed": sum(1 for l in lanes
+                          if l["tasks"] and l["tasks"][0].get("status") in ("failed", "error")),
+            "threads": len(threads),
+            # A thread with a worker out fetching what it asked for is not
+            # waiting on you, and counting it as though it were is how the dock
+            # ends up asking for attention that nothing needs.
+            "waiting": sum(1 for c in threads if _needs_you(c)),
+            "lanes": [c["lane"] for c in threads if _needs_you(c)],
+            "queued": queued_view(),
+        },
         "polled_at": b.get("polled_at"),
         "health": {
-            "codex_installed": amp.codex_available(),
-            "codex_logged_in": logged_in,
+            "claude_installed": amp.claude_available(),
+            "claude_auth": amp.claude_auth_problem(),
+            "codex_installed": codex_installed,
+            "codex_logged_in": codex_installed and amp.codex_logged_in(),
+            "codex_needed": uses_codex,
             "openrouter_key": bool(key),
+            "openrouter_enabled": amp.openrouter_enabled(),
+            # Which backend answers as the architect, and whether it can. The
+            # banner needs both: "the architect is unavailable" is only useful
+            # next to which architect it is talking about.
+            "architect_backend": amp.architect_backend(),
+            "architect_ready": amp.architect_available(),
             "unbound_lanes": [l["name"] for l in lanes if not l["bound"]],
+            # The three lights in the header. Each one names the role, the model
+            # answering as it, whether it may run and why not - the header shows
+            # all four, because a dark dot with no reason is just a worry.
+            "roles": amp.role_view(),
         },
         "consult_models": amp.CONSULT_MODELS,
         "default_model": cfg.get("consult_model", amp.DEFAULT_CONSULT),
+        "backends": list(amp.BACKENDS),
+        "claude_budget_usd": cfg.get("claude_budget_usd", amp.DEFAULT_BUDGET_USD),
+        "claude_model": cfg.get("claude_model", amp.DEFAULT_CLAUDE_MODEL),
+        "limits": amp.limits(),
+        "workers": amp.worker_stats(),
     }
+
+
+def _needs_you(c: dict) -> bool:
+    """Is this thread actually stuck on the operator, or just mid-round?"""
+    return bool(c.get("needs")) and c.get("blocked_on") != "gathering"
 
 
 def rulings_payload() -> list[dict]:
@@ -98,11 +322,13 @@ def rulings_payload() -> list[dict]:
 
 
 def do_poll(lane_filter: str | None) -> dict:
-    if not amp.codex_logged_in():
-        return {"ok": False, "error": "codex is not logged in. Run: codex login"}
+    """Refresh codex lanes. Claude lanes settle themselves as their threads finish."""
     cfg = amp.config()
     b = amp.board()
     names = [lane_filter] if lane_filter else sorted(cfg["lanes"])
+    names = [n for n in names if amp.lane_backend(cfg["lanes"].get(n, {})) == "codex"]
+    if names and not amp.codex_logged_in():
+        return {"ok": False, "error": "codex is not logged in. Run: codex login"}
     seen, errors = 0, {}
     for name in names:
         lane = cfg["lanes"].get(name)
@@ -119,7 +345,170 @@ def do_poll(lane_filter: str | None) -> dict:
     return {"ok": True, "tasks_seen": seen, "errors": errors, "polled_at": b["polled_at"]}
 
 
-def do_dispatch(body: dict) -> dict:
+def _run_claude_bg(name: str, rec: dict):
+    """Workers take minutes; the browser polls /api/state for the settled record."""
+    lock = lane_lock(name)
+    with lock:
+        try:
+            amp.run_claude_task(name, rec)
+        except Exception as e:  # never leave a record stuck on `running`
+            traceback.print_exc()
+            amp.update_task(name, rec["task_id"], {"status": "failed", "error": str(e)})
+    try:
+        _settle(name, rec)
+    except Exception:
+        # An escalation that fails must not rewrite a worker's real outcome.
+        traceback.print_exc()
+    # The slot is free now. Whoever was waiting on it is started here, by the
+    # worker that freed it - there is no other moment when anyone is looking.
+    try:
+        _drain_queue()
+    except Exception:
+        traceback.print_exc()
+
+
+def _settle(name: str, rec: dict):
+    """What happens once a worker stops: report to the architect that sent it,
+    or escalate on its own if it came back blocked.
+
+    A worker's report goes back to the architect automatically, but the next
+    build order does not go back to a worker automatically - a loop that both
+    ends drive is a loop that spends your money while you are not looking.
+    """
+    fresh = (do_task(name, rec["task_id"]).get("task")) or rec
+    # Every worker passes through here exactly once, whoever sent it - a goal, a
+    # consult, or the operator - so this is the one place a DOCTRINE: line cannot
+    # be missed. It is filed before anything below can return.
+    try:
+        amp.record_worker_finding(name, fresh)
+    except Exception:
+        traceback.print_exc()
+    gid = rec.get("goal_id")
+    if gid:
+        # A goal's worker reports to the goal, which judges it against the
+        # definition of done and sends the next one. Nothing else here applies:
+        # the goal owns what happens next by construction.
+        amp.goal_worker_done(gid, name, {**fresh, "goal_task": rec.get("goal_task")})
+        return
+    cid = rec.get("consult_id")
+    if cid and rec.get("report_back", True):
+        # The report is recorded either way - it is free, and losing a worker's
+        # findings because the architect was switched off would be throwing away
+        # the expensive half to save the cheap half. Only the round is skipped.
+        amp.add_turn(cid, "worker", amp.worker_report(name, fresh), task_id=rec["task_id"])
+        if amp.architect_available():
+            amp.advance_consult(cid)
+        else:
+            amp.add_note(f"{name}'s report is on consult {cid}, but "
+                         f"{amp.architect_off_reason().lower()} - continue the thread "
+                         f"to send it.", lane=name)
+        return
+    if not amp.config().get("auto_escalate", True) or not amp.architect_available():
+        return
+    why = amp.needs_escalation(fresh)
+    if not why:
+        return
+    amp.open_consult(
+        name,
+        f"A worker in this lane stopped and needs a ruling.\n\n{why}\n\n"
+        "The packet below is its full context. Rule on what should happen next.",
+        model_key=amp.config().get("consult_model", amp.DEFAULT_CONSULT),
+        trigger="auto",
+    )
+
+
+def _gather_task_for(cid: str) -> dict | None:
+    """The most recent worker sent to gather evidence for this thread."""
+    for tasks in (amp.board().get("tasks") or {}).values():
+        for rec in tasks:
+            if rec.get("consult_id") == cid and rec.get("report_back"):
+                return rec
+    return None
+
+
+def _recover_stuck_consults() -> list[str]:
+    """Relay any worker that finished while nobody was listening.
+
+    A thread waiting on evidence is waiting on one specific worker, and the only
+    thing that moves it is that worker's report. If the report is missed - a
+    restart, a crash in the settle path - the thread does not fail, it simply
+    stops, and stopping is indistinguishable from working. So the fact that
+    settles it is not `did we relay?` but `has its worker finished, and is its
+    report in the thread?`, both of which are on disk and can be re-checked.
+    """
+    moved = []
+    for row in amp.consults():
+        if row.get("blocked_on") != "gathering":
+            continue
+        cid = row["id"]
+        c = amp.load_consult(cid)
+        rec = _gather_task_for(cid)
+        if not c or not rec or rec.get("status") == "running":
+            continue
+        if any(t.get("task_id") == rec["task_id"] and t.get("role") == "worker"
+               for t in c.get("turns") or []):
+            continue          # it did report; the thread is stopped for another reason
+        try:
+            _settle(rec.get("lane") or c["lane"], rec)
+            moved.append(cid)
+        except Exception:
+            traceback.print_exc()
+    return moved
+
+
+def _recover_stuck_goals() -> list[str]:
+    """A goal whose worker finished while nobody was listening, restarted.
+
+    Same failure as a stopped thread and the same test for it: the goal says a
+    task is running, and the board says that task is not.
+    """
+    moved = []
+    for row in amp.goals():
+        if row.get("state") != "running":
+            continue
+        g = amp.load_goal(row["id"])
+        task = next((t for t in g.get("tasks") or [] if t.get("state") == "running"), None)
+        if not task:
+            continue
+        rec = next((r for recs in (amp.board().get("tasks") or {}).values() for r in recs
+                    if r.get("goal_id") == g["id"] and r.get("goal_task") == task["id"]), None)
+        if rec and rec.get("status") == "running":
+            continue
+        try:
+            if rec:
+                amp.goal_worker_done(g["id"], g["lane"], {**rec, "goal_task": task["id"]})
+            else:
+                # It never started. Put the task back and let the goal send it.
+                task["state"] = "todo"
+                amp.save_goal(g)
+                amp.goal_dispatch(g["id"])
+            moved.append(g["id"])
+        except Exception:
+            traceback.print_exc()
+    return moved + _restart_idle_goals()
+
+
+def _restart_idle_goals() -> list[str]:
+    """Send the next task out for every goal that has nobody on it.
+
+    The companion to the sweep above, for the case it cannot see: that one looks
+    for a goal whose task says `running` when the board says otherwise, which
+    only catches a worker lost mid-flight. A review lost mid-flight leaves no
+    running task at all, so the goal is simply quiet, and quiet was indexed as
+    healthy. Three goals sat like this for two hours with five lanes idle.
+    """
+    moved = []
+    for g in amp.idle_goals():
+        try:
+            amp.goal_log(g["id"], "picked back up: it had work left and nobody on it")
+            amp.goal_dispatch(g["id"])
+            moved.append(g["id"])
+        except Exception:
+            traceback.print_exc()
+    return moved
+
+
+def do_dispatch(body: dict, *, queue: bool = True) -> dict:
     name = body.get("lane")
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
@@ -128,13 +517,79 @@ def do_dispatch(body: dict) -> dict:
     lane = cfg["lanes"].get(name)
     if not lane:
         return {"ok": False, "error": f"unknown lane {name!r}"}
+
+    # Checked before either backend, because a worker is a worker wherever it
+    # runs, and before the queue, because queueing work against a role that is
+    # switched off just builds a backlog that starts the moment it comes back.
+    if not amp.role_on("worker"):
+        return {"ok": False, "error": "workers are switched off in Settings"}
+
+    backend = body.get("backend") or amp.lane_backend(lane)
+    branch = body.get("branch") or lane.get("branch") or "main"
+
+    if backend == "claude":
+        if not amp.claude_available():
+            return {"ok": False, "error": "claude CLI not found"}
+        if lane_lock(name).locked():
+            if queue:
+                return _enqueue(body, f"a worker is already running in {name!r}")
+            return {"ok": False, "error": f"a worker is already running in {name!r}"}
+        cap = amp.limits()["max_workers"]
+        live = amp.live_workers()
+        if live >= cap:
+            if queue:
+                return _enqueue(body, f"{live} of {cap} slots in use")
+            return {"ok": False, "error":
+                    f"{live} workers already running - the board is capped at {cap}. "
+                    "Wait for one to finish, stop one, or raise max_workers in config.json."}
+        budget = float(body.get("budget") or cfg.get("claude_budget_usd", amp.DEFAULT_BUDGET_USD))
+        model = body.get("model") or cfg.get("claude_model", amp.DEFAULT_CLAUDE_MODEL)
+        resume_of = None
+        want = body.get("resume")
+        if isinstance(want, str) and want not in ("", "1", "true", "last"):
+            # A named session, because the one worth continuing is usually not
+            # the newest - a worker killed by a limit is often followed by
+            # others, and those are what "reply to last" was reaching.
+            resume_of = amp.resumable_session(name, want)
+            if not resume_of:
+                return {"ok": False,
+                        "error": f"no resumable claude session matching {want!r} in {name!r}"}
+        elif want:
+            prior = amp.latest_claude_task(name)
+            if not prior:
+                return {"ok": False, "error": "no prior claude session to resume"}
+            resume_of = prior.get("session_id") or prior.get("task_id")
+        try:
+            rec = amp.start_claude_task(
+                name, lane, prompt,
+                branch=branch, model=model, budget=budget, resume_of=resume_of,
+            )
+        except SystemExit as e:
+            return {"ok": False, "error": str(e) or "could not start the worker"}
+        # Carried on the record so the settle step knows which architect, if any,
+        # is waiting on this worker.
+        extra = {k: body[k] for k in ("consult_id", "report_back", "goal_id", "goal_task")
+                 if body.get(k) is not None}
+        if extra:
+            rec.update(extra)
+            amp.update_task(name, rec["task_id"], extra)
+        threading.Thread(target=_run_claude_bg, args=(name, rec), daemon=True).start()
+        return {
+            "ok": True,
+            "running": True,
+            "task_id": rec["task_id"],
+            "cwd": rec["cwd"],
+            "budget_usd": budget,
+            "model": model,
+            "resumed": bool(resume_of),
+        }
+
     env_id = lane.get("env_id")
     if not env_id:
         return {"ok": False, "error": f"lane {name!r} has no codex env id (bind it first)"}
     if not amp.codex_logged_in():
         return {"ok": False, "error": "codex is not logged in. Run: codex login"}
 
-    branch = body.get("branch") or lane.get("branch") or "main"
     attempts = int(body.get("attempts") or 1)
 
     cmd = ["codex", "cloud", "exec", "--env", env_id, "--branch", branch]
@@ -152,6 +607,7 @@ def do_dispatch(body: dict) -> dict:
         b["tasks"][name].insert(
             0,
             {
+                "backend": "codex",
                 "dispatched_at": amp.now(),
                 "prompt": prompt,
                 "branch": branch,
@@ -165,50 +621,580 @@ def do_dispatch(body: dict) -> dict:
     return {"ok": True, "output": out}
 
 
-def do_ask(body: dict) -> dict:
-    name = body.get("lane")
-    question = (body.get("question") or "").strip()
-    if not question:
-        return {"ok": False, "error": "question is empty"}
-    cfg = amp.config()
-    if name not in cfg["lanes"]:
-        return {"ok": False, "error": f"unknown lane {name!r}"}
-    if not amp.find_openrouter_key():
-        return {"ok": False, "error": "no OpenRouter key configured"}
+# ---------------------------------------------------------------- consult threads
 
-    model_key = body.get("model") or cfg.get("consult_model", amp.DEFAULT_CONSULT)
-    try:
-        zpath, brief = amp.build_packet(name, question, body.get("files") or [])
-        resp = amp.consult_gpt(brief, model_key)
-    except SystemExit as e:
-        return {"ok": False, "error": str(e) or "packet/consult failed"}
 
-    choice = (resp.get("choices") or [{}])[0]
-    text = (choice.get("message") or {}).get("content") or "(empty response)"
-    usage = resp.get("usage") or {}
-
-    amp.RULING_DIR.mkdir(parents=True, exist_ok=True)
-    from datetime import datetime
-
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    rpath = amp.RULING_DIR / f"{name}-{stamp}.md"
-    rpath.write_text(
-        f"# GPT-5.6 ruling: {name}\n\n"
-        f"- model: {resp.get('model')}\n- packet: {zpath.name}\n- asked: {amp.now()}\n"
-        f"- tokens: {usage.get('prompt_tokens')} in / {usage.get('completion_tokens')} out\n\n"
-        f"## Question\n\n{question}\n\n## Ruling\n\n{text}\n"
-    )
+def _consult_view(c: dict) -> dict:
+    """A thread as the console shows it. The packet turn is a document, not a
+    chat line, so it is summarised rather than shipped in full."""
+    turns = []
+    for t in c["turns"]:
+        text = t["text"]
+        turns.append({
+            "role": t["role"],
+            "at": t["at"],
+            "text": (f"packet built ({len(text)} chars): {c.get('question','')}"
+                     if t["role"] == "packet" else text),
+            "packet": t.get("packet"),
+            "task_id": t.get("task_id"),
+            "usage": t.get("usage"),
+        })
     return {
-        "ok": True,
-        "ruling": text,
-        "model": resp.get("model"),
-        "usage": usage,
-        "packet": zpath.name,
-        "saved": rpath.name,
+        "id": c["id"], "lane": c["lane"], "model": c["model"], "status": c["status"],
+        "trigger": c.get("trigger"), "question": c.get("question"),
+        "opened_at": c["opened_at"], "cost_tokens": c.get("cost_tokens", 0),
+        "needs": c.get("needs") or [], "turns": turns,
+        # Why it is not moving. A thread that is gathering is not stuck, and a
+        # thread that is stuck should say which kind of stuck.
+        "blocked_on": c.get("blocked_on"),
+        "blocked_why": amp.BLOCK_REASONS.get(c.get("blocked_on") or ""),
+        "auto_rounds": c.get("auto_rounds", 0),
     }
 
 
+def _gather_for_consult(cid: str, needs: list[str]) -> bool:
+    """Send a worker to fetch the evidence an architect stopped without.
+
+    This is the relay a build order already uses - dispatched with the consult id
+    on it, so when the worker finishes, `_settle` hands its report straight back
+    and the thread advances on its own. The only difference is the prompt: this
+    one is told to look and not touch.
+    """
+    c = amp.load_consult(cid)
+    if not c:
+        return False
+    out = do_dispatch({
+        "lane": c["lane"],
+        "prompt": amp.gather_prompt(needs, c["lane"]),
+        "backend": "claude",
+        "consult_id": cid,
+        "report_back": True,
+    })
+    if not out.get("ok"):
+        amp.add_note(f"could not send a worker to gather what the {c['lane']} architect "
+                     f"asked for: {out.get('error')}", lane=c["lane"])
+        return False
+    # The architect is told a worker went, so the report that arrives next round
+    # arrives as the answer to something rather than out of nowhere.
+    amp.add_turn(cid, "note",
+                 ("queued" if out.get("queued") else "sent") +
+                 " a worker to gather: " + "; ".join(needs)[:400],
+                 task_id=out.get("task_id"))
+    return True
+
+
+def do_ask(body: dict) -> dict:
+    """Open a consult, or add a round to one that is already open."""
+    cfg = amp.config()
+    if not amp.architect_available():
+        return {"ok": False, "error": amp.architect_off_reason()}
+
+    cid = body.get("consult_id")
+    text = (body.get("question") or "").strip()
+    if not text:
+        return {"ok": False, "error": "question is empty"}
+    try:
+        if cid:
+            if not amp.load_consult(cid):
+                return {"ok": False, "error": f"no consult {cid!r}"}
+            amp.add_turn(cid, "you", text)
+            c = amp.advance_consult(cid)
+        else:
+            name = body.get("lane")
+            if name not in cfg["lanes"]:
+                return {"ok": False, "error": f"unknown lane {name!r}"}
+            model_key = body.get("model") or cfg.get("consult_model", amp.DEFAULT_CONSULT)
+            c = amp.open_consult(name, text, model_key=model_key,
+                                 extra_files=body.get("files") or [])
+    except SystemExit as e:
+        return {"ok": False, "error": str(e) or "packet/consult failed"}
+    return {"ok": True, "consult": _consult_view(c), "ruling": amp.last_ruling(c)}
+
+
+def do_consults(lane: str | None, cid: str | None) -> dict:
+    if cid:
+        c = amp.load_consult(cid)
+        return {"ok": True, "consult": _consult_view(c)} if c else {
+            "ok": False, "error": f"no consult {cid!r}"}
+    return {"ok": True, "consults": amp.consults(lane or None)}
+
+
+def do_relay(body: dict) -> dict:
+    """Hand the architect's latest ruling to the lane's worker, and bring the
+    worker's report back to the architect when it finishes."""
+    cid = body.get("consult_id")
+    c = amp.load_consult(cid or "")
+    if not c:
+        return {"ok": False, "error": f"no consult {cid!r}"}
+    if not amp.last_ruling(c):
+        return {"ok": False, "error": "this consult has no ruling to relay yet"}
+    out = do_dispatch({
+        "lane": c["lane"],
+        "prompt": amp.ruling_prompt(c),
+        "backend": "claude",
+        "budget": body.get("budget"),
+        "model": body.get("model"),
+        "consult_id": cid,
+        "report_back": body.get("report_back", True),
+    })
+    if out.get("ok"):
+        amp.add_turn(cid, "note", f"relayed to the {c['lane']} worker as task "
+                                  f"{out.get('task_id')}", task_id=out.get("task_id"))
+    return out
+
+
+def _dispatch_for_goal(goal: dict, task: dict) -> dict:
+    """One task of a goal, out to one worker in that goal's lane."""
+    return do_dispatch({
+        "lane": goal["lane"],
+        "prompt": amp.goal_worker_prompt(goal, task),
+        "backend": "claude",
+        "goal_id": goal["id"],
+        "goal_task": task["id"],
+        # It reports to the goal, not to a consult thread.
+        "report_back": False,
+    })
+
+
+def do_open_goal(body: dict) -> dict:
+    lane = body.get("lane") or ""
+    objective = (body.get("objective") or "").strip()
+    if not objective:
+        return {"ok": False, "error": "say what the goal is"}
+    if lane not in amp.config()["lanes"]:
+        return {"ok": False, "error": f"unknown lane {lane!r}"}
+    if not amp.architect_available():
+        return {"ok": False, "error": amp.architect_off_reason()
+                + " - a goal needs an architect to plan it"}
+    try:
+        g = amp.open_goal(lane, objective, model_key=body.get("model"))
+    except SystemExit as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "goal": amp.load_goal(g["id"])}
+
+
+def do_goal(body: dict) -> dict:
+    gid = body.get("goal_id") or ""
+    g = amp.load_goal(gid)
+    if not g:
+        return {"ok": False, "error": f"no goal {gid!r}"}
+    return {"ok": True, "goal": g}
+
+
+def do_answer_goal(body: dict) -> dict:
+    gid = body.get("goal_id") or ""
+    text = (body.get("text") or "").strip()
+    if not amp.load_goal(gid):
+        return {"ok": False, "error": f"no goal {gid!r}"}
+    if not text:
+        return {"ok": False, "error": "say something"}
+    return {"ok": True, "goal": amp.answer_goal(gid, text)}
+
+
+def do_push_goal(body: dict) -> dict:
+    """Give a stopped goal its rounds back and let it carry on."""
+    gid = body.get("goal_id") or ""
+    g = amp.load_goal(gid)
+    if not g:
+        return {"ok": False, "error": f"no goal {gid!r}"}
+    if g.get("cost_tokens", 0) >= amp.GOAL_TOKEN_CEILING:
+        return {"ok": False, "error": "this goal has spent its whole token ceiling. "
+                                      "Raise GOAL_TOKEN_CEILING or open a fresh goal."}
+    g["rounds"] = 0
+    g["stopped_on"] = None
+    g["state"] = "running"
+    amp.save_goal(g)
+    return {"ok": True, "goal": amp.goal_dispatch(gid)}
+
+
+def do_publish_report(body: dict) -> dict:
+    """What would happen, and what is standing in the way. Pushes nothing."""
+    gid = body.get("goal_id") or ""
+    return {"ok": True, "report": amp.publish_report(gid)}
+
+
+def do_publish_goal(body: dict) -> dict:
+    """Push the lane branch and open a pull request.
+
+    `confirm: true` is required in the body. Not as ceremony - this is the only
+    call in the harness whose effect leaves this machine and lands somewhere
+    other people can see, and it is worth its own deliberate word.
+    """
+    gid = body.get("goal_id") or ""
+    if not body.get("confirm"):
+        rep = amp.publish_report(gid)
+        rep["dry_run"] = True
+        return {"ok": True, "report": rep,
+                "note": "dry run - send confirm:true to push the branch and open the PR"}
+    return {"ok": True, "report": amp.publish_goal(gid, dry_run=False)}
+
+
+def do_close_goal(body: dict) -> dict:
+    gid = body.get("goal_id") or ""
+    if not amp.load_goal(gid):
+        return {"ok": False, "error": f"no goal {gid!r}"}
+    return {"ok": True, "goal": amp.close_goal(gid, body.get("state") or "abandoned")}
+
+
+def do_findings(lane: str | None, unread_only: bool) -> dict:
+    """What the work has said about the doctrine."""
+    return {"ok": True, "findings": amp.findings(lane=lane, unread_only=unread_only)[:80],
+            "summary": amp.findings_summary(),
+            "doctrine_path": str(amp.DOCTRINE_PATH),
+            "doctrine_state": amp.doctrine_state(),
+            "doctrine": amp.doctrine()}
+
+
+def do_ack_findings(body: dict) -> dict:
+    """Mark findings as told to the operator.
+
+    Deliberately not automatic. A finding is unread until someone says it was
+    put in front of Travis, because the whole point of the channel is that a
+    contradiction cannot be quietly aged out of the board.
+    """
+    ids = body.get("ids") or ([body["id"]] if body.get("id") else [])
+    if not ids:
+        return {"ok": False, "error": "no ids"}
+    return {"ok": True, "acked": amp.ack_findings([str(i) for i in ids]),
+            "summary": amp.findings_summary()}
+
+
+# --------------------------------------------------------------- direction
+
+
+def do_direction(lane: str | None) -> dict:
+    """The thesis, the values, what came back, and where there is left to go."""
+    return {"ok": True, "direction": amp.direction_view(lane)}
+
+
+def do_direction_review(body: dict) -> dict:
+    """Look back at one finished goal and ask what it was for.
+
+    Slow - it is a full architect call against the repository as it now is - and
+    it spends tokens, so it is a request rather than something the tab does on
+    open. It fires by itself when a goal finishes; this is for the ones that
+    finished before there was anything to fire.
+    """
+    gid = body.get("goal_id") or ""
+    if not gid:
+        return {"ok": False, "error": "no goal_id"}
+    rev = amp.direction_review(gid)
+    return {"ok": bool(rev.get("ok")), "review": rev, "error": rev.get("error")}
+
+
+def do_direction_proposal(body: dict) -> dict:
+    """Adopt a proposed objective as a real goal, or turn it down.
+
+    Adopting is the operator deciding what gets built, which is why it is a click
+    and not a consequence of the review that proposed it.
+    """
+    pid = body.get("id") or ""
+    action = body.get("action") or ""
+    if action == "adopt":
+        return amp.adopt_proposal(pid)
+    if action == "dismiss":
+        p = amp.set_proposal(pid, "dismissed", reason=str(body.get("reason") or "")[:400])
+        return {"ok": bool(p), "proposal": p} if p else {"ok": False, "error": "no such proposal"}
+    return {"ok": False, "error": "action must be adopt or dismiss"}
+
+
+def do_direction_auto(body: dict) -> dict:
+    """Let a review open its own goals, or stop letting it.
+
+    Off by default. On, the stack keeps choosing its own next objective inside a
+    lane until it says the lane is exhausted - which is the automation Travis
+    asked for, and is also exactly the thing rule 6 says is his to switch on.
+    """
+    return {"ok": True, "auto_adopt": amp.set_auto_adopt(bool(body.get("on")))}
+
+
+def do_ratify_doctrine() -> dict:
+    """The operator, and only the operator, saying the current core stands.
+
+    There is no counterpart for an agent. An amendment is proposed as a finding
+    and adopted here, by hand, or it is not adopted.
+    """
+    return {"ok": True, "doctrine": {**amp.ratify_doctrine(), **amp.doctrine_state()}}
+
+
+# ------------------------------------------------- workspaces, mission, supervisor
+
+
+def do_workspaces() -> dict:
+    return {"ok": True, "workspace": amp.workspace_view(),
+            "supervisor": amp.supervisor_view()}
+
+
+def do_workspace_use(body: dict) -> dict:
+    """Point the whole console at another workspace.
+
+    This rebinds every path the harness writes to, so it refuses outright while
+    anything is in flight rather than trying to be clever about it. The refusal
+    says what is in flight, because "not now" without a reason is the same as a
+    bug from where the operator is sitting.
+    """
+    slug = str(body.get("slug") or "").strip()
+    if not slug:
+        return {"ok": False, "error": "which workspace?"}
+    try:
+        ws = amp.use_workspace(slug)
+    except amp.WorkspaceError as e:
+        return {"ok": False, "error": str(e), "blocked": amp.switch_blocked()}
+    amp.add_note(f"switched to the {ws.get('name')!r} workspace")
+    return {"ok": True, "workspace": amp.workspace_view()}
+
+
+def do_workspace_add(body: dict) -> dict:
+    """Open a new workspace: no lanes, no board, no goals, its own mission."""
+    try:
+        ws = amp.add_workspace(str(body.get("name") or ""),
+                               mission=str(body.get("mission") or ""))
+    except amp.WorkspaceError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "created": ws, "workspace": amp.workspace_view()}
+
+
+def do_workspace_rename(body: dict) -> dict:
+    try:
+        amp.rename_workspace(str(body.get("slug") or ""), str(body.get("name") or ""))
+    except amp.WorkspaceError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "workspace": amp.workspace_view()}
+
+
+def do_workspace_remove(body: dict) -> dict:
+    """Drop a workspace from the list. Its state stays on disk."""
+    try:
+        gone = amp.remove_workspace(str(body.get("slug") or ""))
+    except amp.WorkspaceError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "removed": gone, "workspace": amp.workspace_view(),
+            "note": "the state directory was left on disk; putting the entry back "
+                    "restores the workspace"}
+
+
+def do_mission(body: dict) -> dict:
+    """Write what this workspace is for.
+
+    The only text in the harness that no agent may author. It goes out with the
+    doctrine to every planner, worker and review from the next prompt onward.
+    """
+    if "text" not in body:
+        return {"ok": False, "error": "nothing to write"}
+    try:
+        amp.set_mission(str(body.get("text") or ""), body.get("slug") or None)
+    except amp.WorkspaceError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "workspace": amp.workspace_view()}
+
+
+def do_supervise() -> dict:
+    """Take a reading: is what is happening still the mission?
+
+    Slow and costs an architect call, like a direction review, and for the same
+    reason it is a request rather than something a timer does. Nothing it returns
+    is carried out - it names drift, it does not stop anything.
+    """
+    return amp.supervise_workspace()
+
+
+def do_supervisor() -> dict:
+    return {"ok": True, "supervisor": amp.supervisor_view(),
+            "reports": amp.supervisor_store().get("reports", [])[-12:][::-1]}
+
+
+# ------------------------------------------------------------- obligations
+
+_OBLIGATION_TICK = 300.0   # how often the ticker wakes, not how often a check runs
+
+
+def do_obligations() -> dict:
+    return {"ok": True, "obligations": amp.obligations(),
+            "summary": amp.obligations_summary()}
+
+
+def do_add_obligation(body: dict) -> dict:
+    try:
+        ob = amp.add_obligation(
+            body.get("name") or "", body.get("check") or "",
+            why=body.get("why") or "", fix=body.get("fix") or "",
+            every_hours=float(body.get("every_hours") or 24),
+            lane=body.get("lane") or None, auto_fix=bool(body.get("auto_fix")))
+    except SystemExit as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "obligation": ob}
+
+
+def do_check_obligation(body: dict) -> dict:
+    """Run one obligation's check now, on demand."""
+    oid = body.get("id") or ""
+    ob = next((o for o in amp.obligations() if o["id"] == oid), None)
+    if not ob:
+        return {"ok": False, "error": f"no obligation {oid!r}"}
+    return {"ok": True, "obligation": amp.run_obligation_check(ob)}
+
+
+def do_set_obligation(body: dict) -> dict:
+    oid = body.get("id") or ""
+    patch = {k: body[k] for k in ("enabled", "auto_fix", "every_hours", "fix", "check", "why")
+             if k in body}
+    if not patch:
+        return {"ok": False, "error": "nothing to change"}
+    ob = amp.update_obligation(oid, patch)
+    return {"ok": True, "obligation": ob} if ob else {"ok": False, "error": f"no obligation {oid!r}"}
+
+
+def do_remove_obligation(body: dict) -> dict:
+    oid = body.get("id") or ""
+    return ({"ok": True} if amp.remove_obligation(oid)
+            else {"ok": False, "error": f"no obligation {oid!r}"})
+
+
+_PIPELINE_TICK = 60.0
+
+
+def _pipeline_ticker():
+    """The fleet's heartbeat: keep every running goal actually running.
+
+    Recovery used to happen once, at boot. That is enough only if the thing that
+    interrupts a goal is a restart - and it is not. A dispatch hook that throws,
+    a review that dies, a worker settled while the hooks were being rebound: any
+    of them leaves a goal quiet, and until now quiet lasted until someone looked.
+
+    Restarting an idle goal costs one worker's budget on work the goal already
+    said it wanted, so it is safe to do unattended. Restarting a *stopped* goal
+    is not - it stopped for a reason - and this does not touch those.
+    """
+    while True:
+        time.sleep(_PIPELINE_TICK)
+        try:
+            for gid in _restart_idle_goals():
+                print(f"amp: restarted idle goal {gid}")
+        except Exception:
+            traceback.print_exc()
+
+
+def _obligation_ticker():
+    """Wake periodically, run whatever check is due, and report drift.
+
+    The checks run here rather than on a browser poll because an obligation that
+    is only evaluated when someone is looking at the page is not a standing
+    obligation - it is a manual task with extra steps.
+
+    This thread never writes to a repository. It runs read-only checks and files
+    what they said; repairing drift is a dispatch, and a dispatch into the shared
+    checkout is the operator's decision (see the note on auto_fix in amp.py).
+    """
+    while True:
+        try:
+            for ob in amp.obligations():
+                if not amp.obligation_due(ob):
+                    continue
+                was = ob.get("state")
+                done = amp.run_obligation_check(ob)
+                if done.get("state") == "drifted" and was != "drifted":
+                    amp.add_note(f"obligation {done['name']!r} is no longer current: "
+                                 f"its check exited {done.get('last_rc')}.",
+                                 lane=done.get("lane"))
+        except Exception:
+            traceback.print_exc()
+        time.sleep(_OBLIGATION_TICK)
+
+
+def do_continue_consult(body: dict) -> dict:
+    """Push a halted thread one more time.
+
+    Threads carry themselves now, but three kinds stop: ones that ran out of
+    automatic rounds, ones that went round in circles, and every thread that was
+    already sitting there before any of this existed. This is the kick. It clears
+    the two limits that are about the loop rather than about the money, so the
+    same button cannot be leaned on to spend without end.
+    """
+    cid = body.get("consult_id") or ""
+    c = amp.load_consult(cid)
+    if not c:
+        return {"ok": False, "error": f"no consult {cid!r}"}
+    if c.get("cost_tokens", 0) >= amp.AUTO_TOKEN_CEILING:
+        return {"ok": False, "error":
+                f"this thread has spent {c['cost_tokens']} tokens, past the "
+                f"{amp.AUTO_TOKEN_CEILING} it is allowed to continue itself on. "
+                "Answer it, or open a fresh thread with what you have learned."}
+    c["auto_rounds"] = 0
+    c["need_trail"] = []
+    amp.save_consult(c)
+    c = amp.auto_continue(cid)
+    return {"ok": True, "consult": _consult_view(c), "ruling": amp.last_ruling(c)}
+
+
+def do_close_consult(body: dict) -> dict:
+    c = amp.load_consult(body.get("consult_id") or "")
+    if not c:
+        return {"ok": False, "error": "no such consult"}
+    c["status"] = "closed"
+    amp.save_consult(c)
+    return {"ok": True}
+
+
+def do_cancel(body: dict) -> dict:
+    """Stop a runaway worker and everything it spawned."""
+    lane = body.get("lane")
+    task_id = body.get("task_id")
+    if not task_id:
+        recs = amp.board().get("tasks", {}).get(lane, [])
+        rec = next((r for r in recs if r.get("status") == "running"), None)
+        if not rec:
+            return {"ok": False, "error": f"nothing is running in {lane!r}"}
+        task_id = rec["task_id"]
+    if not amp.cancel_worker(task_id):
+        # The record can say `running` after a server restart, when the process
+        # it names is long gone. Settle it rather than leaving the lane stuck.
+        amp.update_task(lane, task_id, {"status": "cancelled", "finished_at": amp.now(),
+                                        "error": "no live process - the record was stale"})
+        return {"ok": True, "stale": True, "task_id": task_id}
+    return {"ok": True, "stale": False, "task_id": task_id}
+
+
+def do_restart(body: dict) -> dict:
+    """Stop a worker and dispatch its own prompt again, fresh.
+
+    Deliberately a button and not a rule. A restart is a second full budget on
+    a task that has already spent one, and a worker that hung once on the same
+    prompt can hang on it twice - so the harness stops the hung one by itself
+    and leaves the decision to spend again here.
+    """
+    lane = (body.get("lane") or "").strip()
+    task_id = (body.get("task_id") or "").strip()
+    recs = amp.board().get("tasks", {}).get(lane, [])
+    rec = (next((r for r in recs if r.get("task_id") == task_id), None) if task_id
+           else next((r for r in recs if r.get("status") == "running"), None))
+    if not rec:
+        return {"ok": False, "error": f"no such task in {lane!r}"}
+    if not rec.get("prompt"):
+        return {"ok": False, "error": "that task has no prompt to run again"}
+    if rec.get("status") == "running":
+        do_cancel({"lane": lane, "task_id": rec["task_id"]})
+        # The kill usually beats the dispatch to the lane lock, but not always.
+        # It does not matter which wins: a dispatch that arrives while the lock
+        # is still held is queued, and the dying worker's own settle starts it.
+    return do_dispatch({"lane": lane, "prompt": rec["prompt"],
+                        "branch": rec.get("branch"), "model": rec.get("model"),
+                        "budget": rec.get("budget_usd")})
+
+
 def do_diff(lane: str, attempt: int | None, task_id: str | None) -> dict:
+    cfg = amp.config()
+    l = cfg["lanes"].get(lane)
+    if not l:
+        return {"ok": False, "error": f"unknown lane {lane!r}"}
+    if amp.lane_backend(l) == "claude":
+        diff = amp.claude_diff(lane, l)
+        if not diff:
+            note = ("no worker has run in this lane yet"
+                    if not (amp.WORKTREE_DIR / lane).exists()
+                    else "the worker ran but changed nothing")
+            return {"ok": True, "branch": f"amp/{lane}", "diff": "", "note": note}
+        return {"ok": True, "branch": f"amp/{lane}", "diff": diff}
+
     b = amp.board()
     if not task_id:
         tasks = b.get("remote", {}).get(lane, [])
@@ -235,6 +1221,16 @@ def do_apply(body: dict) -> dict:
     l = cfg["lanes"].get(lane)
     if not l:
         return {"ok": False, "error": f"unknown lane {lane!r}"}
+    if amp.lane_backend(l) == "claude":
+        # The work is already a real branch. Merging it into the shared checkout
+        # is the user's call - other sessions are editing that tree right now.
+        return {
+            "ok": False,
+            "error": (
+                f"claude work lives on branch amp/{lane} in {amp.WORKTREE_DIR / lane}. "
+                f"Merge it yourself: git -C {ROOT / l['path']} merge amp/{lane}"
+            ),
+        }
     task_id = body.get("task_id")
     if not task_id:
         tasks = amp.board().get("remote", {}).get(lane, [])
@@ -270,6 +1266,29 @@ def do_credits() -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def do_lane_add(body: dict) -> dict:
+    """Register a new lane. The orchestrator can reach this, and should.
+
+    Deciding that a body of work deserves its own lane is exactly the judgement
+    the orchestrator is for, and until this existed it could see the gap, say so,
+    and then be stuck - `lane add` was terminal-only, so noticing was as far as
+    it could get.
+    """
+    try:
+        lane = amp.add_lane(
+            (body.get("lane") or body.get("name") or "").strip(),
+            repo=(body.get("repo") or "").strip() or None,
+            path=(body.get("path") or "").strip() or None,
+            branch=(body.get("branch") or "main").strip(),
+            backend=(body.get("backend") or amp.DEFAULT_BACKEND).strip(),
+            env_id=(body.get("env_id") or "").strip() or None,
+            replace=bool(body.get("replace")),
+        )
+    except amp.LaneError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "lane": lane}
+
+
 def do_bind_env(body: dict) -> dict:
     cfg = amp.config()
     name, env_id = body.get("lane"), (body.get("env_id") or "").strip()
@@ -280,6 +1299,370 @@ def do_bind_env(body: dict) -> dict:
     cfg["lanes"][name]["env_id"] = env_id
     amp.save_json(amp.CONFIG_PATH, cfg)
     return {"ok": True, "lane": name, "env_id": env_id}
+
+
+def do_set_backend(body: dict) -> dict:
+    cfg = amp.config()
+    name, backend = body.get("lane"), body.get("backend")
+    if name not in cfg["lanes"]:
+        return {"ok": False, "error": f"unknown lane {name!r}"}
+    if backend not in amp.BACKENDS:
+        return {"ok": False, "error": f"backend must be one of {', '.join(amp.BACKENDS)}"}
+    cfg["lanes"][name]["backend"] = backend
+    amp.save_json(amp.CONFIG_PATH, cfg)
+    return {"ok": True, "lane": name, "backend": backend}
+
+
+# Sign-in is a two-call conversation with one live pty, so the pending flow is
+# held here between /api/auth/start and /api/auth/code.
+_LOGIN: amp.ClaudeLogin | None = None
+_LOGIN_LOCK = threading.Lock()
+
+
+def do_auth_start() -> dict:
+    global _LOGIN
+    with _LOGIN_LOCK:
+        if _LOGIN:
+            _LOGIN.close()
+        lg = amp.ClaudeLogin()
+        try:
+            url = lg.start()
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
+        _LOGIN = lg
+        amp.open_url(url)          # Chrome, per browser_cmd()
+        return {"ok": True, "url": url}
+
+
+def do_auth_code(body: dict) -> dict:
+    global _LOGIN
+    code = (body.get("code") or "").strip()
+    if not code:
+        return {"ok": False, "error": "paste the code from the sign-in page"}
+    with _LOGIN_LOCK:
+        lg = _LOGIN
+        if not lg:
+            return {"ok": False, "error": "sign-in expired - click Connect Claude again"}
+        try:
+            token = lg.submit(code)
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
+        finally:
+            _LOGIN = None
+        amp.store_claude_token(token)
+    return {"ok": True, "connected": True}
+
+
+# The ChatGPT flow is also two calls over one live pty, but the second one asks
+# "did they approve it yet?" rather than carrying anything back - see CodexLogin.
+_CODEX_LOGIN: amp.CodexLogin | None = None
+_CODEX_LOCK = threading.Lock()
+
+
+def do_codex_auth_start() -> dict:
+    global _CODEX_LOGIN
+    with _CODEX_LOCK:
+        if _CODEX_LOGIN:
+            _CODEX_LOGIN.close()
+            _CODEX_LOGIN = None
+        # `fresh`: this decides whether to run a sign-in at all, so a cached
+        # answer could either start a flow the CLI then refuses, or skip one
+        # the operator actually needs.
+        if amp.codex_logged_in(fresh=True):
+            # Starting a flow that the CLI will refuse, and then reporting its
+            # refusal, would be a confusing way to say "already done".
+            return {"ok": True, "connected": True}
+        lg = amp.CodexLogin()
+        try:
+            out = lg.start()
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
+        _CODEX_LOGIN = lg
+        amp.open_url(out["url"])        # Chrome, per browser_cmd()
+        return {"ok": True, **out}
+
+
+def do_codex_auth_poll() -> dict:
+    global _CODEX_LOGIN
+    with _CODEX_LOCK:
+        lg = _CODEX_LOGIN
+        if not lg:
+            # A poll with nothing running is not necessarily an error: the flow
+            # may have finished and been cleared. Answer from the CLI, and
+            # `fresh`, because "may have just finished" is exactly the window a
+            # cached answer would still be reporting the state before.
+            if amp.codex_logged_in(fresh=True):
+                return {"ok": True, "connected": True}
+            return {"ok": False, "error": "sign-in is not running - click Connect ChatGPT"}
+        out = lg.poll()
+        if out["state"] != "pending":
+            _CODEX_LOGIN = None
+        if out["state"] == "failed":
+            return {"ok": False, "error": out["error"]}
+        return {"ok": True, "connected": out["state"] == "connected",
+                "url": out.get("url"), "code": out.get("code")}
+
+
+def do_settings() -> dict:
+    """What is switched on, and what each switch actually stops."""
+    cfg = amp.config()
+    return {
+        "ok": True,
+        "architect_backend": amp.architect_backend(),
+        "architect_backends": list(amp.ARCHITECT_BACKENDS),
+        "architect_ready": amp.architect_available(),
+        "architect_reason": None if amp.architect_available() else amp.architect_off_reason(),
+        "codex_installed": amp.codex_available(),
+        "codex_logged_in": amp.codex_logged_in(),
+        "openrouter_enabled": amp.openrouter_enabled(),
+        "openrouter_key": bool(amp.find_openrouter_key()),
+        "auto_escalate": bool(cfg.get("auto_escalate", True)),
+        "architect_actions": amp.ARCHITECT_ACTIONS,
+        "auto_max_rounds": amp.AUTO_MAX_ROUNDS,
+        "roles": amp.role_view(),
+    }
+
+
+def do_role_set(body: dict) -> dict:
+    """Turn a role on or off, or change which model answers as it."""
+    role = body.get("role")
+    on = body.get("on")
+    model = body.get("model")
+    if on is None and model is None:
+        return {"ok": False, "error": "nothing to set - expected `on` or `model`"}
+    try:
+        roles = amp.set_role(role, on=None if on is None else bool(on), model=model)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    return {**do_settings(), "roles": roles}
+
+
+SETTINGS_FLAGS = ("openrouter_enabled", "auto_escalate")
+# Not a flag: it names one of a fixed set, and an unrecognised name is refused
+# here rather than written and silently fallen back from at read time.
+SETTINGS_CHOICES = {"architect_backend": amp.ARCHITECT_BACKENDS}
+
+
+def do_settings_set(body: dict) -> dict:
+    cfg = amp.config()
+    changed = {}
+    for k in SETTINGS_FLAGS:
+        if k in body:
+            cfg[k] = bool(body[k])
+            changed[k] = cfg[k]
+    for k, allowed in SETTINGS_CHOICES.items():
+        if k in body:
+            v = body[k]
+            if v not in allowed:
+                return {"ok": False,
+                        "error": f"{k} must be one of {', '.join(allowed)}"}
+            cfg[k] = v
+            changed[k] = v
+    if not changed:
+        return {"ok": False, "error": f"nothing to set - expected any of "
+                                      f"{', '.join(SETTINGS_FLAGS + tuple(SETTINGS_CHOICES))}"}
+    amp.save_json(amp.CONFIG_PATH, cfg)
+    return {**do_settings(), "changed": changed}
+
+
+def do_codex_auth_cancel() -> dict:
+    global _CODEX_LOGIN
+    with _CODEX_LOCK:
+        if _CODEX_LOGIN:
+            _CODEX_LOGIN.close()
+            _CODEX_LOGIN = None
+    return {"ok": True}
+
+
+def do_task(lane: str, task_id: str) -> dict:
+    for rec in amp.board().get("tasks", {}).get(lane, []):
+        if rec.get("task_id") == task_id:
+            return {"ok": True, "task": rec}
+    return {"ok": False, "error": "no such task"}
+
+
+def do_log(lane: str, task_id: str) -> dict:
+    """The worker's own turn-by-turn transcript, not just its final answer."""
+    task = do_task(lane, task_id)
+    if not task["ok"]:
+        return task
+    rec = task["task"]
+    if rec.get("backend") != "claude":
+        return {"ok": False, "error": "only claude lanes keep a transcript"}
+    # A resumed task appends to the session it resumed, so that is the log.
+    session = rec.get("session_id") or rec.get("resume_of") or rec.get("task_id")
+    events = amp.transcript(session)
+    if not events:
+        return {"ok": False, "error": f"no transcript on disk for session {session[:8]}"
+                                      " (the worker may not have started)"}
+    return {"ok": True, "session_id": session, "task": rec, "events": events}
+
+
+# ---------------------------------------------------------------- orchestrator chat
+
+
+def _first_line(text: str, limit: int = 240) -> str:
+    """A prompt or a result, shortened to something a chat bubble can hold."""
+    body = " ".join((text or "").split())
+    return body[:limit] + "…" if len(body) > limit else body
+
+
+def chat_payload() -> dict:
+    """The orchestrator thread: operator notes merged with what the board did.
+
+    Task activity is derived rather than stored, so the thread cannot disagree
+    with the board it is summarising.
+    """
+    msgs = [{"kind": "note", "id": n["id"], "at": n["at"], "lane": n.get("lane"),
+             "text": n["text"]}
+            for n in amp.notes()]
+    # The orchestrator's own conversation. Unlike the rest of the feed this is
+    # stored, because it is the thing itself rather than a summary of it.
+    for t in amp.orchestrator_turns():
+        msgs.append({
+            "kind": "you" if t["role"] == "you" else "amp",
+            "id": t["id"], "at": t["at"], "text": t.get("text") or "",
+            "status": t.get("status"), "cost_usd": t.get("cost_usd"),
+            "num_turns": t.get("num_turns"),
+        })
+    for lane, recs in amp.board().get("tasks", {}).items():
+        for rec in recs:
+            tid, backend = rec.get("task_id"), rec.get("backend")
+            if rec.get("dispatched_at"):
+                msgs.append({
+                    "kind": "dispatch", "id": f"d:{tid}", "at": rec["dispatched_at"],
+                    "lane": lane, "task_id": tid, "backend": backend,
+                    "model": rec.get("model"), "resumed": bool(rec.get("resume_of")),
+                    "text": _first_line(rec.get("prompt", "")),
+                })
+            if rec.get("finished_at"):
+                msgs.append({
+                    "kind": "result", "id": f"r:{tid}", "at": rec["finished_at"],
+                    "lane": lane, "task_id": tid, "backend": backend,
+                    "status": rec.get("status"), "cost_usd": rec.get("cost_usd"),
+                    "num_turns": rec.get("num_turns"),
+                    "text": _first_line(rec.get("error") or rec.get("result") or ""),
+                })
+    # Escalations belong in the thread too - an architect ruling on a lane is
+    # the most consequential thing that happens here, and it is the one thing
+    # that can start without you.
+    for summary in amp.consults():
+        c = amp.load_consult(summary["id"])
+        if not c:
+            continue
+        rounds = 0
+        msgs.append({
+            "kind": "escalation", "id": f"e:{c['id']}", "at": c["opened_at"],
+            "lane": c.get("lane"), "consult_id": c["id"],
+            "trigger": c.get("trigger"), "text": _first_line(c.get("question", "")),
+        })
+        for i, t in enumerate(c.get("turns", [])):
+            if t["role"] != "gpt":
+                continue
+            rounds += 1
+            msgs.append({
+                "kind": "ruling", "id": f"g:{c['id']}:{i}", "at": t["at"],
+                "lane": c.get("lane"), "consult_id": c["id"], "round": rounds,
+                "needs": len(amp.parse_needs(t["text"])),
+                "text": _first_line(t["text"]),
+            })
+    msgs.sort(key=lambda m: m.get("at") or "")
+    return {"ok": True, "messages": msgs}
+
+
+# ---------------------------------------------------------------- prior sessions
+
+
+def do_history(limit: int, everywhere: bool) -> dict:
+    """Every recent Claude Code chat about this workspace, and what looks wrong."""
+    sessions = amp.prior_sessions(limit=limit, under=None if everywhere else amp.ROOT)
+    return {"ok": True, "sessions": sessions,
+            "troubled": sum(1 for s in sessions if s["symptoms"])}
+
+
+def do_session_log(session_id: str) -> dict:
+    events = amp.session_events(session_id)
+    if not events:
+        return {"ok": False, "error": f"no readable transcript for {session_id[:8]}"}
+    return {"ok": True, "session_id": session_id, "events": events}
+
+
+def do_history_note(body: dict) -> dict:
+    """Put a prior chat into the orchestrator thread, so it is on the board."""
+    sid = body.get("session_id") or ""
+    path = amp.transcript_path(sid)
+    if not path:
+        return {"ok": False, "error": "no such session"}
+    s = amp.scan_session(path)
+    symptoms = amp.diagnose_session(s)
+    amp.add_note(
+        f"prior chat {sid[:8]} in {s['project']} ({s['last_at'][:16]}): "
+        + (", ".join(symptoms) if symptoms else "nothing obviously wrong")
+        + f"\n{s['first_prompt'][:200]}",
+        lane=body.get("lane") or None,
+    )
+    return {"ok": True, "symptoms": symptoms}
+
+
+def do_history_ask(body: dict) -> dict:
+    """Hand a prior chat to the architect: what went wrong, and what to do now."""
+    sid = body.get("session_id") or ""
+    lane = body.get("lane") or ""
+    cfg = amp.config()
+    if lane not in cfg["lanes"]:
+        return {"ok": False, "error": f"pick a lane to attach this to (got {lane!r})"}
+    if not amp.architect_available():
+        return {"ok": False, "error": amp.architect_off_reason()}
+    brief = amp.session_brief(sid)
+    if not brief:
+        return {"ok": False, "error": "no such session"}
+    try:
+        c = amp.open_consult(
+            lane,
+            "This is a prior Claude Code session in this workspace that may have gone "
+            "wrong. Diagnose it: say what it was trying to do, where it actually got "
+            "to, what went wrong, and what the next build order should be.\n\n" + brief,
+            model_key=body.get("model") or cfg.get("consult_model", amp.DEFAULT_CONSULT),
+            trigger="history",
+        )
+    except SystemExit as e:
+        return {"ok": False, "error": str(e) or "consult failed"}
+    return {"ok": True, "consult": _consult_view(c)}
+
+
+def _run_orchestrator_bg(text: str):
+    try:
+        amp.orchestrator_ask(text, base_url=BASE_URL)
+    except Exception:
+        traceback.print_exc()
+
+
+def do_chat_send(body: dict) -> dict:
+    """Send a line.
+
+    With a lane named it goes straight to a worker in that lane, unchanged -
+    the escape hatch for when you already know exactly who should do it.
+    Without one it goes to the orchestrator, which can answer, look things up,
+    run git here, and dispatch to lanes itself.
+    """
+    text = (body.get("text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "nothing to send"}
+    lane = (body.get("lane") or "").strip()
+    if lane == "note":
+        amp.add_note(text)
+        return {"ok": True, "dispatched": False}
+    if lane:
+        out = do_dispatch({**body, "lane": lane, "prompt": text})
+        if not out.get("ok"):
+            return out
+        return {"ok": True, "dispatched": True, "lane": lane, "task_id": out.get("task_id")}
+    if not amp.claude_available():
+        return {"ok": False, "error": "claude CLI not found"}
+    if amp.orch_busy():
+        return {"ok": False, "error": "the orchestrator is still working on the last one"}
+    threading.Thread(target=_run_orchestrator_bg, args=(text,), daemon=True).start()
+    return {"ok": True, "dispatched": False, "orchestrating": True}
 
 
 # ---------------------------------------------------------------- http
@@ -339,6 +1722,39 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "text": p.read_text()})
             if u.path == "/api/credits":
                 return self._send(200, do_credits())
+            if u.path == "/api/task":
+                return self._send(
+                    200, do_task((q.get("lane") or [""])[0], (q.get("task_id") or [""])[0])
+                )
+            if u.path == "/api/log":
+                return self._send(
+                    200, do_log((q.get("lane") or [""])[0], (q.get("task_id") or [""])[0])
+                )
+            if u.path == "/api/chat":
+                return self._send(200, chat_payload())
+            if u.path == "/api/history":
+                return self._send(200, do_history(
+                    int((q.get("limit") or ["40"])[0]),
+                    (q.get("all") or [""])[0] == "1"))
+            if u.path == "/api/session":
+                return self._send(200, do_session_log((q.get("id") or [""])[0]))
+            if u.path == "/api/consults":
+                return self._send(200, do_consults((q.get("lane") or [None])[0],
+                                                   (q.get("id") or [None])[0]))
+            if u.path == "/api/goal":
+                return self._send(200, do_goal({"goal_id": (q.get("id") or [""])[0]}))
+            if u.path == "/api/findings":
+                return self._send(200, do_findings(
+                    (q.get("lane") or [None])[0],
+                    (q.get("unread") or [""])[0] == "1"))
+            if u.path == "/api/obligations":
+                return self._send(200, do_obligations())
+            if u.path == "/api/direction":
+                return self._send(200, do_direction((q.get("lane") or [None])[0]))
+            if u.path == "/api/workspaces":
+                return self._send(200, do_workspaces())
+            if u.path == "/api/supervisor":
+                return self._send(200, do_supervisor())
             if u.path == "/api/diff":
                 lane = (q.get("lane") or [""])[0]
                 attempt = q.get("attempt")
@@ -360,12 +1776,96 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_poll(body.get("lane")))
             if u.path == "/api/dispatch":
                 return self._send(200, do_dispatch(body))
+            if u.path == "/api/chat":
+                return self._send(200, do_chat_send(body))
             if u.path == "/api/ask":
                 return self._send(200, do_ask(body))
+            if u.path == "/api/goal/open":
+                return self._send(200, do_open_goal(body))
+            if u.path == "/api/goal/answer":
+                return self._send(200, do_answer_goal(body))
+            if u.path == "/api/goal/push":
+                return self._send(200, do_push_goal(body))
+            if u.path == "/api/goal/close":
+                return self._send(200, do_close_goal(body))
+            # Two routes, not one with a flag. The dry run is something you can
+            # call freely and often; the other one leaves the machine.
+            if u.path == "/api/goal/publish/report":
+                return self._send(200, do_publish_report(body))
+            if u.path == "/api/goal/publish":
+                return self._send(200, do_publish_goal(body))
+            # Reviewing is a read that costs a model call; adopting is the only
+            # one of the three that starts work, and it is a separate word.
+            if u.path == "/api/direction/review":
+                return self._send(200, do_direction_review(body))
+            if u.path == "/api/direction/proposal":
+                return self._send(200, do_direction_proposal(body))
+            if u.path == "/api/direction/auto":
+                return self._send(200, do_direction_auto(body))
+            if u.path == "/api/findings/ack":
+                return self._send(200, do_ack_findings(body))
+            if u.path == "/api/doctrine/ratify":
+                return self._send(200, do_ratify_doctrine())
+            # `use` moves the ground under everything else in this process and
+            # refuses while anything is running; the rest are bookkeeping.
+            if u.path == "/api/workspace/use":
+                return self._send(200, do_workspace_use(body))
+            if u.path == "/api/workspace/add":
+                return self._send(200, do_workspace_add(body))
+            if u.path == "/api/workspace/rename":
+                return self._send(200, do_workspace_rename(body))
+            if u.path == "/api/workspace/remove":
+                return self._send(200, do_workspace_remove(body))
+            if u.path == "/api/mission":
+                return self._send(200, do_mission(body))
+            if u.path == "/api/supervise":
+                return self._send(200, do_supervise())
+            if u.path == "/api/obligation/add":
+                return self._send(200, do_add_obligation(body))
+            if u.path == "/api/obligation/check":
+                return self._send(200, do_check_obligation(body))
+            if u.path == "/api/obligation/set":
+                return self._send(200, do_set_obligation(body))
+            if u.path == "/api/obligation/remove":
+                return self._send(200, do_remove_obligation(body))
+            if u.path == "/api/consult/relay":
+                return self._send(200, do_relay(body))
+            if u.path == "/api/consult/continue":
+                return self._send(200, do_continue_consult(body))
+            if u.path == "/api/consult/close":
+                return self._send(200, do_close_consult(body))
+            if u.path == "/api/cancel":
+                return self._send(200, do_cancel(body))
+            if u.path == "/api/restart":
+                return self._send(200, do_restart(body))
+            if u.path == "/api/history/note":
+                return self._send(200, do_history_note(body))
+            if u.path == "/api/history/ask":
+                return self._send(200, do_history_ask(body))
             if u.path == "/api/apply":
                 return self._send(200, do_apply(body))
+            if u.path == "/api/lane/add":
+                return self._send(200, do_lane_add(body))
             if u.path == "/api/lane/env":
                 return self._send(200, do_bind_env(body))
+            if u.path == "/api/lane/backend":
+                return self._send(200, do_set_backend(body))
+            if u.path == "/api/auth/start":
+                return self._send(200, do_auth_start())
+            if u.path == "/api/auth/code":
+                return self._send(200, do_auth_code(body))
+            if u.path == "/api/codex-auth/start":
+                return self._send(200, do_codex_auth_start())
+            if u.path == "/api/codex-auth/poll":
+                return self._send(200, do_codex_auth_poll())
+            if u.path == "/api/codex-auth/cancel":
+                return self._send(200, do_codex_auth_cancel())
+            if u.path == "/api/settings":
+                return self._send(200, do_settings())
+            if u.path == "/api/settings/set":
+                return self._send(200, do_settings_set(body))
+            if u.path == "/api/role/set":
+                return self._send(200, do_role_set(body))
             return self._send(404, {"error": "unknown endpoint"})
         except Exception:
             traceback.print_exc()
@@ -387,18 +1887,69 @@ def main(argv=None):
     ap.add_argument("--open", action="store_true", help="open a browser")
     a = ap.parse_args(argv)
 
+    global BASE_URL
     port = free_port(a.port)
     srv = ThreadingHTTPServer((a.host, port), Handler)
     url = f"http://{a.host}:{port}"
+    BASE_URL = url
+    # A turn marked `running` in the file names a process that died with the
+    # last server. Left alone it wedges the dock, since a busy orchestrator
+    # refuses the next line.
+    for t in amp.orchestrator_turns():
+        if t.get("status") == "running":
+            amp.orch_update(t["id"], {"status": "failed", "finished_at": amp.now(),
+                                      "text": "interrupted - the console restarted"})
+    # Lane workers outlive the console rather than dying with it, so the same
+    # sweep has to reach them - but by picking them back up, not writing them
+    # off. One of these is a live Opus session with a budget already spent.
+    for a_ in amp.adopt_orphans():
+        print(f"  {'picked up' if a_['adopted'] else 'settled orphaned'} "
+              f"{a_['lane']} {a_['task_id'][:8]}"
+              + (f" (pid {a_['pid']})" if a_.get("pid") else ""))
+        if a_["adopted"]:
+            # Synchronously, before anything can dispatch: the lane an adopted
+            # worker occupies must look occupied.
+            lk = lane_lock(a_["lane"])
+            lk.acquire()
+            threading.Thread(target=_hold_lane_for_adopted,
+                             args=(a_["lane"], a_["task_id"], lk), daemon=True).start()
+    # Order matters: the queue is drained only after adoption has run, so the
+    # cap counts the workers that were picked up and their lanes read as busy.
+    amp.ON_SETTLE = _drain_queue
+    # A worker this process did not start still has an architect waiting on it.
+    amp.ON_WORKER_DONE = _settle
+    # A ruling that asks for evidence sends a worker for it, rather than stopping.
+    amp.ON_CONSULT_NEEDS = _gather_for_consult
+    # A goal sends its own next task out.
+    amp.ON_GOAL_DISPATCH = _dispatch_for_goal
+    # The hooks above are deliberately set after adoption, so nothing dispatches
+    # into a lane whose lock has not been re-taken yet. That leaves a window: a
+    # worker that finished during it reported to nobody. This closes it.
+    for cid in _recover_stuck_consults():
+        print(f"  relayed a finished worker into consult {cid}")
+    for gid in _recover_stuck_goals():
+        print(f"  picked goal {gid} back up")
+    n_q = _load_queue()
+    if n_q:
+        print(f"  {n_q} queued task(s) restored")
+    _drain_queue()
+    # Standing obligations are checked on a clock, not on a page view: one that
+    # is only evaluated while someone is watching is not standing.
+    n_ob = len(amp.obligations())
+    if n_ob:
+        print(f"  {n_ob} standing obligation(s) on a {_OBLIGATION_TICK / 60:.0f}m clock")
+    threading.Thread(target=_obligation_ticker, daemon=True).start()
+    print(f"  goals kept moving on a {_PIPELINE_TICK:.0f}s heartbeat")
+    threading.Thread(target=_pipeline_ticker, daemon=True).start()
     print(f"amp console -> {url}")
-    if not amp.codex_logged_in():
-        print("  ! codex is not logged in - run `codex login` to enable dispatch")
+    if not amp.claude_available():
+        print("  ! claude CLI not found - claude lanes cannot dispatch")
     if not amp.find_openrouter_key():
         print("  ! no OpenRouter key - escalation disabled")
+    if amp.claude_auth_problem():
+        print("  ! Claude not connected - open the console and click Connect Claude")
     if a.open:
-        import webbrowser
-
-        webbrowser.open(url)
+        amp.open_url(url)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

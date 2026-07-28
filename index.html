@@ -17,26 +17,58 @@
   <div class="health" id="health"></div>
   <div class="actions">
     <span class="credit" id="credit"></span>
+    <!-- Which workspace, before anything else in this bar: every number on the
+         page is scoped to it, so reading the page without seeing it is how you
+         end up reasoning about the wrong board. -->
+    <select id="ws-pick" title="which set of lanes, goals and history you are looking at"></select>
+    <!-- Why the select will not move, said where the select is. This used to be
+         written into a status line inside the Mission sheet, which is closed
+         when you are using the header - so switching looked like it did
+         nothing at all. -->
+    <span class="ws-why" id="ws-why"></span>
+    <span class="align" id="align"></span>
+    <button id="btn-mission" title="what this workspace is for, and whether the work still is">Mission</button>
+    <button id="btn-settings" title="what spends, and what to switch off">Settings</button>
     <button id="btn-poll" class="primary">Poll</button>
   </div>
 </header>
 
 <div id="banner" class="banner hidden"></div>
+<!-- What the work has said about the doctrine, above everything the harness
+     noticed by itself: a contradiction means something we believed is false. -->
+<div id="findings" class="findings hidden"></div>
+<!-- Things that have to keep being true and currently do not. Below findings:
+     a stale build is a chore, a contradiction is news. -->
+<div id="obligations" class="obligations hidden"></div>
+<div id="watch" class="watch hidden"></div>
+<div id="running" class="running hidden"></div>
 
 <main>
   <section class="lanes">
     <div class="section-head">
       <h2>Lanes</h2>
       <span class="muted" id="polled">never polled</span>
+      <button id="btn-lane-add" title="Register a repo under the workspace as a lane">+ lane</button>
     </div>
     <div id="lane-list" class="lane-list"></div>
+    <div id="lane-add" class="lane-add hidden">
+      <input id="la-name" placeholder="lane name" autocomplete="off">
+      <input id="la-path" placeholder="directory (defaults to the name)" autocomplete="off">
+      <input id="la-branch" placeholder="branch (main)" autocomplete="off">
+      <div class="row"><button id="la-go" class="primary">Add</button><button id="la-cancel">Cancel</button></div>
+      <div id="la-msg" class="msg"></div>
+    </div>
   </section>
 
   <section class="detail">
     <nav class="tabs">
       <button class="tab active" data-tab="dispatch">Dispatch</button>
+      <button class="tab" data-tab="goals">Goals</button>
+      <button class="tab" data-tab="direction">Direction</button>
+      <button class="tab" data-tab="log">Log</button>
       <button class="tab" data-tab="diff">Diff</button>
       <button class="tab" data-tab="ask">Ask GPT-5.6</button>
+      <button class="tab" data-tab="history">History</button>
       <button class="tab" data-tab="rulings">Rulings</button>
     </nav>
 
@@ -44,27 +76,79 @@
       <div class="pane-head">
         <h3>Dispatch to <span class="lane-chip" id="d-lane">&mdash;</span></h3>
         <div class="row">
+          <label>worker <select id="d-backend"><option value="claude">claude</option><option value="codex">codex</option></select></label>
           <label>branch <input id="d-branch" type="text" placeholder="main"></label>
-          <label>best-of <input id="d-attempts" type="number" min="1" max="5" value="1"></label>
+          <label class="claude-only">cap $ <input id="d-budget" type="number" min="0.05" step="0.25" value="1"></label>
+          <label class="claude-only">model <input id="d-model" type="text" placeholder="opus"></label>
+          <label class="codex-only">best-of <input id="d-attempts" type="number" min="1" max="5" value="1"></label>
         </div>
       </div>
-      <textarea id="d-prompt" rows="14" placeholder="Task for the Codex Cloud worker.
-
-Write it self-contained: the cloud CLI has no message/answer channel, so a task
-that stops to ask a question cannot be replied to headlessly."></textarea>
+      <div id="d-resume" class="resume hidden"></div>
+      <textarea id="d-prompt" rows="12" placeholder="Task for the worker."></textarea>
       <div class="pane-foot">
         <button id="btn-dispatch" class="primary">Dispatch</button>
+        <button id="btn-reply" class="claude-only">Reply to last</button>
         <span class="muted" id="d-status"></span>
       </div>
+      <!-- A div, not a pre: the worker's report is rendered markdown now, and
+           block elements inside a pre are both invalid and squashed by its
+           inherited white-space. `md` is what turns that white-space back off. -->
+      <div id="d-out" class="ruling md"></div>
+    </div>
+
+    <div class="pane" id="pane-goals">
+      <div class="pane-head">
+        <h3>Goals in <span class="lane-chip" id="g-lane">&mdash;</span></h3>
+        <div class="row">
+          <button id="btn-g-new" class="primary">New goal</button>
+          <span class="muted" id="g-status"></span>
+        </div>
+      </div>
+      <div id="g-new" class="lane-add hidden">
+        <textarea id="g-objective" rows="3" placeholder="What has to be true when this is finished. One objective, not a task list - the architect writes that."></textarea>
+        <div class="row"><button id="g-go" class="primary">Plan it</button><button id="g-cancel">Cancel</button></div>
+        <div class="msg">This calls GPT-5.6 to write a definition of done and a task list against the real repo, then sends the first worker. Takes about 20 seconds.</div>
+      </div>
+      <div id="g-list" class="goal-list"></div>
+    </div>
+
+    <!-- Above goals rather than beside them: a goal is what has to be true next,
+         and this is what any of it was for. Four things kept apart on purpose -
+         the bet, what the work is held to, what the work said back, and what we
+         still do not know. -->
+    <div class="pane" id="pane-direction">
+      <div class="pane-head">
+        <h3>Direction <span class="muted" id="dir-lane"></span></h3>
+        <div class="row">
+          <label title="Let a review open the goals it proposes, without asking">
+            <input id="dir-auto" type="checkbox"> adopt automatically</label>
+          <button id="btn-dir-review">Review a finished goal</button>
+          <span class="muted" id="dir-status"></span>
+        </div>
+      </div>
+      <div id="dir-out" class="direction">loading…</div>
+    </div>
+
+    <div class="pane" id="pane-log">
+      <div class="pane-head">
+        <h3>Transcript for <span class="lane-chip" id="l-lane">&mdash;</span>
+          <span id="l-live" class="live hidden"><span class="dot"></span>live</span></h3>
+        <div class="row">
+          <label>session <select id="l-task"></select></label>
+          <label><input id="l-thinking" type="checkbox"> thinking</label>
+          <button id="btn-loadlog">Load</button>
+        </div>
+      </div>
+      <div id="l-out" class="log">Pick a session, then Load.</div>
     </div>
 
     <div class="pane" id="pane-diff">
       <div class="pane-head">
         <h3>Diff for <span class="lane-chip" id="f-lane">&mdash;</span></h3>
         <div class="row">
-          <label>attempt <input id="f-attempt" type="number" min="1" max="5" placeholder="1"></label>
+          <label class="codex-only">attempt <input id="f-attempt" type="number" min="1" max="5" placeholder="1"></label>
           <button id="btn-loaddiff">Load</button>
-          <button id="btn-apply" class="danger">Apply locally</button>
+          <button id="btn-apply" class="danger codex-only">Apply locally</button>
         </div>
       </div>
       <pre id="f-out" class="diff">Poll a lane, then Load.</pre>
@@ -74,27 +158,169 @@ that stops to ask a question cannot be replied to headlessly."></textarea>
       <div class="pane-head">
         <h3>Escalate <span class="lane-chip" id="a-lane">&mdash;</span> to GPT-5.6</h3>
         <div class="row">
+          <label>thread <select id="a-consult"></select></label>
           <label>model <select id="a-model"></select></label>
+          <button id="btn-a-new">New thread</button>
         </div>
       </div>
-      <textarea id="a-question" rows="8" placeholder="What is blocking, and what ruling do you need?
+      <div id="a-needs" class="needs hidden"></div>
+      <div id="a-thread" class="log">Ask a question to open a thread with the architect.</div>
+      <textarea id="a-question" rows="5" placeholder="What is blocking, and what ruling do you need?
 
-The packet auto-includes: recent commits, working-tree status, the uncommitted
-diff, recent dispatches, and the lane's cloud tasks."></textarea>
+The packet auto-includes recent commits, working-tree status, the uncommitted diff,
+the worker's branch diff, its recent dispatches, and a digest of what it actually did.
+If the architect asks for a file by name it is fetched and sent without another round."></textarea>
       <div class="pane-foot">
         <button id="btn-ask" class="primary">Ask</button>
+        <button id="btn-relay">Relay ruling to worker</button>
+        <label><input id="a-report" type="checkbox" checked> report back</label>
+        <button id="btn-a-close">Close thread</button>
         <span class="muted" id="a-status"></span>
       </div>
-      <pre id="a-out" class="ruling"></pre>
+    </div>
+
+    <div class="pane" id="pane-history">
+      <div class="pane-head">
+        <h3>Earlier chats <span class="muted" id="h-count"></span></h3>
+        <div class="row">
+          <label><input id="h-troubled" type="checkbox"> only ones that look wrong</label>
+          <label><input id="h-all" type="checkbox"> outside this workspace</label>
+          <button id="btn-h-load">Rescan</button>
+        </div>
+      </div>
+      <div id="h-list" class="hist-list">Rescan to read the sessions on this disk.</div>
+      <div id="h-out" class="log"></div>
     </div>
 
     <div class="pane" id="pane-rulings">
       <div class="pane-head"><h3>Saved rulings</h3></div>
       <div id="r-list" class="ruling-list"></div>
-      <pre id="r-out" class="ruling"></pre>
+      <div id="r-out" class="ruling md"></div>
     </div>
   </section>
 </main>
+
+<div id="dock" class="dock">
+  <div class="dock-head" id="dock-head">
+    <span class="dock-title">[&amp;] orchestrator</span>
+    <span class="muted" id="dock-sub">the thread that runs the others</span>
+    <span class="dock-toggle" id="dock-toggle">&minus;</span>
+  </div>
+  <div id="dock-feed" class="dock-feed"></div>
+  <div class="dock-compose">
+    <select id="dock-lane" title="the orchestrator by default, or straight to one lane"></select>
+    <input id="dock-text" type="text" placeholder="ask, or say what you want done" autocomplete="off">
+    <button id="dock-send" class="primary">Send</button>
+  </div>
+</div>
+
+<div id="signin" class="modal hidden">
+  <div class="sheet">
+    <h3>Connect Claude</h3>
+    <p class="muted">Signs in once and stores a long-lived worker token, so background
+    workers no longer depend on whatever credentials a terminal happens to carry.</p>
+    <div id="si-link"></div>
+    <div class="row">
+      <input id="si-code" type="text" placeholder="paste code here" autocomplete="off">
+      <button id="btn-si-submit" class="primary">Connect</button>
+      <button id="btn-si-cancel">Cancel</button>
+    </div>
+    <span id="si-status" class="muted"></span>
+  </div>
+</div>
+
+<!-- The mission and the supervisor share one sheet because they are one thing
+     seen twice: what this workspace is for, and whether it still is. Workspaces
+     are managed at the bottom of it, since a workspace with no mission is the
+     thing this sheet exists to stop. -->
+<div id="mission" class="modal hidden">
+  <div class="sheet wide">
+    <h3>Mission <span class="lane-chip" id="mi-ws-name">&mdash;</span></h3>
+    <p class="muted">What this workspace is for, in your words. It goes out with the
+    doctrine to every plan, every worker and every review, and it is the only text
+    here no agent may write. The doctrine says <em>how</em> work is done anywhere in
+    this ecosystem; this says <em>what this workspace is for</em>.</p>
+    <textarea id="mi-text" rows="6" placeholder="What this workspace is for. One or two paragraphs - what counts as being on it, and what would be off it."></textarea>
+    <div class="row">
+      <button id="btn-mi-save" class="primary">Save mission</button>
+      <span class="muted" id="mi-status"></span>
+    </div>
+
+    <h4>Alignment</h4>
+    <p class="muted">The supervisor reads the mission, the doctrine, every goal in
+    every lane, what is proposed, what the work has reported back, which standing
+    obligations are failing, and what is running - and says whether that is still
+    the mission. It recommends. It never stops, starts or closes anything.</p>
+    <div class="row">
+      <button id="btn-supervise">Take a reading</button>
+      <span class="muted" id="mi-sup-status"></span>
+    </div>
+    <div id="mi-sup" class="supervisor"></div>
+
+    <h4>Workspaces</h4>
+    <p class="muted">A workspace is a separate board: its own lanes, goals, consults,
+    findings, obligations, direction and worktrees. Switching is refused while
+    anything is running, because every path this console writes to moves with it.</p>
+    <div id="mi-ws" class="ws-list"></div>
+    <div class="row">
+      <input id="mi-new" placeholder="name a new workspace" autocomplete="off">
+      <button id="btn-ws-add">Create</button>
+      <span class="muted" id="mi-ws-status"></span>
+    </div>
+
+    <div class="row"><button id="btn-mi-close">Close</button></div>
+  </div>
+</div>
+
+<div id="settings" class="modal hidden">
+  <div class="sheet wide">
+    <h3>Settings</h3>
+
+    <h4>Who does what</h4>
+    <p class="muted">Three roles, three models, three switches. These are the
+    lights in the header. <b>Off means refused</b>, not hidden: a role you switch
+    off here stops running, and the thing that would have used it says so.</p>
+    <div id="set-roles"></div>
+    <p class="muted">Every role lists every model. <b>opus</b>, <b>sonnet</b> and
+    <b>haiku</b> run on your Claude subscription; <b>codex</b> runs
+    <code>codex exec</code> against your ChatGPT one. Neither spends metered
+    money. <b>luna</b>, <b>terra</b> and <b>sol</b> are the paid OpenRouter tiers,
+    cheapest first. A supervisor set to <b>architect</b> follows whatever the
+    architect is, so you only change it in one place.</p>
+    <p class="muted">A greyed-out option is one that role cannot do at all, and
+    it says why on the line. One that names a problem in brackets can still be
+    picked &mdash; that is a sign-in away from working, not a dead end.</p>
+    <label class="switch">
+      <input id="set-openrouter" type="checkbox">
+      <span>Allow spending OpenRouter credit</span>
+    </label>
+    <p class="muted">Off means nothing in this console can spend OpenRouter credit.
+    Reading your remaining balance is a free request and keeps working.</p>
+    <div id="set-actions"></div>
+    <label class="switch">
+      <input id="set-auto-escalate" type="checkbox">
+      <span>Auto-escalate a blocked worker to a new thread</span>
+    </label>
+    <div class="row">
+      <button id="btn-set-close">Close</button>
+    </div>
+    <span id="set-status" class="muted"></span>
+  </div>
+</div>
+
+<div id="cx-signin" class="modal hidden">
+  <div class="sheet">
+    <h3>Connect ChatGPT</h3>
+    <p class="muted">Signs Codex in against your ChatGPT subscription. Open the page,
+    enter the code below, and this window will notice when you approve it.</p>
+    <div id="cx-link"></div>
+    <div id="cx-code" class="pairing hidden"></div>
+    <div class="row">
+      <button id="btn-cx-cancel">Cancel</button>
+    </div>
+    <span id="cx-status" class="muted"></span>
+  </div>
+</div>
 
 <script src="app.js"></script>
 </body>
