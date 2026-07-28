@@ -5501,6 +5501,7 @@ ESCALATE_DEFAULTS = {
     "lane_failures": 2,
     "notional_day_usd": 60.0,
     "off_mission": True,
+    "fleet_floor": 3,
 }
 
 
@@ -5557,7 +5558,22 @@ def escalations(lane_name: str | None = None) -> list[dict]:
             out.append({"gate": "lane_failures", "at": streak, "limit": pol["lane_failures"],
                         "why": f"{lane_name}'s last {streak} goals stopped without finishing. "
                                f"Another goal is not what that lane needs."})
+    if pol.get("fleet_floor"):
+        live = sum(1 for r in goals() if r.get("state") == "running")
+        if live < int(pol["fleet_floor"]) and not open_proposals():
+            out.append({"gate": "fleet_floor", "at": live, "limit": pol["fleet_floor"],
+                        "why": f"{live} goal(s) are still running and there is nothing left "
+                               f"to adopt. A review proposes only inside the lane it was "
+                               f"reviewing, so a lane that says it is exhausted stays empty - "
+                               f"the fleet drains a lane at a time and no gate above notices. "
+                               f"What to build next is yours to say."})
     return out
+
+
+def open_proposals() -> list[dict]:
+    """Proposed objectives nobody has adopted or turned down yet."""
+    return [p for p in direction_store().get("proposals", [])
+            if p.get("state") == "open" and p.get("kind") == "goal"]
 
 
 DIRECTION_SYSTEM = (
