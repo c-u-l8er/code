@@ -245,6 +245,12 @@ def state_payload() -> dict:
             "findings": found["unread"],
             "contradicted": found["contradicted"],
             "goals_stuck": sum(1 for g in live_goals if g["state"] == "blocked"),
+            # Of those, the ones stopped because a budget ran out rather than
+            # because they need a decision. Both say `blocked`, but only one of
+            # them is anybody waiting: a goal out of rounds is a lane that has
+            # quietly retired, and it reads as healthy next to the ones that
+            # correctly asked you something.
+            "goals_spent": len(amp.budget_stopped()),
             # A goal that is running with nobody on it. The heartbeat restarts
             # these, so a number here that does not fall within a minute means
             # the restart itself is failing - which is worth seeing, and used to

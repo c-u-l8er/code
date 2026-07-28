@@ -4831,13 +4831,19 @@ def goal_dispatch(gid: str) -> dict:
 def run_check(cmd: str, cwd: Path) -> tuple[int | None, str]:
     """Run one done-item's check. Returns (exit code or None if it timed out, output).
 
-    Not `subprocess.run(..., timeout=)`, which is a hang waiting to happen here.
-    On timeout that kills the shell and then drains the pipes again with NO
-    second timeout - so a check that started anything outliving its shell (a dev
-    server, a watcher, a stray build daemon) leaves a grandchild holding the
-    write end, and the drain blocks forever. The review thread never returns, so
-    the goal keeps a live `reviewing_pid`, so `idle_goals` skips it on purpose,
-    and the one goal that can never be recovered is the one that hung.
+    Not `subprocess.run(..., timeout=)`, because that kills only the SHELL. A
+    check that starts anything outliving it - a dev server, a watcher, a build
+    daemon - leaves those running in the worktree after the timeout, and they
+    accumulate one per timed-out check, all holding the same lane's tree open.
+    Measured on `sleep N & sleep N` with a 3s ceiling: the old path leaves two
+    processes behind, this one leaves none.
+
+    RETRACTED: this said the old path would also HANG FOREVER after the kill,
+    because its second drain has no timeout of its own and a grandchild still
+    holds the pipe. That is what the stdlib code reads like, but four attempts
+    to reproduce it (`setsid sleep`, a detached writer, `nohup`) all raised
+    `TimeoutExpired` on schedule. The leak is measured; the hang is not, and was
+    never observed in this repo.
 
     So: own process group, kill the GROUP, and give the drain a deadline of its
     own. A check that will not die is reported as a check that would not die.
@@ -5526,6 +5532,9 @@ def set_auto_adopt(on: bool) -> bool:
 #     another goal. It is a lane with something wrong in it.
 #   notional_day   - a crude burn ceiling, so a loop that has started going in
 #     circles cannot spend the subscription window doing it all night.
+#   budget_stops   - goals that ran out of rounds or tokens. Nothing restarts
+#     them and nothing proposes past them, so each one silently retires a lane.
+#   fleet_floor    - too few goals still running and nothing left to adopt.
 #
 # Every gate is a REASON TO ASK, never a reason to kill: nothing already running
 # is stopped. Crossing one only means the pipeline stops feeding ITSELF new
@@ -5537,6 +5546,7 @@ ESCALATE_DEFAULTS = {
     "notional_day_usd": 60.0,
     "off_mission": True,
     "fleet_floor": 3,
+    "budget_stops": 2,
 }
 
 
@@ -5593,6 +5603,18 @@ def escalations(lane_name: str | None = None) -> list[dict]:
             out.append({"gate": "lane_failures", "at": streak, "limit": pol["lane_failures"],
                         "why": f"{lane_name}'s last {streak} goals stopped without finishing. "
                                f"Another goal is not what that lane needs."})
+    if pol.get("budget_stops"):
+        spent = budget_stopped()
+        if len(spent) >= int(pol["budget_stops"]):
+            named = ", ".join(f"{r['lane']} ({r['stopped_on']}, {r['rounds']} rounds)"
+                              for r in spent[:6])
+            out.append({"gate": "budget_stops", "at": len(spent), "limit": pol["budget_stops"],
+                        "why": f"{len(spent)} goal(s) ran out of the budget they were given "
+                               f"and stopped without finishing: {named}. Nothing restarts "
+                               f"them and nothing proposes past them - only a FINISHED goal "
+                               f"gets a direction review - so each one holds its lane for "
+                               f"good and the fleet loses a lane at a time. Extend the "
+                               f"budget or close the goal; both are yours."})
     if pol.get("fleet_floor"):
         live = sum(1 for r in goals() if r.get("state") == "running")
         if live < int(pol["fleet_floor"]) and not open_proposals():
@@ -5603,6 +5625,26 @@ def escalations(lane_name: str | None = None) -> list[dict]:
                                f"the fleet drains a lane at a time and no gate above notices. "
                                f"What to build next is yours to say."})
     return out
+
+
+def budget_stopped() -> list[dict]:
+    """Goals that stopped because they ran out of rounds or tokens, not because
+    they finished and not because they need a decision.
+
+    These are the quiet way the fleet shrinks. A goal that hits `GOAL_MAX_ROUNDS`
+    is set to `blocked`, and three separate things then decline to touch it:
+    `idle_goals` only considers goals that still say `running`, the direction
+    review that proposes the NEXT objective in a lane fires only on the `done`
+    path, and `goals_stuck` counts it alongside the goals correctly waiting on an
+    operator decision. So the lane it was holding never runs anything again, and
+    the board reads as if somebody was asked a question.
+
+    Restarting them automatically is not the fix - the cap exists so that
+    deciding to spend more reaches you (doctrine rule 6). Being able to see them
+    is.
+    """
+    return [r for r in goals()
+            if r.get("state") == "blocked" and r.get("stopped_on") in ("rounds", "tokens")]
 
 
 def open_proposals() -> list[dict]:
