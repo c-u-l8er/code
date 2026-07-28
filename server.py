@@ -1083,6 +1083,17 @@ def _pipeline_ticker():
                 print(f"amp: restarted idle goal {gid}")
         except Exception:
             traceback.print_exc()
+        # The queue is otherwise drained only by a settling worker, which is
+        # sound only while every enqueue has a live worker behind it - true
+        # today, since you can only be queued for a busy lane or a full cap, but
+        # enforced nowhere. If that ever stops holding, the queue holds work,
+        # nothing is running, and nothing is looking: the exact shape of the
+        # halt this ticker was written for. Not a diagnosed bug; a no-op when
+        # there is nothing to start.
+        try:
+            _drain_queue()
+        except Exception:
+            traceback.print_exc()
 
 
 def _obligation_ticker():
