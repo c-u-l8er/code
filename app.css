@@ -205,7 +205,10 @@ main {
 .lane-add .msg { font-size: 11px; color: var(--muted); line-height: 1.45; }
 .lane-add .msg.err { color: var(--bad); }
 
-.lane-list { overflow-y: auto; flex: 1 1 auto; }
+/* overflow-anchor: belt and braces with the render guard in renderLanes(). Even
+   a genuine change re-anchors this scroller, and re-anchoring on a poll is what
+   walked the panel downward on its own. */
+.lane-list { overflow-y: auto; flex: 1 1 auto; overflow-anchor: none; }
 
 .lane {
   padding: 10px 14px;

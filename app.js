@@ -448,13 +448,26 @@ async function cxDone(msg) {
   setTimeout(() => $('cx-signin').classList.add('hidden'), 1200);
 }
 
+// Rebuilt only when the markup actually changes, and scrolled back to where you
+// left it when it does.
+//
+// This used to replace the whole list on every refresh - every 3s while anything
+// is live - and `.lane-list` is a scroll container. Replacing all of a scroller's
+// children makes the browser re-anchor, and doing it on a beat walks the list
+// downward about a centimetre a tick: a panel that scrolls itself away while you
+// are reading it. Nothing was scrolling it; it was being rebuilt underneath.
+//
+// Most of those rebuilds were also identical, because lanes change far more
+// slowly than the poll. So the cheap fix and the correct one are the same:
+// don't touch the DOM unless the output differs. Same rule the obligations and
+// findings lists already follow.
 function renderLanes() {
   const el = $('lane-list');
   if (!state.lanes.length) {
-    el.innerHTML = '<div class="empty">No lanes configured.</div>';
+    paintLanes(el, '<div class="empty">No lanes configured.</div>');
     return;
   }
-  el.innerHTML = state.lanes
+  const html = state.lanes
     .map((l) => {
       const tasks = (l.tasks || [])
         .map(
@@ -475,9 +488,22 @@ function renderLanes() {
     })
     .join('');
 
+  if (!paintLanes(el, html)) return;   // unchanged: listeners are still on the
+                                       // nodes that are still there
   el.querySelectorAll('.lane').forEach((n) =>
     n.addEventListener('click', () => select(n.dataset.lane))
   );
+}
+
+/** Write `html` into `el` only if it differs. Returns whether it wrote. */
+function paintLanes(el, html) {
+  if (el.dataset.painted === html) return false;
+  const top = el.scrollTop;
+  el.innerHTML = html;
+  el.dataset.painted = html;
+  el.scrollTop = top;                  // a real change must not send you to the
+                                       // top of a list you were reading either
+  return true;
 }
 
 function select(name) {
