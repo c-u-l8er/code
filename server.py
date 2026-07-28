@@ -1484,7 +1484,8 @@ def do_settings() -> dict:
         # what the scores behind it actually turned out to be worth is a number
         # asking to be trusted, and there is no reason to.
         "adopt_confidence": amp.adopt_bar(),
-        "calibration": amp.confidence_calibration(),
+        "adopt_need": amp.need_bar(),
+        "calibration": amp.calibration(),
     }
 
 
@@ -1506,23 +1507,28 @@ SETTINGS_FLAGS = ("openrouter_enabled", "auto_escalate")
 # Not a flag: it names one of a fixed set, and an unrecognised name is refused
 # here rather than written and silently fallen back from at read time.
 SETTINGS_CHOICES = {"architect_backend": amp.ARCHITECT_BACKENDS}
+# Neither: probabilities, and they live under `autonomy` rather than at the top
+# level because they are thresholds on how much runs without being watched.
+SETTINGS_BARS = ("adopt_confidence", "adopt_need")
 
 
 def do_settings_set(body: dict) -> dict:
     cfg = amp.config()
     changed = {}
-    # Not a flag and not a choice: a number, refused here if it is not one or
-    # not a probability, rather than written and clamped silently at read time
-    # where the operator would never learn the bar is not where they set it.
-    if "adopt_confidence" in body:
+    # Neither flags nor choices: numbers, refused here if they are not ones or
+    # not probabilities, rather than written and clamped silently at read time
+    # where the operator would never learn a bar is not where they set it.
+    for k in SETTINGS_BARS:
+        if k not in body:
+            continue
         try:
-            v = float(body["adopt_confidence"])
+            v = float(body[k])
         except (TypeError, ValueError):
-            return {"ok": False, "error": "adopt_confidence must be a number between 0 and 1"}
+            return {"ok": False, "error": f"{k} must be a number between 0 and 1"}
         if not 0.0 <= v <= 1.0:
-            return {"ok": False, "error": f"adopt_confidence must be between 0 and 1, not {v}"}
-        cfg.setdefault("autonomy", {})["adopt_confidence"] = round(v, 3)
-        changed["adopt_confidence"] = round(v, 3)
+            return {"ok": False, "error": f"{k} must be between 0 and 1, not {v}"}
+        cfg.setdefault("autonomy", {})[k] = round(v, 3)
+        changed[k] = round(v, 3)
     for k in SETTINGS_FLAGS:
         if k in body:
             cfg[k] = bool(body[k])
@@ -1537,8 +1543,8 @@ def do_settings_set(body: dict) -> dict:
             changed[k] = v
     if not changed:
         return {"ok": False, "error": f"nothing to set - expected any of "
-                                      f"{', '.join(SETTINGS_FLAGS + tuple(SETTINGS_CHOICES))}"
-                                      f", adopt_confidence"}
+                                      f"{', '.join(SETTINGS_FLAGS + tuple(SETTINGS_CHOICES)
+                                                   + SETTINGS_BARS)}"}
     amp.save_json(amp.CONFIG_PATH, cfg)
     return {**do_settings(), "changed": changed}
 

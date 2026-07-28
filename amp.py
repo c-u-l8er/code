@@ -5813,70 +5813,164 @@ def open_proposals() -> list[dict]:
             if p.get("state") == "open" and p.get("kind") == "goal"]
 
 
-# ------------------------------------------------------------------ odds
-# Every proposed objective carries a number, and the number is the odds it
-# FINISHES: every done-condition judged met, without stopping to ask the
-# operator for something.
+# ------------------------------------------------------------- four scores
+# Every proposed objective carries four numbers, and each one exists because a
+# different question has to be answered before a lane is spent on it:
 #
-# That definition is the whole design. "How good is this idea" cannot be
-# checked afterwards and therefore cannot be wrong, which makes it worthless as
-# a gate - a model would be free to say 0.9 forever. "Did it finish" is written
-# into the goal file either way, by machinery that was here before the score
-# was, so the estimate is answerable to something that does not care what was
-# estimated. `confidence_calibration()` is that comparison, and it is the
-# reason any of this is worth more than a model asserting a number about
-# itself. Read it before trusting the bar.
+#   odds     - will it FINISH: every done-condition judged met, without stopping
+#     to ask the operator for something.
+#   need     - how much the mission wants it NOW: which rung of the evidence
+#     ladder it moves, and what stops being unknown when it lands.
+#   cost     - what it will spend to find out, in notional dollars.
+#   headroom - whether looking at it AGAIN would help: is it held back by how it
+#     is written, or by something only the operator can supply.
 #
-# The bar is the dial between "adopt everything" and "ask me about everything".
-# It is deliberately NOT one of the `escalations()` gates: those are facts about
-# the workspace and hold every lane at once, this is a fact about one objective
-# and holds only that objective.
+# The discipline that makes them worth anything is that EACH ANSWERS TO A
+# RECORDED EVENT. "How good is this idea" cannot be checked afterwards and
+# therefore cannot be wrong, which makes it worthless as a gate - a model would
+# be free to say 0.9 forever. So: odds is checked against the goal's final
+# state, need against whether the rung it claimed actually moved in the next
+# review, cost against what the goal's tasks really billed, and headroom against
+# whether the next sharpen round ACTUALLY RAISED the score - which the sharpener
+# already records, because it writes down what a proposal scored before and
+# after. `calibration()` is those four comparisons, and it is the only reason any
+# of this is worth more than a model asserting numbers about itself. Read it
+# before trusting a bar.
+#
+# Headroom is the one that decides where an architect call goes. Sharpening is
+# not free and only one runs per tick, so the question "which held proposal is
+# worth looking at again" needs an answer better than "the oldest". A proposal
+# stuck at 30% because it bundles five things can be split and will move. One
+# stuck at 30% because it needs a credential nobody has will score 30% forever,
+# and spending two rounds discovering that is the waste this number prevents.
+#
+# A fifth number is DERIVED and never stated: `worth`, which is
+# odds x need / cost. It is what ranks proposals when several are waiting and
+# only one can be started, and it is deliberately not a gate - a cheap certainty
+# that the mission barely wants should not outrank the thing we actually need.
+#
+# What was rejected, and why, so it does not get re-proposed: blast radius (real
+# but the wrong layer - workers already run in isolated worktrees and `apply`
+# refuses to merge), urgency split from importance (no distinct recorded event
+# checks it, so it would be a dial with nothing behind it), and duplication
+# (already handled by the dedupe and by telling the architect what is open).
+#
+# The bars are the dial between "adopt everything" and "ask me about
+# everything". They are deliberately NOT `escalations()` gates: those are facts
+# about the workspace and hold every lane at once, these are facts about one
+# objective and hold only that objective.
 
 DEFAULT_ADOPT_CONFIDENCE = 0.6
+DEFAULT_ADOPT_NEED = 0.5
 SHARPEN_MAX_ROUNDS = 2
+
+# Below this much headroom the harness stops spending calls on a proposal by
+# itself. Not a bar the operator sets, because it is not a decision about how
+# much autonomy to allow - it is the point past which the architect has said its
+# own next answer would be the same one.
+SHARPEN_FLOOR = 0.15
+
+# Divisor floor for `worth`. A proposal estimated at nothing is not infinitely
+# worth doing, it is one nobody has costed - and without a floor it would sort
+# above every real proposal forever.
+COST_FLOOR_USD = 0.25
 
 
 def pct(c) -> str:
-    """Odds as a percentage, or the word for not having any. `0.0` is a score."""
+    """A score as a percentage, or the word for not having one. `0.0` is a score."""
     return "unscored" if c is None else f"{float(c):.0%}"
 
 
-def _scored(n: dict) -> dict:
-    """The odds fields off an architect reply, clamped and typed.
+def usd(c) -> str:
+    return "uncosted" if c is None else f"${float(c):.2f}"
 
-    An unreadable or absent score is `None`, never `0.0`. They mean opposite
-    things - 0.0 is "this will not finish", None is "nobody has judged it" -
-    and a missing field quietly becoming the most damning number in the range
-    would hold a proposal back for a reason nobody ever stated.
+
+def _num(v, lo: float, hi: float):
+    """One number off an architect reply, clamped, or None if it was not one.
+
+    Absent or unreadable is `None`, never `0.0`. They mean opposite things -
+    0.0 is "this will not finish" or "the mission does not want this", None is
+    "nobody has judged it" - and a missing field quietly becoming the most
+    damning number in the range would hold a proposal back, or rank it top, for
+    a reason nobody ever stated.
     """
     try:
-        c = float(n.get("confidence"))
+        return round(min(hi, max(lo, float(v))), 3)
     except (TypeError, ValueError):
-        c = None
-    if c is not None:
-        c = round(min(1.0, max(0.0, c)), 3)
+        return None
+
+
+def _scored(n: dict) -> dict:
+    """The four scores off an architect reply, clamped and typed."""
+    c, need = _num(n.get("confidence"), 0.0, 1.0), _num(n.get("need"), 0.0, 1.0)
     return {"confidence": c,
+            "need": need,
+            "why_need": str(n.get("why_need") or "")[:400],
+            # No upper clamp worth naming: an honest estimate of a very large
+            # job is information, and squashing it to a ceiling would make the
+            # expensive thing sort like a cheap one.
+            "cost_usd": _num(n.get("cost_usd"), 0.0, 10_000.0),
+            "headroom": _num(n.get("headroom"), 0.0, 1.0),
+            "why_headroom": str(n.get("why_headroom") or "")[:400],
             "unknowns": [str(u)[:300] for u in (n.get("unknowns") or []) if str(u).strip()][:6],
             "scored_at": now() if c is not None else None}
 
 
-def adopt_bar() -> float:
-    """The odds a proposal must reach to be adopted with nobody watching."""
+def _bar(key: str, default: float) -> float:
     cfg = config().get("autonomy") or {}
     try:
-        return min(1.0, max(0.0, float(cfg.get("adopt_confidence", DEFAULT_ADOPT_CONFIDENCE))))
+        return min(1.0, max(0.0, float(cfg.get(key, default))))
     except (TypeError, ValueError):
-        return DEFAULT_ADOPT_CONFIDENCE
+        return default
+
+
+def adopt_bar() -> float:
+    """The odds a proposal must reach to be adopted with nobody watching."""
+    return _bar("adopt_confidence", DEFAULT_ADOPT_CONFIDENCE)
+
+
+def need_bar() -> float:
+    """How much the mission must want it before it is started unattended."""
+    return _bar("adopt_need", DEFAULT_ADOPT_NEED)
+
+
+def worth(p: dict):
+    """Expected mission movement per dollar. The ranking key, never a gate.
+
+    None unless all three are known, because a partial answer here is worse
+    than no answer: an unscored proposal would rank either top or bottom on
+    whichever field happened to be missing.
+    """
+    c, need = p.get("confidence"), p.get("need")
+    if c is None or need is None:
+        return None
+    cost = p.get("cost_usd")
+    return round(c * need / max(COST_FLOOR_USD, cost if cost is not None else COST_FLOOR_USD), 3)
 
 
 def proposal_hold(p: dict) -> str | None:
-    """Why this proposal may not be adopted unattended, or None if it may."""
-    c = p.get("confidence")
+    """Why this proposal may not be adopted unattended, or None if it may.
+
+    Cost is not tested here on purpose. It ranks, and it feeds the burn ceiling
+    that already exists in `escalations()`; making it a third bar would mean a
+    proposal we badly need and are confident about gets refused for being big,
+    which is a decision about what to spend and therefore the operator's.
+    """
+    c, need = p.get("confidence"), p.get("need")
+    # Named separately rather than as one "unscored", because they are different
+    # missing facts with different fixes, and a proposal scored under the old
+    # single-number scheme has one of them and not the other.
+    if c is None and need is None:
+        return "nobody has scored it yet"
     if c is None:
-        return "nobody has put odds on it yet"
-    bar = adopt_bar()
+        return "nobody has judged whether it would finish"
+    if need is None:
+        return "nobody has judged how much the mission wants it"
+    bar, nbar = adopt_bar(), need_bar()
     if c < bar:
         return f"{c:.0%} odds of finishing, under the {bar:.0%} bar you set"
+    if need < nbar:
+        return f"the mission wants it {need:.0%}, under the {nbar:.0%} bar you set"
     return None
 
 
@@ -5910,12 +6004,117 @@ def _record_block(lane_name: str) -> str:
             f"objective read on its own.")
 
 
-def confidence_calibration() -> dict:
-    """What the scores turned out to be worth.
+LADDER_RUNGS = ("spec", "in_tree", "live_local", "live_deployed", "external")
+
+
+def lane_rungs() -> dict[str, str]:
+    """The highest rung each lane has actually been judged to reach.
+
+    Derived from the reviews, not asserted anywhere: a review records the claims
+    a finished goal moved and the rungs it moved them between, so the top of
+    that list is the furthest the lane's evidence has ever got. This is the
+    single most useful fact for judging how much the mission wants a proposal,
+    and it is exactly what an architect reading one objective cannot see.
+    """
+    top: dict[str, str] = {}
+    for r in direction_store().get("reviews", []):
+        lane_name = r.get("lane")
+        for e in (r.get("ladder") or []):
+            rung = e.get("to")
+            if not lane_name or rung not in LADDER_RUNGS:
+                continue
+            if lane_name not in top or LADDER_RUNGS.index(rung) > LADDER_RUNGS.index(top[lane_name]):
+                top[lane_name] = rung
+    return top
+
+
+def _need_block(lane_name: str) -> str:
+    """Where every lane stands, so `need` is scored against the stack, not the lane.
+
+    Deliberately the WHOLE stack and not just this lane. Need is comparative -
+    it is how much the mission wants this next, and "next" means instead of
+    everything else - so an architect shown one lane in isolation has no way to
+    say anything but "quite a lot".
+    """
+    top = lane_rungs()
+    if not top:
+        return ""
+    rows = []
+    for name in sorted(set(top) | {lane_name}):
+        rung = top.get(name)
+        rows.append(f"- **{name}**{' (the lane you are scoring)' if name == lane_name else ''}: "
+                    + (f"evidence has reached `{rung}`" if rung
+                       else "no claim has ever been judged past `spec`"))
+    return ("# How far each lane's evidence has actually got\n\n"
+            + "\n".join(rows)
+            + "\n\nThese are the rungs recorded by earlier reviews, so they are what the "
+              "stack has EARNED, not what it aims at. Score `need` against the distance "
+              "between this and the mission.")
+
+
+def goal_spend(gid: str) -> float:
+    """What a goal's workers actually billed, notionally. The check on `cost`."""
+    return round(sum(float(r.get("cost_usd") or 0)
+                     for recs in (board().get("tasks") or {}).values() for r in recs
+                     if r.get("goal_id") == gid), 2)
+
+
+def _moved_a_rung(gid: str) -> bool | None:
+    """Did the review after this goal actually move a claim up the ladder?
+
+    The check on `need`, and the weakest of the three - a rung moves because a
+    later architect call judged the evidence reached it, so this is one model's
+    reading of another's estimate. It is still worth having, because the two
+    calls see different things: the scorer sees an objective and the reviewer
+    sees what the work came back with. None means no review has run yet, which
+    is not evidence either way.
+    """
+    revs = [r for r in direction_store().get("reviews", []) if r.get("goal_id") == gid]
+    if not revs:
+        return None
+    return any(r.get("ladder") for r in revs)
+
+
+def _refine_record() -> dict:
+    """Whether claimed headroom turned into anything. The check on `headroom`.
+
+    Reads the log every sharpen attempt writes: what the proposal was claimed to
+    have left in it, what it scored before, and what the best version of it
+    scored after. The event is `after > before`, so this is a probability
+    checked the same way `confidence` is.
+
+    It needs no goal to have run, which makes it the fastest of the four to
+    become real - the loop closes inside the pipeline instead of waiting on a
+    fleet. That is also its limit: it says the sharpener knows when it can help,
+    not that helping was worth the call.
+    """
+    n = rose = 0
+    said = gain = 0.0
+    for p in direction_store().get("proposals", []):
+        for a in (p.get("sharpen_log") or []):
+            if a.get("claimed_headroom") is None or a.get("before") is None \
+                    or a.get("after") is None:
+                continue
+            n += 1
+            said += a["claimed_headroom"]
+            if a["after"] > a["before"]:
+                rose += 1
+            gain += a["after"] - a["before"]
+    return {"n": n,
+            "stated": round(said / n, 2) if n else None,
+            "actual": round(rose / n, 2) if n else None,
+            "gain": round(gain / n, 3) if n else None,
+            "floor": SHARPEN_FLOOR}
+
+
+def calibration() -> dict:
+    """What the four scores turned out to be worth.
 
     Reads only what was already recorded: an adopted proposal names the goal it
-    opened, and that goal has since finished or stopped. `done` is the exact
-    event the score is a probability of, so nothing here needs interpreting.
+    opened, and that goal has since finished or stopped. Each score is checked
+    against its own event and they are kept apart, because they can be wrong in
+    opposite directions - consistently over-confident and consistently
+    under-costed would cancel in any single number and stay invisible.
 
     Goals still open are counted nowhere. They are not evidence yet, and
     counting them as failures is how a calibration table talks itself into
@@ -5926,26 +6125,101 @@ def confidence_calibration() -> dict:
               "n": 0, "finished": 0} for i, lo in enumerate(edges)]
     n = fin = 0
     stated = 0.0
+    need_n = need_moved = 0
+    need_said = 0.0
+    cost_n = 0
+    cost_said = cost_real = 0.0
     for p in direction_store().get("proposals", []):
         c = p.get("confidence")
-        if p.get("state") != "adopted" or c is None or not p.get("goal_id"):
+        if p.get("state") != "adopted" or not p.get("goal_id"):
             continue
         g = load_goal(p["goal_id"])
         if not g or g.get("state") in ("planning", "running"):
             continue
-        row = [b for b in bands if c >= b["from"]][-1]
-        row["n"] += 1
-        n += 1
-        stated += c
-        if g.get("state") == "done":
-            row["finished"] += 1
-            fin += 1
+        if c is not None:
+            row = [b for b in bands if c >= b["from"]][-1]
+            row["n"] += 1
+            n += 1
+            stated += c
+            if g.get("state") == "done":
+                row["finished"] += 1
+                fin += 1
+        moved = _moved_a_rung(p["goal_id"])
+        if p.get("need") is not None and moved is not None:
+            need_n += 1
+            need_said += p["need"]
+            need_moved += 1 if moved else 0
+        # Only goals that ran to a stop are costed. A goal stopped early spent
+        # less than it would have, and reading that as an over-estimate would
+        # teach the scorer to under-cost everything.
+        real = goal_spend(p["goal_id"])
+        if p.get("cost_usd") is not None and real > 0 and g.get("state") == "done":
+            cost_n += 1
+            cost_said += p["cost_usd"]
+            cost_real += real
     for b in bands:
         b["rate"] = round(b["finished"] / b["n"], 2) if b["n"] else None
-    return {"bands": bands, "n": n, "bar": adopt_bar(),
-            "stated": round(stated / n, 2) if n else None,
-            "actual": round(fin / n, 2) if n else None}
+    return {
+        "bands": bands, "n": n, "bar": adopt_bar(), "need_bar": need_bar(),
+        "stated": round(stated / n, 2) if n else None,
+        "actual": round(fin / n, 2) if n else None,
+        "need": {"n": need_n,
+                 "stated": round(need_said / need_n, 2) if need_n else None,
+                 "moved": round(need_moved / need_n, 2) if need_n else None},
+        "cost": {"n": cost_n,
+                 "stated": round(cost_said / cost_n, 2) if cost_n else None,
+                 "actual": round(cost_real / cost_n, 2) if cost_n else None},
+        "refine": _refine_record(),
+    }
 
+
+# Stated once and used by both the review and the sharpener. They used to carry
+# near-identical copies of this text, which is how two definitions of the same
+# number quietly stop being the same number.
+_SCORE_RULES = (
+    "- `confidence` is a probability, and it is a probability of ONE recorded event: that a "
+    "worker fleet given this objective finishes it and has every one of its done-conditions "
+    "judged met, WITHOUT stopping to ask the operator for something. Stopping to ask counts "
+    "as not finishing. It is not how good the idea is and it is not how strongly you hold "
+    "it: it is the share of times this would land. The number is written down, the outcome "
+    "is written down beside it, and the two are compared - so a run of 0.9s that keep "
+    "stopping is a visible fact about the scoring, not about the lanes. Anything resting on "
+    "money, a credential, an account, a deployed target, or a decision about what counts as "
+    "good enough is a stop, and an objective that needs one is BELOW 0.5 however good it "
+    "is.\n"
+    "- `need` is how much the MISSION wants this objective next, and it is a separate "
+    "question from whether it would succeed. 1.0 is the thing the mission is currently "
+    "blocked on. 0.0 is real work that the mission would not miss. Score it against the "
+    "mission and the rung each lane is actually on, which you have been given - not against "
+    "how interesting it is, and not against how close to done it feels. Tidying, "
+    "refactoring, and more tests of a thing already at its rung are LOW however cheap and "
+    "safe they are. What moves a lane to a rung it has never reached, or answers something "
+    "the mission is waiting on, is HIGH even when it is hard.\n"
+    "- `why_need` must name the specific thing: which claim moves from which rung to which, "
+    "or which open question closes. \"It advances the mission\" is not an answer. This is "
+    "checked - the review that follows the goal records which claims actually moved, and a "
+    "high `need` whose rung never moved is a visible fact about the scoring.\n"
+    "- `cost_usd` is what you expect the workers to burn finding out, at API prices, for "
+    "this objective end to end including the retries a job like this usually needs. It is "
+    "compared against what the goal really billed. Do not anchor on a round number: a "
+    "one-file change that a worker verifies with an existing check is well under a dollar, "
+    "and something that has to stand up a substrate is many.\n"
+    "- `headroom` is the odds that LOOKING AT THIS AGAIN would raise its score - that the "
+    "objective is held back by how it is written rather than by the world. High means there "
+    "is something to do: it bundles several things that could be split, it reaches for a rung "
+    "when a lower one would do first, it is vague where being specific would make it "
+    "checkable. Low means the score is what it is: the thing it needs does not exist, or only "
+    "the operator can supply it, and no amount of rewording changes that. An objective that "
+    "is already good scores LOW too - there is nothing to improve. This decides where the "
+    "next architect call is spent, and it is checked: the score before and after each attempt "
+    "is recorded, so claiming headroom that never materialises is visible.\n"
+    "- `why_headroom` names the specific move - \"split the deploy off from the harness\", "
+    "\"aim at in_tree first\" - or says plainly that there is none. Do not describe the move "
+    "and then not make it in `revision`; if you can see it, make it.\n"
+    "- `unknowns` is what the objective needs that nobody has established exists, one clause "
+    "each. An empty list claims everything it touches is already there, so return one only "
+    "when that is true. This is the list that gets attacked to raise the number."
+)
 
 DIRECTION_SYSTEM = (
     "You are the consulting architect deciding where a codebase should go next. A goal "
@@ -5963,6 +6237,11 @@ DIRECTION_SYSTEM = (
     '  "next": [{"objective": "one objective, what has to be true when it is finished",\n'
     '            "why": "what it buys, in terms of the thesis or an open question",\n'
     '            "confidence": 0.0,\n'
+    '            "need": 0.0,\n'
+    '            "why_need": "which rung moves, or which open question closes, if it lands",\n'
+    '            "cost_usd": 0.0,\n'
+    '            "headroom": 0.0,\n'
+    '            "why_headroom": "the move that would raise this, or that there is none",\n'
     '            "unknowns": ["what this needs that is not established to exist"]}],\n'
     '  "research": [{"question": "what we do not know", "why": "why it matters",\n'
     '                "settled_by": "the observation or experiment that would answer it"}],\n'
@@ -5978,19 +6257,7 @@ DIRECTION_SYSTEM = (
     "not restate work that is already open, and do not propose work whose only merit is "
     "that it is more work. If the honest answer is that this lane is finished for now, "
     "return an empty list and set `exhausted` to true with a reason.\n"
-    "- `confidence` is a probability, and it is a probability of ONE recorded event: that a "
-    "worker fleet given this objective finishes it and has every one of its done-conditions "
-    "judged met, WITHOUT stopping to ask the operator for something. Stopping to ask counts "
-    "as not finishing. It is not how good the idea is, it is not how much you want it done, "
-    "and it is not how confident you feel: it is the share of times this would land. That "
-    "number is written down, the outcome is written down beside it, and the two are compared "
-    "- so a lane of 0.9s that keep stopping is a visible fact about the scoring and not about "
-    "the lane. Anything needing money, a credential, an account, a deployed target, or a "
-    "decision about what counts as good enough is a stop, and an objective that rests on one "
-    "is BELOW 0.5 however good it is.\n"
-    "- `unknowns` is what that objective needs and nobody has established exists yet, one "
-    "clause each. An empty list is a claim that everything it touches is already there, so "
-    "make it only when that is true. This is the list that gets attacked to raise the number.\n"
+    + _SCORE_RULES + "\n"
     "- `research` is the highest-value thing you can return: something we believe and have "
     "not tested, or that this goal has just made answerable. It must be stated so that it "
     "could come out either way, and `settled_by` must be something someone could actually "
@@ -6041,47 +6308,40 @@ def _direction_context(g: dict, sections: list[dict]) -> str:
     rec = _record_block(lane_name)
     if rec:
         parts.append(rec)
+    stands = _need_block(lane_name)
+    if stands:
+        parts.append(stands)
     parts.append(f"# The repository right now\n\n{goal_brief(lane_name)}")
     return "\n\n".join(parts)
 
 
-_ODDS_RULE = (
-    "- `confidence` is a probability, and it is a probability of ONE recorded event: that a "
-    "worker fleet given this objective finishes it and has every one of its done-conditions "
-    "judged met, WITHOUT stopping to ask the operator for something. Stopping to ask counts "
-    "as not finishing. It is not how good the idea is and it is not how strongly you hold "
-    "it: it is the share of times this would land. The number is written down, the outcome "
-    "is written down beside it, and the two are compared - so a run of 0.9s that keep "
-    "stopping is a visible fact about the scoring, not about the lanes. Anything resting on "
-    "money, a credential, an account, a deployed target, or a decision about what counts as "
-    "good enough is a stop, and an objective that needs one is BELOW 0.5 however good it is.\n"
-    "- `unknowns` is what the objective needs that nobody has established exists, one clause "
-    "each. An empty list claims everything it touches is already there, so return one only "
-    "when that is true. This is the list that gets attacked to raise the number."
-)
+_SCORE_FIELDS = ('"confidence": 0.0, "need": 0.0, "why_need": "...", "cost_usd": 0.0, '
+                 '"headroom": 0.0, "why_headroom": "...", "unknowns": ["..."]')
 
 SHARPEN_SYSTEM = (
     "You are the consulting architect. An objective has been proposed for one lane of the "
-    "operator's stack and has not been started. Say what its odds are, and then see whether "
-    "they can be raised without giving up what it was for.\n\n"
+    "operator's stack and has not been started. Score it, and then see whether it can be "
+    "made more likely to land without giving up what it was for.\n\n"
     "Reply with one JSON object and nothing else:\n"
     "{\n"
-    '  "confidence": 0.0,\n'
-    '  "unknowns": ["..."],\n'
-    '  "reasoning": "why that number, 1-3 sentences",\n'
-    '  "revision": {"objective": "...", "why": "...", "confidence": 0.0, "unknowns": ["..."],\n'
+    "  " + _SCORE_FIELDS + ",\n"
+    '  "reasoning": "why those numbers, 1-3 sentences",\n'
+    '  "revision": {"objective": "...", "why": "...", ' + _SCORE_FIELDS + ",\n"
     '               "what_changed": "what you narrowed or split off, and which unknown that '
     'kills"} or null,\n'
-    '  "alternates": [{"objective": "...", "why": "...", "confidence": 0.0, '
-    '"unknowns": ["..."]}]\n'
+    '  "alternates": [{"objective": "...", "why": "...", ' + _SCORE_FIELDS + "}]\n"
     "}\n\n"
     "Rules:\n"
-    + _ODDS_RULE + "\n"
+    + _SCORE_RULES + "\n"
     "- A `revision` is THE SAME objective made likelier to land: narrowed, or with the part "
     "that needs something we do not have split off, or aimed at a lower rung of the evidence "
     "ladder first so the higher one becomes reachable later. It must still be worth doing. A "
     "revision that scores well by asking for nothing of value is worse than the original - "
     "return null. Return null too if you cannot honestly beat the original.\n"
+    "- Raising `confidence` by cutting the objective down until the mission no longer wants "
+    "it is not an improvement, and it will show: `need` is scored too, and a revision that "
+    "trades need away for odds is the failure this rule exists to catch. If the only way to "
+    "make it likely is to make it not worth doing, return null and say so.\n"
     "- You may not raise a number by deciding something that is the operator's. If an unknown "
     "is money, a credential, an account, a deploy target, or what counts as good enough, the "
     "honest revision is one that DOES NOT NEED it - never one that assumes it, and never one "
@@ -6101,7 +6361,10 @@ def _sharpen_context(p: dict) -> str:
     if p.get("why"):
         parts.append(f"## Why it was proposed\n\n{p['why']}")
     if p.get("confidence") is not None:
-        parts.append(f"## What it was scored before\n\n{p['confidence']:.2f}"
+        parts.append("## What it was scored before\n\n"
+                     f"odds {pct(p.get('confidence'))}, "
+                     f"need {pct(p.get('need'))}, cost {usd(p.get('cost_usd'))}"
+                     + (f"\nwhy it was needed: {p['why_need']}" if p.get("why_need") else "")
                      + ("\nunknowns then: " + "; ".join(p.get("unknowns") or [])
                         if p.get("unknowns") else "")
                      + "\n\nYou have already tried once to improve this. Say so and stop if "
@@ -6113,6 +6376,9 @@ def _sharpen_context(p: dict) -> str:
     rec = _record_block(lane_name)
     if rec:
         parts.append(rec)
+    stands = _need_block(lane_name)
+    if stands:
+        parts.append(stands)
     parts.append(f"# The repository right now\n\n{goal_brief(lane_name)}")
     return "\n\n".join(parts)
 
@@ -6126,11 +6392,11 @@ def sharpen_proposal(pid: str) -> dict:
     becomes adoptable without anything else changing;
 
     a REVISION is the same objective made likelier, and it becomes a new
-    proposal that supersedes this one - but ONLY if it actually scores higher.
-    A revision that scores lower is not an improvement, it is a different and
-    worse objective with the original thrown away, and taking it because it
-    arrived under the heading "revision" is how a sharpener talks a lane into
-    smaller and smaller work;
+    proposal that supersedes this one - but ONLY if it is both more likely to
+    land AND no less wanted by the mission. A revision that scores lower is not
+    an improvement, it is a different and worse objective with the original
+    thrown away, and taking it because it arrived under the heading "revision"
+    is how a sharpener talks a lane into smaller and smaller work;
 
     ALTERNATES are different routes to the same end and are added alongside.
     They never replace anything, because "here is another way" is not a claim
@@ -6156,6 +6422,10 @@ def sharpen_proposal(pid: str) -> dict:
     scored = _scored(out)
     rounds = int(p.get("sharpen_rounds") or 0) + 1
     was = p.get("confidence")
+    # Read before the new score overwrites it. This is the claim the call is
+    # about to test: somebody said looking again would help, and this call is
+    # the looking.
+    claimed = p.get("headroom")
 
     rev, alts = out.get("revision") or None, []
     made = []
@@ -6183,8 +6453,16 @@ def sharpen_proposal(pid: str) -> dict:
             store["proposals"].append(new)
             return new
 
+        # More likely to land, AND no less wanted. The second half is the guard
+        # that matters now: narrowing an objective almost always raises its
+        # odds, and the cheapest way to raise them is to cut away the part the
+        # mission actually wanted. That revision arrives looking like progress -
+        # a bigger number, under the heading "revision" - and taking it is how a
+        # lane gets talked down to work nobody needs. Scoring need is what makes
+        # the trade visible; refusing it here is what makes it not happen.
         took = None
-        if rev and (rev.get("confidence") or 0) > (scored["confidence"] or 0):
+        if rev and (rev.get("confidence") or 0) > (scored["confidence"] or 0) \
+                and (rev.get("need") or 0) >= (scored["need"] or 0):
             took = _add(rev, sharpened_from=pid,
                         what_changed=str(rev.get("what_changed") or "")[:600])
             if took:
@@ -6197,16 +6475,38 @@ def sharpen_proposal(pid: str) -> dict:
             if new:
                 alts.append(new)
                 made.append(new)
+
+        # What the attempt was worth, written down beside what it was predicted
+        # to be worth. `after` is the best this objective ended up at, which is
+        # the revision's odds when one was taken and the re-score otherwise -
+        # because the question headroom answers is whether the objective got
+        # better, not whether this particular record did.
+        cur.setdefault("sharpen_log", []).append(
+            {"at": now(), "round": rounds, "claimed_headroom": claimed,
+             "before": was,
+             "after": (took or {}).get("confidence") if took else scored["confidence"],
+             "took_revision": bool(took)})
         _save_direction(store)
 
     lane, now_c = p.get("lane"), scored["confidence"]
-    note = f"odds in {lane}: {pct(was)} → {pct(now_c)} on {p.get('text', '')[:120]}"
+    note = (f"scored in {lane}: odds {pct(was)} → {pct(now_c)}, "
+            f"mission wants it {pct(scored['need'])}, about {usd(scored['cost_usd'])} "
+            f"— {p.get('text', '')[:120]}")
     if took:
-        note += f" — sharpened to {pct(took.get('confidence'))}: {took.get('what_changed', '')[:200]}"
+        note += (f" — sharpened to {pct(took.get('confidence'))} odds at "
+                 f"{pct(took.get('need'))} need: {took.get('what_changed', '')[:200]}")
+    elif rev:
+        # Worth saying out loud. A rejected revision is the guard doing its job,
+        # and silence here would read as the sharpener having found nothing.
+        note += " — a revision was offered and refused for trading away odds or need"
     if alts:
         note += f" — {len(alts)} alternate route(s) proposed"
+    if scored["headroom"] is not None and scored["headroom"] < SHARPEN_FLOOR:
+        note += " — nothing left to sharpen: " + (scored["why_headroom"] or "no reason given")[:160]
     add_note(note[:600], lane=lane)
     return {"ok": True, "proposal_id": pid, "confidence": now_c,
+            "need": scored["need"], "cost_usd": scored["cost_usd"],
+            "headroom": scored["headroom"], "why_headroom": scored["why_headroom"],
             "unknowns": scored["unknowns"], "reasoning": out.get("reasoning"),
             "revision": took if rev else None, "alternates": alts,
             "superseded": bool(took), "rounds": rounds, "made": made}
@@ -6338,19 +6638,23 @@ def adopt_proposal(pid: str) -> dict:
     objective = p["text"] + (f"\n\nWhy: {p['why']}" if p.get("why") else "")
     g = open_goal(p["lane"], objective)
     set_proposal(pid, "adopted", goal_id=g.get("id"))
-    # The odds travel with the work. Without this the estimate lives only in the
-    # proposal store, which is trimmed, and `confidence_calibration` would start
-    # quietly losing its oldest and most informative rows.
+    # The scores travel with the work. Without this they live only in the
+    # proposal store, which is trimmed, and `calibration` would start quietly
+    # losing its oldest and most informative rows.
     with _GOAL_LOCK:
         gg = load_goal(g["id"])
         if gg:
             gg["confidence"] = p.get("confidence")
+            gg["need"] = p.get("need")
+            gg["cost_estimate_usd"] = p.get("cost_usd")
             gg["unknowns"] = p.get("unknowns") or []
             gg["proposal_id"] = pid
             save_goal(gg)
-    add_note(f"adopted a proposed goal in {p['lane']} at {pct(p.get('confidence'))} odds: "
+    add_note(f"adopted a proposed goal in {p['lane']}: {pct(p.get('confidence'))} odds, "
+             f"mission wants it {pct(p.get('need'))}, about {usd(p.get('cost_usd'))} — "
              f"{p['text'][:200]}", lane=p.get("lane"))
-    return {"ok": True, "goal": g, "proposal_id": pid, "confidence": p.get("confidence")}
+    return {"ok": True, "goal": g, "proposal_id": pid, "confidence": p.get("confidence"),
+            "need": p.get("need"), "cost_usd": p.get("cost_usd"), "worth": worth(p)}
 
 
 def resume_adoption() -> list[dict]:
@@ -6375,29 +6679,60 @@ def resume_adoption() -> list[dict]:
     One per call, for the reason triage is: adopting runs `plan_goal`, which is
     an architect call, and doing every waiting lane at once would hold the
     heartbeat for minutes.
+
+    Which one is the point of scoring. This used to take the OLDEST waiting
+    proposal, which is a fair rule and an uninformed one - age says nothing
+    about whether the mission wants the thing. It now takes the highest `worth`,
+    so the one goal a tick can start is the best expected movement per dollar
+    rather than whichever happened to be proposed first.
     """
     if not direction_store().get("auto_adopt"):
         return []
     busy = {r.get("lane") for r in goals() if r.get("state") == "running"}
-    for p in sorted(open_proposals(), key=lambda x: x.get("at") or ""):
-        # One goal to a lane. The review never had to test this, because it only
-        # ever proposes into the lane whose goal has just closed. This does.
-        if p.get("lane") in busy or escalations(p.get("lane")) or proposal_hold(p):
-            continue
-        return [adopt_proposal(p["id"])]
-    return []
+    ready = [p for p in open_proposals()
+             # One goal to a lane. The review never had to test this, because it
+             # only ever proposes into the lane whose goal has just closed.
+             if p.get("lane") not in busy
+             and not escalations(p.get("lane"))
+             and not proposal_hold(p)]
+    # `worth` cannot be None here - nothing unscored gets past `proposal_hold` -
+    # but age stays as the tie-break so two equal proposals still resolve in a
+    # fixed order rather than on dict ordering.
+    ready.sort(key=lambda p: (-(worth(p) or 0), p.get("at") or ""))
+    return [adopt_proposal(ready[0]["id"])] if ready else []
 
 
 def sharpenable() -> list[dict]:
-    """Open proposals that are being held back and are not yet given up on.
+    """Open proposals that are being held back and are worth another look.
 
-    A proposal above the bar is left alone: it is already going to be adopted,
+    A proposal above the bars is left alone: it is already going to be adopted,
     and spending an architect call to agree with it buys nothing.
+
+    Unscored first, because a proposal nobody has judged is not being held back
+    for a reason - it is simply unjudged, and one call turns it into something
+    that can be decided either way.
+
+    After that, highest `headroom` first, which is the whole reason that number
+    exists. There is one of these calls per tick, and ordering them by age or by
+    worth answers a question nobody asked: age says nothing at all, and worth
+    says which one would be best IF it could be rescued, not which one can. A
+    proposal held at 30% because it bundles five things can be split and will
+    move; one held at 30% because it needs a credential nobody has will score
+    30% forever. Those two look identical until something asks which is which.
+
+    Below `SHARPEN_FLOOR` it is dropped entirely rather than ranked last. The
+    architect has already said, in `why_headroom`, that nothing it can do moves
+    this - so the next call would spend real money to be told that again. It
+    stays open and stays visible, and the operator can still sharpen it by hand,
+    because "the architect can't move this" is not "this is dead".
     """
     return sorted([p for p in open_proposals()
                    if proposal_hold(p)
-                   and int(p.get("sharpen_rounds") or 0) < SHARPEN_MAX_ROUNDS],
-                  key=lambda x: x.get("at") or "")
+                   and int(p.get("sharpen_rounds") or 0) < SHARPEN_MAX_ROUNDS
+                   and (p.get("headroom") is None or p["headroom"] >= SHARPEN_FLOOR)],
+                  key=lambda p: (p.get("headroom") is not None,
+                                 -(p.get("headroom") or 0),
+                                 -(worth(p) or 0), p.get("at") or ""))
 
 
 def auto_sharpen() -> list[dict]:
@@ -6441,10 +6776,10 @@ def direction_view(lane: str | None = None) -> dict:
         "sections": sections,
         "findings": findings(lane=lane)[:60],
         "findings_summary": findings_summary(),
-        # `hold` is derived here rather than stored, so moving the bar in
-        # Settings re-judges every waiting proposal at once instead of leaving
+        # `hold` and `worth` are derived here rather than stored, so moving a bar
+        # in Settings re-judges every waiting proposal at once instead of leaving
         # them labelled against a threshold that is no longer the threshold.
-        "proposals": sorted([{**p, "hold": proposal_hold(p),
+        "proposals": sorted([{**p, "hold": proposal_hold(p), "worth": worth(p),
                               "sharpen_rounds": int(p.get("sharpen_rounds") or 0)}
                              for p in props if p.get("kind") == "goal"],
                             key=lambda p: p.get("at") or "", reverse=True),
@@ -6453,8 +6788,11 @@ def direction_view(lane: str | None = None) -> dict:
         "reviews": revs[:8],
         "auto_adopt": bool(store.get("auto_adopt")),
         "bar": adopt_bar(),
-        "calibration": confidence_calibration(),
+        "need_bar": need_bar(),
+        "calibration": calibration(),
+        "rungs": lane_rungs(),
         "max_sharpen": SHARPEN_MAX_ROUNDS,
+        "sharpen_floor": SHARPEN_FLOOR,
         "doctrine_state": doctrine_state(),
         "doctrine_path": str(DOCTRINE_PATH),
         # A lane whose goal is finished and never reviewed is exactly where the

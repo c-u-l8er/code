@@ -378,6 +378,9 @@ function renderSettings(s) {
   const bar = $('set-bar');
   if (document.activeElement !== bar) bar.value = Math.round((s.adopt_confidence ?? 0.6) * 100);
   $('set-bar-out').textContent = bar.value + '%';
+  const nb = $('set-need');
+  if (document.activeElement !== nb) nb.value = Math.round((s.adopt_need ?? 0.5) * 100);
+  $('set-need-out').textContent = nb.value + '%';
   $('set-cal').innerHTML = calBlock(s.calibration, (s.adopt_confidence ?? 0.6));
   renderSpend(s);
 }
@@ -399,8 +402,11 @@ async function setFlag(key, value) {
         ? 'OpenRouter credit may be spent again.'
         : 'OpenRouter off — nothing here can spend it. Workers are unaffected.'
       : key === 'adopt_confidence'
-      ? `goals scored ${Math.round(value * 100)}% or better start on their own. ` +
+      ? `goals with ${Math.round(value * 100)}% odds or better start on their own. ` +
         'Everything already waiting was just re-judged against it.'
+      : key === 'adopt_need'
+      ? `only goals the mission wants ${Math.round(value * 100)}% or more start on their ` +
+        'own. Everything already waiting was just re-judged against it.'
       : 'saved.';
   st.className = 'good';
   await refresh();
@@ -1420,31 +1426,91 @@ function wireGoals() {
 // worth travelling. Then what we still do not know. Proposals last: they are the
 // cheapest thing here to produce and the only one that spends anything.
 
-/** The odds as a bar you can read without arithmetic, with your threshold marked on it. */
-function odds(c, bar) {
-  if (c === null || c === undefined)
-    return `<div class="odds none"><span class="on">unscored</span></div>`;
-  const pc = Math.round(c * 100);
-  return `<div class="odds ${c >= bar ? 'good' : 'low'}">` +
+const pcs = (v) => (v === null || v === undefined ? '—' : Math.round(v * 100) + '%');
+
+/** One score as a bar you can read without arithmetic, with its threshold marked
+ *  on the same scale, so comparing them is a look rather than a calculation.
+ *  `bar` null draws no tick: not every one of these is a threshold to clear. */
+function meter(label, v, bar, cls, why) {
+  const t = why ? ` title="${esc(why)}"` : '';
+  if (v === null || v === undefined)
+    return `<div class="odds none"${t}><span class="sl">${label}</span>` +
+      `<span class="on">unscored</span></div>`;
+  const pc = Math.round(v * 100);
+  const tone = cls || (bar === null || v >= bar ? 'good' : 'low');
+  return `<div class="odds ${tone}"${t}><span class="sl">${label}</span>` +
     `<span class="ometer"><i style="width:${pc}%"></i>` +
-    `<u style="left:${Math.round(bar * 100)}%" title="the bar you set"></u></span>` +
-    `<span class="on">${pc}%</span></div>`;
+    (bar === null ? '' : `<u style="left:${Math.round(bar * 100)}%" title="the bar"></u>`) +
+    `</span><span class="on">${pc}%</span></div>`;
 }
 
-/** The bar, and what the scores behind it have so far turned out to be worth.
+/** All four scores on one proposal, plus what they rank it at.
+ *  Four rather than one because they answer different questions and can point
+ *  opposite ways: the thing most likely to land is routinely the thing the
+ *  mission needs least, and a single number hides exactly that trade. */
+function scores(p, d) {
+  const bar = typeof d.bar === 'number' ? d.bar : 0.6;
+  const nb = typeof d.need_bar === 'number' ? d.need_bar : 0.5;
+  const floor = typeof d.sharpen_floor === 'number' ? d.sharpen_floor : 0.15;
+  const c = p.cost_usd;
+  return `<div class="scores">` +
+    meter('will finish', p.confidence, bar, null,
+      'the odds a worker fleet finishes this without stopping to ask you for something') +
+    meter('mission wants it', p.need, nb, null, p.why_need) +
+    `<div class="odds flat"><span class="sl">costs about</span>` +
+    `<span class="on">${c === null || c === undefined ? 'uncosted' : '$' + c.toFixed(2)}</span>` +
+    (p.worth === null || p.worth === undefined ? ''
+      : `<span class="on rank" title="odds × need ÷ cost — how it ranks against the ` +
+        `others waiting, never a threshold">ranks ${p.worth}</span>`) + `</div>` +
+    meter('room to improve', p.headroom, floor, 'hr', p.why_headroom) +
+    `</div>`;
+}
+
+/** The bars, and what the scores behind them have so far turned out to be worth.
  *  Shown together on purpose: a threshold on its own is a number asking to be
- *  trusted, and until some scored goal has actually finished there is no reason to. */
+ *  trusted, and until something has actually settled there is no reason to. Each
+ *  score is reported against its own recorded event and they are never averaged
+ *  together - being over-confident and under-costed at once would cancel out. */
 function calBlock(c, bar) {
-  const head = `starts on its own at <b>${Math.round(bar * 100)}%</b> and up`;
-  if (!c || !c.n)
-    return `<div class="cal">${head} · <span class="muted">no scored goal has settled yet, ` +
-           `so nothing has checked these numbers</span></div>`;
-  const rows = c.bands.filter((b) => b.n).map((b) =>
+  const head = `starts on its own at <b>${Math.round(bar * 100)}%</b> odds and up`;
+  if (!c) return `<div class="cal">${head}</div>`;
+  const rows = [];
+  if (c.n)
+    rows.push(`<span class="calb"><i>will finish</i> said ${pcs(c.stated)}, ` +
+      `${pcs(c.actual)} finished · ${c.n}</span>`);
+  if (c.need && c.need.n)
+    rows.push(`<span class="calb"><i>wanted</i> said ${pcs(c.need.stated)}, ` +
+      `${pcs(c.need.moved)} moved a rung · ${c.need.n}</span>`);
+  if (c.cost && c.cost.n)
+    rows.push(`<span class="calb"><i>cost</i> said $${c.cost.stated}, ` +
+      `billed $${c.cost.actual} · ${c.cost.n}</span>`);
+  if (c.refine && c.refine.n)
+    rows.push(`<span class="calb"><i>room</i> said ${pcs(c.refine.stated)}, ` +
+      `${pcs(c.refine.actual)} actually rose · ${c.refine.n}</span>`);
+  if (!rows.length)
+    return `<div class="cal">${head} · <span class="muted">nothing has settled yet, so ` +
+           `nothing has checked these numbers</span></div>`;
+  const bands = (c.bands || []).filter((b) => b.n).map((b) =>
     `<span class="calb"><i>${Math.round(b.from * 100)}–${Math.round(b.to * 100)}%</i> ` +
     `${b.finished}/${b.n} finished</span>`).join('');
-  return `<div class="cal">${head} · <span class="muted">scored ` +
-    `${Math.round(c.stated * 100)}% on average, ${Math.round(c.actual * 100)}% actually ` +
-    `finished, over ${c.n}</span>${rows}</div>`;
+  return `<div class="cal">${head}${rows.map((r) => ' · ' + r).join('')}` +
+    (bands ? `<div class="calrow">${bands}</div>` : '') + `</div>`;
+}
+
+/** The sharpen button, labelled with the odds that pressing it changes anything.
+ *  That number is the whole reason `headroom` is scored: without it the choice
+ *  between two held proposals is a coin toss, and half the calls buy nothing. */
+function sharpenBtn(p, d) {
+  const rounds = p.sharpen_rounds || 0;
+  if (rounds >= (d.max_sharpen || 2))
+    return `<span class="muted">sharpened ${rounds}× — no attempts left</span>`;
+  const h = p.headroom, floor = typeof d.sharpen_floor === 'number' ? d.sharpen_floor : 0.15;
+  const known = h !== null && h !== undefined;
+  const dim = known && h < floor;
+  return `<button class="dp-s${dim ? ' dim' : ''}" data-id="${esc(p.id)}"` +
+    ` title="${esc(p.why_headroom || 'nobody has judged whether another look would help')}">` +
+    (known ? `Improve the odds · ${Math.round(h * 100)}% chance it helps`
+           : 'Improve the odds') + `</button>`;
 }
 
 function dirSection(s, cls) {
@@ -1480,9 +1546,10 @@ function renderDirection(d) {
     ` <button class="dq-x" data-id="${esc(p.id)}">not worth chasing</button></div></div>`).join('');
 
   const bar = typeof d.bar === 'number' ? d.bar : 0.6;
+  const floor = typeof d.sharpen_floor === 'number' ? d.sharpen_floor : 0.15;
   const props = (d.proposals || []).map((p) =>
     `<div class="dprop${p.hold ? ' held' : ' ready'}">` +
-    odds(p.confidence, bar) +
+    scores(p, d) +
     `<b>${mdi(p.text)}</b>` +
     (p.why ? `<div class="muted">${mdi(p.why)}</div>` : '') +
     (p.what_changed ? `<div class="changed">sharpened: ${mdi(p.what_changed)}</div>` : '') +
@@ -1491,6 +1558,10 @@ function renderDirection(d) {
       ? `<div class="unk"><span>needs, and nobody has established:</span><ul>` +
         p.unknowns.map((u) => `<li>${esc(u)}</li>`).join('') + `</ul></div>` : '') +
     (p.sharpen_reasoning ? `<div class="muted why">${mdi(p.sharpen_reasoning)}</div>` : '') +
+    // Said out loud rather than left in a tooltip, because it is the one case
+    // where the harness has stopped trying and will not say so anywhere else.
+    (p.headroom !== null && p.headroom !== undefined && p.headroom < floor && p.why_headroom
+      ? `<div class="changed">nothing left to sharpen: ${mdi(p.why_headroom)}</div>` : '') +
     `<div class="row"><span class="tag">${esc(p.lane || '')}</span>` +
     // The one thing this panel has to make unmissable: whether this gets
     // started without anyone deciding, and if not, what is stopping it.
@@ -1498,9 +1569,7 @@ function renderDirection(d) {
       ? `<span class="hold">waits for you — ${esc(p.hold)}</span>`
       : `<span class="auto-ok">will start on its own</span>`) +
     `<button class="dp-go primary" data-id="${esc(p.id)}">Adopt as a goal</button>` +
-    (p.sharpen_rounds < (d.max_sharpen || 2)
-      ? `<button class="dp-s" data-id="${esc(p.id)}">Improve the odds</button>`
-      : `<span class="muted">sharpened ${p.sharpen_rounds}×</span>`) +
+    sharpenBtn(p, d) +
     `<button class="dp-x" data-id="${esc(p.id)}">Not now</button></div></div>`).join('');
 
   const revs = (d.reviews || []).map((r) =>
@@ -1551,7 +1620,8 @@ function renderDirection(d) {
       b.disabled = true; b.textContent = 'weighing it up…';
       const r = await post('/api/direction/proposal', { id: b.dataset.id, action: 'sharpen' });
       $('dir-status').innerHTML = r.ok
-        ? `odds ${r.confidence === null ? 'unscored' : Math.round(r.confidence * 100) + '%'}` +
+        ? `${pcs(r.confidence)} odds · mission wants it ${pcs(r.need)} · ` +
+          `about $${(r.cost_usd ?? 0).toFixed(2)} · ${pcs(r.headroom)} room left` +
           (r.superseded ? ' · replaced by a version likelier to land' : '') +
           (r.alternates && r.alternates.length
             ? ` · ${r.alternates.length} other route(s) proposed` : '')
@@ -2100,6 +2170,8 @@ $('set-auto-escalate').onchange = (e) => setFlag('auto_escalate', e.target.check
 // re-renders for one decision.
 $('set-bar').oninput = (e) => { $('set-bar-out').textContent = e.target.value + '%'; };
 $('set-bar').onchange = (e) => setFlag('adopt_confidence', Number(e.target.value) / 100);
+$('set-need').oninput = (e) => { $('set-need-out').textContent = e.target.value + '%'; };
+$('set-need').onchange = (e) => setFlag('adopt_need', Number(e.target.value) / 100);
 $('btn-cx-cancel').onclick = () => {
   cxStop();
   post('/api/codex-auth/cancel');

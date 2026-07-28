@@ -302,14 +302,25 @@ If the architect asks for a file by name it is fetched and sent without another 
       <span>Auto-escalate a blocked worker to a new thread</span>
     </label>
     <h4>Start a proposed goal without asking me</h4>
+    <p class="muted">A proposal has to clear <b>both</b> of these to start on its own. Below
+    either one it waits in Direction with its reason showing.</p>
     <div class="row barrow">
+      <label for="set-bar">odds it finishes</label>
       <input id="set-bar" type="range" min="0" max="100" step="5">
       <output id="set-bar-out" class="barout"></output>
     </div>
-    <p class="muted">Every proposed objective is scored with the odds it <b>finishes</b>
-    &mdash; every done-condition met, without stopping to ask you for something. At or above
-    this mark it starts on its own; below it, it waits in Direction with its reason showing.
+    <p class="muted">Every done-condition met, without stopping to ask you for something.
     0% adopts anything that has been scored at all; 100% means you decide every goal.</p>
+    <div class="row barrow">
+      <label for="set-need">how much the mission wants it</label>
+      <input id="set-need" type="range" min="0" max="100" step="5">
+      <output id="set-need-out" class="barout"></output>
+    </div>
+    <p class="muted">Scored against the rung each lane's evidence has actually reached, not
+    against how good the idea is. Without this bar the harness reliably starts the safest
+    work it can find rather than the work the mission is waiting on &mdash; tidying always
+    looks likelier to finish than a deploy. What it costs is deliberately <em>not</em> a bar:
+    it ranks proposals against each other, and the ceiling on spending is the daily one.</p>
     <div id="set-cal" class="setcal"></div>
     <div class="row">
       <button id="btn-set-close">Close</button>

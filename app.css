@@ -929,9 +929,25 @@ pre.diff, .ruling {
 .dprop.ready { border-left-color: var(--ok, #4ea); }
 .dprop.held { border-left-color: var(--warn, #d9a441); }
 
+/* Four scores stacked so the bars line up under one another. They are read
+   against each other far more often than individually: the useful fact is
+   almost always that one is high while another is low. */
+.scores { margin-bottom: 7px; }
+.odds .sl {
+  flex: 0 0 116px; font-size: 11px; color: var(--muted);
+  text-align: right; white-space: nowrap;
+}
+/* Room to improve is not better high or better low, so it takes neither the
+   good nor the low colour - it is a fact about what another call would buy.
+   Blue rather than the house amber, which is one shade off `--warn` and would
+   read as a score falling short of a bar it does not have. */
+.odds.hr .ometer i { background: var(--accent); }
+.odds.flat .ometer { display: none; }
+.odds .rank { margin-left: 12px; opacity: .8; }
+
 /* The score, with your threshold drawn on the same scale as the bar so the
    comparison is a look rather than a calculation. */
-.odds { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.odds { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; }
 .odds .ometer {
   position: relative; flex: 0 0 132px; height: 6px;
   background: #1c2130; border-radius: 3px; overflow: hidden;
@@ -955,10 +971,15 @@ pre.diff, .ruling {
 .dprop .unk ul { margin: 2px 0 0; padding-left: 16px; }
 .dprop .unk li { margin: 1px 0; }
 
-.cal { font-size: 11px; color: var(--muted); margin: 0 0 10px; }
+/* A proposal the architect says it cannot move any further. Still pressable,
+   because "the architect can't move this" is not "this is dead". */
+.dp-s.dim { opacity: .55; }
+
+.cal { font-size: 11px; color: var(--muted); margin: 0 0 10px; line-height: 1.9; }
 .cal b { color: var(--fg); }
 .calb { display: inline-block; margin-left: 10px; }
 .calb i { font-style: normal; color: var(--fg); font-variant-numeric: tabular-nums; }
+.calrow { margin-top: 2px; }
 .barrow { align-items: center; gap: 10px; }
 .barrow input[type=range] { flex: 1; max-width: 260px; }
 .barout { font-variant-numeric: tabular-nums; color: var(--fg); }
