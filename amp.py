@@ -6010,6 +6010,41 @@ def adopt_proposal(pid: str) -> dict:
     return {"ok": True, "goal": g, "proposal_id": pid}
 
 
+def resume_adoption() -> list[dict]:
+    """Adopt one waiting proposal whose gate has since come down.
+
+    Auto-adopt is decided exactly once, in the direction review that fires as a
+    goal closes. If a gate was up at that instant the proposals are left `open`
+    - correctly; that is the gate doing its job - and then nothing ever looks
+    again. The next review in that lane would look, but a review fires only when
+    a goal FINISHES, and the lane now has no goal left to finish. So the lane is
+    not paused, it is retired, by a gate that says nothing about that lane.
+
+    Four lanes were sitting like that, one of them for over four hours, behind a
+    burn ceiling that resets at midnight and a contradiction count that reading
+    the findings would clear. Both of those gates come down on their own, and
+    nothing was waiting to notice.
+
+    Nothing here weakens a gate. A lane whose gate is still up is skipped
+    exactly as before, and a proposal you dismissed stays dismissed. Crossing a
+    threshold just costs a pause now instead of the lane.
+
+    One per call, for the reason triage is: adopting runs `plan_goal`, which is
+    an architect call, and doing every waiting lane at once would hold the
+    heartbeat for minutes.
+    """
+    if not direction_store().get("auto_adopt"):
+        return []
+    busy = {r.get("lane") for r in goals() if r.get("state") == "running"}
+    for p in sorted(open_proposals(), key=lambda x: x.get("at") or ""):
+        # One goal to a lane. The review never had to test this, because it only
+        # ever proposes into the lane whose goal has just closed. This does.
+        if p.get("lane") in busy or escalations(p.get("lane")):
+            continue
+        return [adopt_proposal(p["id"])]
+    return []
+
+
 def direction_view(lane: str | None = None) -> dict:
     """Everything the Direction tab shows, assembled in one place."""
     sections = doctrine_sections()

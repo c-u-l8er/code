@@ -1106,6 +1106,17 @@ def _pipeline_ticker():
                 print(f"amp: triaged blocked goal {gid}")
         except Exception:
             traceback.print_exc()
+        # An escalation gate is meant to pause the pipeline, not to end a lane -
+        # but auto-adopt is judged once, as a goal closes, so a gate that was up
+        # at that moment left the lane's proposals waiting on a reader that was
+        # never going to come back. This is the reader. It re-tests the same
+        # gates and adopts nothing they still cover.
+        try:
+            for r in amp.resume_adoption():
+                if r.get("ok"):
+                    print(f"amp: adopted waiting proposal {r['proposal_id']}")
+        except Exception:
+            traceback.print_exc()
 
 
 def _obligation_ticker():
