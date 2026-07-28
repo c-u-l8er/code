@@ -5813,6 +5813,140 @@ def open_proposals() -> list[dict]:
             if p.get("state") == "open" and p.get("kind") == "goal"]
 
 
+# ------------------------------------------------------------------ odds
+# Every proposed objective carries a number, and the number is the odds it
+# FINISHES: every done-condition judged met, without stopping to ask the
+# operator for something.
+#
+# That definition is the whole design. "How good is this idea" cannot be
+# checked afterwards and therefore cannot be wrong, which makes it worthless as
+# a gate - a model would be free to say 0.9 forever. "Did it finish" is written
+# into the goal file either way, by machinery that was here before the score
+# was, so the estimate is answerable to something that does not care what was
+# estimated. `confidence_calibration()` is that comparison, and it is the
+# reason any of this is worth more than a model asserting a number about
+# itself. Read it before trusting the bar.
+#
+# The bar is the dial between "adopt everything" and "ask me about everything".
+# It is deliberately NOT one of the `escalations()` gates: those are facts about
+# the workspace and hold every lane at once, this is a fact about one objective
+# and holds only that objective.
+
+DEFAULT_ADOPT_CONFIDENCE = 0.6
+SHARPEN_MAX_ROUNDS = 2
+
+
+def pct(c) -> str:
+    """Odds as a percentage, or the word for not having any. `0.0` is a score."""
+    return "unscored" if c is None else f"{float(c):.0%}"
+
+
+def _scored(n: dict) -> dict:
+    """The odds fields off an architect reply, clamped and typed.
+
+    An unreadable or absent score is `None`, never `0.0`. They mean opposite
+    things - 0.0 is "this will not finish", None is "nobody has judged it" -
+    and a missing field quietly becoming the most damning number in the range
+    would hold a proposal back for a reason nobody ever stated.
+    """
+    try:
+        c = float(n.get("confidence"))
+    except (TypeError, ValueError):
+        c = None
+    if c is not None:
+        c = round(min(1.0, max(0.0, c)), 3)
+    return {"confidence": c,
+            "unknowns": [str(u)[:300] for u in (n.get("unknowns") or []) if str(u).strip()][:6],
+            "scored_at": now() if c is not None else None}
+
+
+def adopt_bar() -> float:
+    """The odds a proposal must reach to be adopted with nobody watching."""
+    cfg = config().get("autonomy") or {}
+    try:
+        return min(1.0, max(0.0, float(cfg.get("adopt_confidence", DEFAULT_ADOPT_CONFIDENCE))))
+    except (TypeError, ValueError):
+        return DEFAULT_ADOPT_CONFIDENCE
+
+
+def proposal_hold(p: dict) -> str | None:
+    """Why this proposal may not be adopted unattended, or None if it may."""
+    c = p.get("confidence")
+    if c is None:
+        return "nobody has put odds on it yet"
+    bar = adopt_bar()
+    if c < bar:
+        return f"{c:.0%} odds of finishing, under the {bar:.0%} bar you set"
+    return None
+
+
+def lane_record(lane_name: str, n: int = 8) -> dict:
+    """How this lane's recent goals actually ended.
+
+    The evidence an estimate is made against, and the reason it is given to the
+    architect rather than left to be inferred: a lane whose last four goals all
+    stopped on `operator` is going to stop on `operator` again, and that is a
+    fact about the lane that no amount of reading the objective reveals.
+    """
+    rows = [r for r in goals(lane_name) if r.get("state") not in ("running", "planning")][:n]
+    out = {"n": len(rows), "done": 0, "stops": {}}
+    for r in rows:
+        if r.get("state") == "done":
+            out["done"] += 1
+        else:
+            k = r.get("stopped_on") or "unknown"
+            out["stops"][k] = out["stops"].get(k, 0) + 1
+    return out
+
+
+def _record_block(lane_name: str) -> str:
+    rec = lane_record(lane_name)
+    if not rec["n"]:
+        return ""
+    stops = ", ".join(f"{v} on {k}" for k, v in sorted(rec["stops"].items())) or "none"
+    return (f"# How this lane actually ends up\n\n"
+            f"Of its last {rec['n']} settled goals, {rec['done']} finished. "
+            f"The rest stopped: {stops}. Score against this, not against the "
+            f"objective read on its own.")
+
+
+def confidence_calibration() -> dict:
+    """What the scores turned out to be worth.
+
+    Reads only what was already recorded: an adopted proposal names the goal it
+    opened, and that goal has since finished or stopped. `done` is the exact
+    event the score is a probability of, so nothing here needs interpreting.
+
+    Goals still open are counted nowhere. They are not evidence yet, and
+    counting them as failures is how a calibration table talks itself into
+    saying the estimates are worse than anyone has established.
+    """
+    edges = [0.0, 0.5, 0.7, 0.85]
+    bands = [{"from": lo, "to": (edges[i + 1] if i + 1 < len(edges) else 1.0),
+              "n": 0, "finished": 0} for i, lo in enumerate(edges)]
+    n = fin = 0
+    stated = 0.0
+    for p in direction_store().get("proposals", []):
+        c = p.get("confidence")
+        if p.get("state") != "adopted" or c is None or not p.get("goal_id"):
+            continue
+        g = load_goal(p["goal_id"])
+        if not g or g.get("state") in ("planning", "running"):
+            continue
+        row = [b for b in bands if c >= b["from"]][-1]
+        row["n"] += 1
+        n += 1
+        stated += c
+        if g.get("state") == "done":
+            row["finished"] += 1
+            fin += 1
+    for b in bands:
+        b["rate"] = round(b["finished"] / b["n"], 2) if b["n"] else None
+    return {"bands": bands, "n": n, "bar": adopt_bar(),
+            "stated": round(stated / n, 2) if n else None,
+            "actual": round(fin / n, 2) if n else None}
+
+
 DIRECTION_SYSTEM = (
     "You are the consulting architect deciding where a codebase should go next. A goal "
     "has just finished in one lane of the operator's stack. You are given the operator's "
@@ -5827,7 +5961,9 @@ DIRECTION_SYSTEM = (
     '  "ladder": [{"claim": "...", "from": "spec|in_tree|live_local|live_deployed|external",\n'
     '              "to": "...", "evidence": "what settles it"}],\n'
     '  "next": [{"objective": "one objective, what has to be true when it is finished",\n'
-    '            "why": "what it buys, in terms of the thesis or an open question"}],\n'
+    '            "why": "what it buys, in terms of the thesis or an open question",\n'
+    '            "confidence": 0.0,\n'
+    '            "unknowns": ["what this needs that is not established to exist"]}],\n'
     '  "research": [{"question": "what we do not know", "why": "why it matters",\n'
     '                "settled_by": "the observation or experiment that would answer it"}],\n'
     '  "exhausted": false,\n'
@@ -5842,6 +5978,19 @@ DIRECTION_SYSTEM = (
     "not restate work that is already open, and do not propose work whose only merit is "
     "that it is more work. If the honest answer is that this lane is finished for now, "
     "return an empty list and set `exhausted` to true with a reason.\n"
+    "- `confidence` is a probability, and it is a probability of ONE recorded event: that a "
+    "worker fleet given this objective finishes it and has every one of its done-conditions "
+    "judged met, WITHOUT stopping to ask the operator for something. Stopping to ask counts "
+    "as not finishing. It is not how good the idea is, it is not how much you want it done, "
+    "and it is not how confident you feel: it is the share of times this would land. That "
+    "number is written down, the outcome is written down beside it, and the two are compared "
+    "- so a lane of 0.9s that keep stopping is a visible fact about the scoring and not about "
+    "the lane. Anything needing money, a credential, an account, a deployed target, or a "
+    "decision about what counts as good enough is a stop, and an objective that rests on one "
+    "is BELOW 0.5 however good it is.\n"
+    "- `unknowns` is what that objective needs and nobody has established exists yet, one "
+    "clause each. An empty list is a claim that everything it touches is already there, so "
+    "make it only when that is true. This is the list that gets attacked to raise the number.\n"
     "- `research` is the highest-value thing you can return: something we believe and have "
     "not tested, or that this goal has just made answerable. It must be stated so that it "
     "could come out either way, and `settled_by` must be something someone could actually "
@@ -5889,8 +6038,178 @@ def _direction_context(g: dict, sections: list[dict]) -> str:
         parts.append("# Already open in this lane, do not propose these again\n\n"
                      + "\n".join(f"- {o['objective'][:200]}" for o in others))
 
+    rec = _record_block(lane_name)
+    if rec:
+        parts.append(rec)
     parts.append(f"# The repository right now\n\n{goal_brief(lane_name)}")
     return "\n\n".join(parts)
+
+
+_ODDS_RULE = (
+    "- `confidence` is a probability, and it is a probability of ONE recorded event: that a "
+    "worker fleet given this objective finishes it and has every one of its done-conditions "
+    "judged met, WITHOUT stopping to ask the operator for something. Stopping to ask counts "
+    "as not finishing. It is not how good the idea is and it is not how strongly you hold "
+    "it: it is the share of times this would land. The number is written down, the outcome "
+    "is written down beside it, and the two are compared - so a run of 0.9s that keep "
+    "stopping is a visible fact about the scoring, not about the lanes. Anything resting on "
+    "money, a credential, an account, a deployed target, or a decision about what counts as "
+    "good enough is a stop, and an objective that needs one is BELOW 0.5 however good it is.\n"
+    "- `unknowns` is what the objective needs that nobody has established exists, one clause "
+    "each. An empty list claims everything it touches is already there, so return one only "
+    "when that is true. This is the list that gets attacked to raise the number."
+)
+
+SHARPEN_SYSTEM = (
+    "You are the consulting architect. An objective has been proposed for one lane of the "
+    "operator's stack and has not been started. Say what its odds are, and then see whether "
+    "they can be raised without giving up what it was for.\n\n"
+    "Reply with one JSON object and nothing else:\n"
+    "{\n"
+    '  "confidence": 0.0,\n'
+    '  "unknowns": ["..."],\n'
+    '  "reasoning": "why that number, 1-3 sentences",\n'
+    '  "revision": {"objective": "...", "why": "...", "confidence": 0.0, "unknowns": ["..."],\n'
+    '               "what_changed": "what you narrowed or split off, and which unknown that '
+    'kills"} or null,\n'
+    '  "alternates": [{"objective": "...", "why": "...", "confidence": 0.0, '
+    '"unknowns": ["..."]}]\n'
+    "}\n\n"
+    "Rules:\n"
+    + _ODDS_RULE + "\n"
+    "- A `revision` is THE SAME objective made likelier to land: narrowed, or with the part "
+    "that needs something we do not have split off, or aimed at a lower rung of the evidence "
+    "ladder first so the higher one becomes reachable later. It must still be worth doing. A "
+    "revision that scores well by asking for nothing of value is worse than the original - "
+    "return null. Return null too if you cannot honestly beat the original.\n"
+    "- You may not raise a number by deciding something that is the operator's. If an unknown "
+    "is money, a credential, an account, a deploy target, or what counts as good enough, the "
+    "honest revision is one that DOES NOT NEED it - never one that assumes it, and never one "
+    "that quietly redefines done so the missing thing stops mattering.\n"
+    "- `alternates` are different routes to the same end, for when the objective is right and "
+    "the approach is what is costing it. Zero, one or two. An empty list is a normal answer.\n"
+    "- You are proposing. The operator decides what gets built."
+)
+
+
+def _sharpen_context(p: dict) -> str:
+    """What the architect needs to judge one proposed objective."""
+    lane_name = p.get("lane") or ""
+    parts = [mission_block().strip(),
+             doctrine_block("The doctrine this stack is held to").strip(),
+             f"# The proposed objective\n\n{p.get('text', '')}"]
+    if p.get("why"):
+        parts.append(f"## Why it was proposed\n\n{p['why']}")
+    if p.get("confidence") is not None:
+        parts.append(f"## What it was scored before\n\n{p['confidence']:.2f}"
+                     + ("\nunknowns then: " + "; ".join(p.get("unknowns") or [])
+                        if p.get("unknowns") else "")
+                     + "\n\nYou have already tried once to improve this. Say so and stop if "
+                       "there is nothing further to take out of it.")
+    others = [x for x in goals(lane_name) if x["state"] in ("planning", "running", "blocked")]
+    if others:
+        parts.append("# Already open in this lane, do not propose these\n\n"
+                     + "\n".join(f"- ({o['state']}) {o['objective'][:200]}" for o in others))
+    rec = _record_block(lane_name)
+    if rec:
+        parts.append(rec)
+    parts.append(f"# The repository right now\n\n{goal_brief(lane_name)}")
+    return "\n\n".join(parts)
+
+
+def sharpen_proposal(pid: str) -> dict:
+    """Put odds on a proposal, and try to improve them. One architect call.
+
+    Three things can come back and they are deliberately kept apart:
+
+    the SCORE lands on the proposal itself, so a proposal that is simply good
+    becomes adoptable without anything else changing;
+
+    a REVISION is the same objective made likelier, and it becomes a new
+    proposal that supersedes this one - but ONLY if it actually scores higher.
+    A revision that scores lower is not an improvement, it is a different and
+    worse objective with the original thrown away, and taking it because it
+    arrived under the heading "revision" is how a sharpener talks a lane into
+    smaller and smaller work;
+
+    ALTERNATES are different routes to the same end and are added alongside.
+    They never replace anything, because "here is another way" is not a claim
+    that the first way was wrong.
+    """
+    p = next((x for x in direction_store().get("proposals", []) if x.get("id") == pid), None)
+    if not p:
+        return {"ok": False, "error": f"no proposal {pid!r}"}
+    if p.get("state") != "open" or p.get("kind") != "goal":
+        return {"ok": False, "error": "only an open objective can be sharpened"}
+    if not architect_available():
+        return {"ok": False, "error": architect_off_reason()}
+
+    model = config().get("consult_model", DEFAULT_CONSULT)
+    resp = architect_chat([{"role": "system", "content": SHARPEN_SYSTEM},
+                           {"role": "user", "content": _sharpen_context(p)}], model)
+    text = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    out = _json_reply(text)
+    if not out:
+        return {"ok": False, "error": "the architect's answer could not be read as JSON",
+                "raw": text[:2000]}
+
+    scored = _scored(out)
+    rounds = int(p.get("sharpen_rounds") or 0) + 1
+    was = p.get("confidence")
+
+    rev, alts = out.get("revision") or None, []
+    made = []
+    with _DIRECTION_LOCK:
+        store = direction_store()
+        cur = next((x for x in store["proposals"] if x.get("id") == pid), None)
+        if not cur:
+            return {"ok": False, "error": f"no proposal {pid!r}"}
+        cur.update(scored)
+        cur["sharpen_rounds"] = rounds
+        cur["sharpen_reasoning"] = str(out.get("reasoning") or "")[:800]
+
+        seen = {_norm_prompt(x.get("text", "")) for x in store["proposals"]}
+
+        def _add(src: dict, **extra) -> dict | None:
+            obj = str((src or {}).get("objective") or "").strip()
+            if not obj or _norm_prompt(obj) in seen:
+                return None
+            seen.add(_norm_prompt(obj))
+            new = {"id": "p" + uuid.uuid4().hex[:9], "at": now(), "kind": "goal",
+                   "lane": cur.get("lane"), "text": obj[:1000],
+                   "why": str(src.get("why") or "")[:1000], "state": "open",
+                   "from_goal": cur.get("from_goal"), "review_id": cur.get("review_id"),
+                   "sharpen_rounds": rounds, **_scored(src), **extra}
+            store["proposals"].append(new)
+            return new
+
+        took = None
+        if rev and (rev.get("confidence") or 0) > (scored["confidence"] or 0):
+            took = _add(rev, sharpened_from=pid,
+                        what_changed=str(rev.get("what_changed") or "")[:600])
+            if took:
+                cur["state"] = "superseded"
+                cur["decided_at"] = now()
+                cur["superseded_by"] = took["id"]
+                made.append(took)
+        for a in (out.get("alternates") or [])[:2]:
+            new = _add(a, alternate_of=pid)
+            if new:
+                alts.append(new)
+                made.append(new)
+        _save_direction(store)
+
+    lane, now_c = p.get("lane"), scored["confidence"]
+    note = f"odds in {lane}: {pct(was)} → {pct(now_c)} on {p.get('text', '')[:120]}"
+    if took:
+        note += f" — sharpened to {pct(took.get('confidence'))}: {took.get('what_changed', '')[:200]}"
+    if alts:
+        note += f" — {len(alts)} alternate route(s) proposed"
+    add_note(note[:600], lane=lane)
+    return {"ok": True, "proposal_id": pid, "confidence": now_c,
+            "unknowns": scored["unknowns"], "reasoning": out.get("reasoning"),
+            "revision": took if rev else None, "alternates": alts,
+            "superseded": bool(took), "rounds": rounds, "made": made}
 
 
 def direction_review(gid: str, *, auto: bool = False) -> dict:
@@ -5937,7 +6256,8 @@ def direction_review(gid: str, *, auto: bool = False) -> dict:
         fresh.append({"id": "p" + uuid.uuid4().hex[:9], "at": now(), "kind": "goal",
                       "lane": g.get("lane"), "text": obj[:1000],
                       "why": str(n.get("why") or "")[:1000], "state": "open",
-                      "from_goal": gid, "review_id": rev["id"]})
+                      "from_goal": gid, "review_id": rev["id"],
+                      **_scored(n)})
     for r in (out.get("research") or []):
         qn = str((r or {}).get("question") or "").strip()
         if not qn or _norm_prompt(qn) in seen:
@@ -5985,7 +6305,19 @@ def direction_review(gid: str, *, auto: bool = False) -> dict:
                      + f" {ngoal} proposed objective(s) are waiting for you in Direction.",
                      lane=g.get("lane"))
         else:
-            rev["adopted"] = [adopt_proposal(p["id"]) for p in fresh if p["kind"] == "goal"]
+            # The gates are about the workspace and have just said yes. The bar
+            # is about each objective on its own, so it is asked separately and
+            # per proposal - a review can quite properly adopt one of its two
+            # and leave the other showing why it was not taken.
+            picks = [p for p in fresh if p["kind"] == "goal"]
+            rev["adopted"] = [adopt_proposal(p["id"]) for p in picks if not proposal_hold(p)]
+            held = [(p, proposal_hold(p)) for p in picks if proposal_hold(p)]
+            rev["held"] = [{"id": p["id"], "text": p["text"], "why": why} for p, why in held]
+            for p, why in held:
+                add_note(f"not adopted in {p['lane']} — {why}: {p['text'][:200]}"
+                         + (" Unknowns: " + "; ".join(p.get("unknowns") or [])
+                            if p.get("unknowns") else ""),
+                         lane=p.get("lane"))
     return rev
 
 
@@ -6006,8 +6338,19 @@ def adopt_proposal(pid: str) -> dict:
     objective = p["text"] + (f"\n\nWhy: {p['why']}" if p.get("why") else "")
     g = open_goal(p["lane"], objective)
     set_proposal(pid, "adopted", goal_id=g.get("id"))
-    add_note(f"adopted a proposed goal in {p['lane']}: {p['text'][:200]}", lane=p.get("lane"))
-    return {"ok": True, "goal": g, "proposal_id": pid}
+    # The odds travel with the work. Without this the estimate lives only in the
+    # proposal store, which is trimmed, and `confidence_calibration` would start
+    # quietly losing its oldest and most informative rows.
+    with _GOAL_LOCK:
+        gg = load_goal(g["id"])
+        if gg:
+            gg["confidence"] = p.get("confidence")
+            gg["unknowns"] = p.get("unknowns") or []
+            gg["proposal_id"] = pid
+            save_goal(gg)
+    add_note(f"adopted a proposed goal in {p['lane']} at {pct(p.get('confidence'))} odds: "
+             f"{p['text'][:200]}", lane=p.get("lane"))
+    return {"ok": True, "goal": g, "proposal_id": pid, "confidence": p.get("confidence")}
 
 
 def resume_adoption() -> list[dict]:
@@ -6039,9 +6382,42 @@ def resume_adoption() -> list[dict]:
     for p in sorted(open_proposals(), key=lambda x: x.get("at") or ""):
         # One goal to a lane. The review never had to test this, because it only
         # ever proposes into the lane whose goal has just closed. This does.
-        if p.get("lane") in busy or escalations(p.get("lane")):
+        if p.get("lane") in busy or escalations(p.get("lane")) or proposal_hold(p):
             continue
         return [adopt_proposal(p["id"])]
+    return []
+
+
+def sharpenable() -> list[dict]:
+    """Open proposals that are being held back and are not yet given up on.
+
+    A proposal above the bar is left alone: it is already going to be adopted,
+    and spending an architect call to agree with it buys nothing.
+    """
+    return sorted([p for p in open_proposals()
+                   if proposal_hold(p)
+                   and int(p.get("sharpen_rounds") or 0) < SHARPEN_MAX_ROUNDS],
+                  key=lambda x: x.get("at") or "")
+
+
+def auto_sharpen() -> list[dict]:
+    """Score or improve one held-back proposal per call.
+
+    Not gated on `escalations()`, unlike adoption, and the difference is the
+    point: a gate stops the pipeline STARTING work, and this starts none. It
+    turns a proposal nobody can judge into one that can be judged, which is
+    what an operator standing at a raised gate actually needs. Triage is
+    allowed past the gates for the same reason.
+
+    `auto_adopt` still governs it, because that is the switch for the harness
+    spending on the pipeline unattended, and an architect call is spending.
+
+    One per call: it is an architect call and this runs on the heartbeat.
+    """
+    if not direction_store().get("auto_adopt"):
+        return []
+    for p in sharpenable():
+        return [sharpen_proposal(p["id"])]
     return []
 
 
@@ -6065,12 +6441,20 @@ def direction_view(lane: str | None = None) -> dict:
         "sections": sections,
         "findings": findings(lane=lane)[:60],
         "findings_summary": findings_summary(),
-        "proposals": sorted([p for p in props if p.get("kind") == "goal"],
+        # `hold` is derived here rather than stored, so moving the bar in
+        # Settings re-judges every waiting proposal at once instead of leaving
+        # them labelled against a threshold that is no longer the threshold.
+        "proposals": sorted([{**p, "hold": proposal_hold(p),
+                              "sharpen_rounds": int(p.get("sharpen_rounds") or 0)}
+                             for p in props if p.get("kind") == "goal"],
                             key=lambda p: p.get("at") or "", reverse=True),
         "questions": sorted([p for p in props if p.get("kind") == "question"],
                             key=lambda p: p.get("at") or "", reverse=True),
         "reviews": revs[:8],
         "auto_adopt": bool(store.get("auto_adopt")),
+        "bar": adopt_bar(),
+        "calibration": confidence_calibration(),
+        "max_sharpen": SHARPEN_MAX_ROUNDS,
         "doctrine_state": doctrine_state(),
         "doctrine_path": str(DOCTRINE_PATH),
         # A lane whose goal is finished and never reviewed is exactly where the

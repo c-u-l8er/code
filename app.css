@@ -922,8 +922,47 @@ pre.diff, .ruling {
   border-radius: 6px; padding: 9px 11px; margin-bottom: 8px; font-size: 12px;
 }
 .dprop b { color: var(--fg); font-weight: 600; display: block; margin-bottom: 4px; }
-.dprop .row { margin-top: 8px; align-items: center; }
+.dprop .row { margin-top: 8px; align-items: center; flex-wrap: wrap; gap: 6px; }
 .dprop .muted { line-height: 1.6; }
+/* The left edge answers the only question that matters at a glance: does this
+   start by itself, or is it waiting for you. */
+.dprop.ready { border-left-color: var(--ok, #4ea); }
+.dprop.held { border-left-color: var(--warn, #d9a441); }
+
+/* The score, with your threshold drawn on the same scale as the bar so the
+   comparison is a look rather than a calculation. */
+.odds { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.odds .ometer {
+  position: relative; flex: 0 0 132px; height: 6px;
+  background: #1c2130; border-radius: 3px; overflow: hidden;
+}
+.odds .ometer i { position: absolute; inset: 0 auto 0 0; border-radius: 3px; }
+.odds.good .ometer i { background: var(--ok, #4ea); }
+.odds.low .ometer i { background: var(--warn, #d9a441); }
+.odds .ometer u {
+  position: absolute; top: -2px; width: 1px; height: 10px;
+  background: var(--fg); opacity: .75; overflow: visible;
+}
+.odds .on { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.odds.none .on { font-style: italic; }
+
+.dprop .hold { color: var(--warn, #d9a441); font-size: 11px; }
+.dprop .auto-ok { color: var(--ok, #4ea); font-size: 11px; }
+.dprop .changed { color: var(--muted); font-size: 11px; margin: 3px 0; font-style: italic; }
+/* What it needs and nobody has. This is the list the sharpener attacks, so it
+   is worth reading before deciding the odds are wrong. */
+.dprop .unk { margin: 5px 0 0; font-size: 11px; color: var(--muted); }
+.dprop .unk ul { margin: 2px 0 0; padding-left: 16px; }
+.dprop .unk li { margin: 1px 0; }
+
+.cal { font-size: 11px; color: var(--muted); margin: 0 0 10px; }
+.cal b { color: var(--fg); }
+.calb { display: inline-block; margin-left: 10px; }
+.calb i { font-style: normal; color: var(--fg); font-variant-numeric: tabular-nums; }
+.barrow { align-items: center; gap: 10px; }
+.barrow input[type=range] { flex: 1; max-width: 260px; }
+.barout { font-variant-numeric: tabular-nums; color: var(--fg); }
+.setcal { margin: 6px 0 10px; }
 
 /* An open question is not an objective and does not get the accent border -
    nothing here can be adopted, only answered, and only by Travis. */

@@ -301,6 +301,16 @@ If the architect asks for a file by name it is fetched and sent without another 
       <input id="set-auto-escalate" type="checkbox">
       <span>Auto-escalate a blocked worker to a new thread</span>
     </label>
+    <h4>Start a proposed goal without asking me</h4>
+    <div class="row barrow">
+      <input id="set-bar" type="range" min="0" max="100" step="5">
+      <output id="set-bar-out" class="barout"></output>
+    </div>
+    <p class="muted">Every proposed objective is scored with the odds it <b>finishes</b>
+    &mdash; every done-condition met, without stopping to ask you for something. At or above
+    this mark it starts on its own; below it, it waits in Direction with its reason showing.
+    0% adopts anything that has been scored at all; 100% means you decide every goal.</p>
+    <div id="set-cal" class="setcal"></div>
     <div class="row">
       <button id="btn-set-close">Close</button>
     </div>

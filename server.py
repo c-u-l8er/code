@@ -906,7 +906,9 @@ def do_direction_proposal(body: dict) -> dict:
     if action == "dismiss":
         p = amp.set_proposal(pid, "dismissed", reason=str(body.get("reason") or "")[:400])
         return {"ok": bool(p), "proposal": p} if p else {"ok": False, "error": "no such proposal"}
-    return {"ok": False, "error": "action must be adopt or dismiss"}
+    if action == "sharpen":
+        return amp.sharpen_proposal(pid)
+    return {"ok": False, "error": "action must be adopt, dismiss or sharpen"}
 
 
 def do_direction_auto(body: dict) -> dict:
@@ -1115,6 +1117,19 @@ def _pipeline_ticker():
             for r in amp.resume_adoption():
                 if r.get("ok"):
                     print(f"amp: adopted waiting proposal {r['proposal_id']}")
+        except Exception:
+            traceback.print_exc()
+        # Anything still held back is held for one of two reasons - no odds on
+        # it, or odds under the bar - and both are answerable by looking harder
+        # at the objective. Runs after adoption so a proposal that is already
+        # good enough is started rather than re-examined.
+        try:
+            for r in amp.auto_sharpen():
+                if r.get("ok"):
+                    print(f"amp: sharpened {r['proposal_id']} -> {amp.pct(r['confidence'])}"
+                          + (" (superseded)" if r.get("superseded") else ""))
+                else:
+                    print(f"amp: sharpen failed: {r.get('error')}")
         except Exception:
             traceback.print_exc()
 
@@ -1465,6 +1480,11 @@ def do_settings() -> dict:
         "architect_actions": amp.ARCHITECT_ACTIONS,
         "auto_max_rounds": amp.AUTO_MAX_ROUNDS,
         "roles": amp.role_view(),
+        # The dial and the evidence for it, together. A threshold shown without
+        # what the scores behind it actually turned out to be worth is a number
+        # asking to be trusted, and there is no reason to.
+        "adopt_confidence": amp.adopt_bar(),
+        "calibration": amp.confidence_calibration(),
     }
 
 
@@ -1491,6 +1511,18 @@ SETTINGS_CHOICES = {"architect_backend": amp.ARCHITECT_BACKENDS}
 def do_settings_set(body: dict) -> dict:
     cfg = amp.config()
     changed = {}
+    # Not a flag and not a choice: a number, refused here if it is not one or
+    # not a probability, rather than written and clamped silently at read time
+    # where the operator would never learn the bar is not where they set it.
+    if "adopt_confidence" in body:
+        try:
+            v = float(body["adopt_confidence"])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "adopt_confidence must be a number between 0 and 1"}
+        if not 0.0 <= v <= 1.0:
+            return {"ok": False, "error": f"adopt_confidence must be between 0 and 1, not {v}"}
+        cfg.setdefault("autonomy", {})["adopt_confidence"] = round(v, 3)
+        changed["adopt_confidence"] = round(v, 3)
     for k in SETTINGS_FLAGS:
         if k in body:
             cfg[k] = bool(body[k])
@@ -1505,7 +1537,8 @@ def do_settings_set(body: dict) -> dict:
             changed[k] = v
     if not changed:
         return {"ok": False, "error": f"nothing to set - expected any of "
-                                      f"{', '.join(SETTINGS_FLAGS + tuple(SETTINGS_CHOICES))}"}
+                                      f"{', '.join(SETTINGS_FLAGS + tuple(SETTINGS_CHOICES))}"
+                                      f", adopt_confidence"}
     amp.save_json(amp.CONFIG_PATH, cfg)
     return {**do_settings(), "changed": changed}
 

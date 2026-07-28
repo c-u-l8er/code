@@ -371,6 +371,14 @@ function renderSettings(s) {
   renderRoles(s.roles);
   $('set-openrouter').checked = !!s.openrouter_enabled;
   $('set-auto-escalate').checked = !!s.auto_escalate;
+  // The slider is only written from the server's value while you are not
+  // dragging it. Settings is re-rendered by every save, and putting the round
+  // trip's answer back under a thumb you are still holding is how a slider
+  // fights you.
+  const bar = $('set-bar');
+  if (document.activeElement !== bar) bar.value = Math.round((s.adopt_confidence ?? 0.6) * 100);
+  $('set-bar-out').textContent = bar.value + '%';
+  $('set-cal').innerHTML = calBlock(s.calibration, (s.adopt_confidence ?? 0.6));
   renderSpend(s);
 }
 
@@ -390,6 +398,9 @@ async function setFlag(key, value) {
       ? value
         ? 'OpenRouter credit may be spent again.'
         : 'OpenRouter off — nothing here can spend it. Workers are unaffected.'
+      : key === 'adopt_confidence'
+      ? `goals scored ${Math.round(value * 100)}% or better start on their own. ` +
+        'Everything already waiting was just re-judged against it.'
       : 'saved.';
   st.className = 'good';
   await refresh();
@@ -1409,6 +1420,33 @@ function wireGoals() {
 // worth travelling. Then what we still do not know. Proposals last: they are the
 // cheapest thing here to produce and the only one that spends anything.
 
+/** The odds as a bar you can read without arithmetic, with your threshold marked on it. */
+function odds(c, bar) {
+  if (c === null || c === undefined)
+    return `<div class="odds none"><span class="on">unscored</span></div>`;
+  const pc = Math.round(c * 100);
+  return `<div class="odds ${c >= bar ? 'good' : 'low'}">` +
+    `<span class="ometer"><i style="width:${pc}%"></i>` +
+    `<u style="left:${Math.round(bar * 100)}%" title="the bar you set"></u></span>` +
+    `<span class="on">${pc}%</span></div>`;
+}
+
+/** The bar, and what the scores behind it have so far turned out to be worth.
+ *  Shown together on purpose: a threshold on its own is a number asking to be
+ *  trusted, and until some scored goal has actually finished there is no reason to. */
+function calBlock(c, bar) {
+  const head = `starts on its own at <b>${Math.round(bar * 100)}%</b> and up`;
+  if (!c || !c.n)
+    return `<div class="cal">${head} · <span class="muted">no scored goal has settled yet, ` +
+           `so nothing has checked these numbers</span></div>`;
+  const rows = c.bands.filter((b) => b.n).map((b) =>
+    `<span class="calb"><i>${Math.round(b.from * 100)}–${Math.round(b.to * 100)}%</i> ` +
+    `${b.finished}/${b.n} finished</span>`).join('');
+  return `<div class="cal">${head} · <span class="muted">scored ` +
+    `${Math.round(c.stated * 100)}% on average, ${Math.round(c.actual * 100)}% actually ` +
+    `finished, over ${c.n}</span>${rows}</div>`;
+}
+
 function dirSection(s, cls) {
   if (!s) return '';
   return `<section class="dsec ${cls || ''}"><h4>${esc(s.title)}</h4>` +
@@ -1441,11 +1479,28 @@ function renderDirection(d) {
     `<div class="muted">${esc(p.lane || '')} · proposed ${esc((p.at || '').slice(0, 10))}` +
     ` <button class="dq-x" data-id="${esc(p.id)}">not worth chasing</button></div></div>`).join('');
 
+  const bar = typeof d.bar === 'number' ? d.bar : 0.6;
   const props = (d.proposals || []).map((p) =>
-    `<div class="dprop"><b>${mdi(p.text)}</b>` +
+    `<div class="dprop${p.hold ? ' held' : ' ready'}">` +
+    odds(p.confidence, bar) +
+    `<b>${mdi(p.text)}</b>` +
     (p.why ? `<div class="muted">${mdi(p.why)}</div>` : '') +
+    (p.what_changed ? `<div class="changed">sharpened: ${mdi(p.what_changed)}</div>` : '') +
+    (p.alternate_of ? `<div class="changed">another route to the same end</div>` : '') +
+    ((p.unknowns || []).length
+      ? `<div class="unk"><span>needs, and nobody has established:</span><ul>` +
+        p.unknowns.map((u) => `<li>${esc(u)}</li>`).join('') + `</ul></div>` : '') +
+    (p.sharpen_reasoning ? `<div class="muted why">${mdi(p.sharpen_reasoning)}</div>` : '') +
     `<div class="row"><span class="tag">${esc(p.lane || '')}</span>` +
+    // The one thing this panel has to make unmissable: whether this gets
+    // started without anyone deciding, and if not, what is stopping it.
+    (p.hold
+      ? `<span class="hold">waits for you — ${esc(p.hold)}</span>`
+      : `<span class="auto-ok">will start on its own</span>`) +
     `<button class="dp-go primary" data-id="${esc(p.id)}">Adopt as a goal</button>` +
+    (p.sharpen_rounds < (d.max_sharpen || 2)
+      ? `<button class="dp-s" data-id="${esc(p.id)}">Improve the odds</button>`
+      : `<span class="muted">sharpened ${p.sharpen_rounds}×</span>`) +
     `<button class="dp-x" data-id="${esc(p.id)}">Not now</button></div></div>`).join('');
 
   const revs = (d.reviews || []).map((r) =>
@@ -1468,6 +1523,7 @@ function renderDirection(d) {
     (qs ? `<div class="dqs"><div class="muted">Proposed by the work, not yet in the doctrine ` +
       `— only you can put one there:</div>${qs}</div>` : '') + `</section>` +
     `<section class="dsec"><h4>Where there is left to go</h4>` +
+    calBlock(d.calibration, bar) +
     (props || '<div class="empty">No proposals. One appears when a goal finishes and the ' +
       'architect judges the lane has somewhere left to travel.</div>') +
     (revs ? `<h5>Recent reviews</h5>${revs}` : '') + `</section>` +
@@ -1489,6 +1545,18 @@ function renderDirection(d) {
         ? `opened goal ${esc(r.goal.id)}`
         : `<span class="err">${esc(r.error)}</span>`;
       await refresh(); loadDirection();
+    }));
+  el.querySelectorAll('.dp-s').forEach((b) =>
+    b.addEventListener('click', async () => {
+      b.disabled = true; b.textContent = 'weighing it up…';
+      const r = await post('/api/direction/proposal', { id: b.dataset.id, action: 'sharpen' });
+      $('dir-status').innerHTML = r.ok
+        ? `odds ${r.confidence === null ? 'unscored' : Math.round(r.confidence * 100) + '%'}` +
+          (r.superseded ? ' · replaced by a version likelier to land' : '') +
+          (r.alternates && r.alternates.length
+            ? ` · ${r.alternates.length} other route(s) proposed` : '')
+        : `<span class="err">${esc(r.error)}</span>`;
+      loadDirection();
     }));
   el.querySelectorAll('.dp-x, .dq-x').forEach((b) =>
     b.addEventListener('click', async () => {
@@ -2027,6 +2095,11 @@ $('btn-settings').onclick = openSettings;
 $('btn-set-close').onclick = () => $('settings').classList.add('hidden');
 $('set-openrouter').onchange = (e) => setFlag('openrouter_enabled', e.target.checked);
 $('set-auto-escalate').onchange = (e) => setFlag('auto_escalate', e.target.checked);
+// `input` only moves the label; the save is on `change`, which fires once when
+// you let go. Saving on every pixel of a drag would be twenty writes and twenty
+// re-renders for one decision.
+$('set-bar').oninput = (e) => { $('set-bar-out').textContent = e.target.value + '%'; };
+$('set-bar').onchange = (e) => setFlag('adopt_confidence', Number(e.target.value) / 100);
 $('btn-cx-cancel').onclick = () => {
   cxStop();
   post('/api/codex-auth/cancel');
