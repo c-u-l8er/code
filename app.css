@@ -495,9 +495,23 @@ pre.diff, .ruling {
 .dm.esc .dm-body { background: #2b2410; border-left: 3px solid var(--warn); }
 .dm.rule .dm-body { background: #241a33; border-left: 3px solid #a78bfa; }
 
+/* A goal waiting on a decision. The loudest thing in the feed on purpose: it is
+   the only kind of message here that holds a lane stopped until someone reads
+   it, and it used to arrive as a dashed grey note among the dispatches. */
+.dm.ask .dm-body { background: #2b1a10; border-left: 3px solid var(--bad); }
+.dm.ask .qs { margin: 6px 0 0; padding-left: 18px; }
+.dm.ask .qs li { margin: 3px 0; }
+
 /* The orchestrator conversation. It is the only part of the feed that is a
    conversation rather than a summary, so it is the only part that gets width. */
 .dm.said .dm-body { background: #16233b; }
+/* The harness asking on its own initiative: quieter than an operator line and
+   labelled, so the thread never reads as though they typed it. */
+.dm.said.harness .dm-body { background: #1b2130; color: var(--muted); }
+.dm.said.harness .who {
+  display: inline-block; margin-right: 6px; padding: 0 5px;
+  border: 1px solid var(--line); border-radius: 3px; font-size: 10px;
+}
 .dm.amp .dm-body { background: var(--panel2); border-left: 3px solid var(--amp); }
 .dm.amp.bad .dm-body { background: #2a1414; border-left-color: var(--bad); }
 .dm.amp .dm-body.md { padding: 8px 11px; }

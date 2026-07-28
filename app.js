@@ -21,6 +21,12 @@ function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 }
 
+/** The first line with anything on it. Long harness prompts are summarised, not shown. */
+function _firstLine(s) {
+  const l = String(s || '').split('\n').find((x) => x.trim()) || '';
+  return l.length > 120 ? l.slice(0, 120) + '…' : l;
+}
+
 // ---------------------------------------------------------------- render
 
 const ROLE_DOES = {
@@ -839,11 +845,31 @@ function dockLine(m) {
     : '';
   if (m.kind === 'note')
     return `<div class="dm note"><span class="dm-at">${at}</span><span class="dm-body">${esc(m.text)}</span></div>`;
+  // A goal that stopped to ask something, with every question it asked - not
+  // the first 400 characters of them joined together, which is what the note
+  // this replaces could carry. There is no answer box here on purpose: this
+  // feed is repainted wholesale, every two seconds while a turn is running,
+  // and a textarea inside it would eat what you were typing at exactly the
+  // moment you had just read the reply and were answering it. The button goes
+  // to the goal, where the answer box already lives and survives.
+  if (m.kind === 'question')
+    return `<div class="dm ask"><span class="dm-at">${at}</span><span class="dm-body">` +
+           `${lane} stopped and needs a decision` +
+           (m.triaged ? '' : ' <span class="pill auto">triaging</span>') +
+           `<ul class="qs">${(m.questions || []).map((q) => `<li>${esc(q)}</li>`).join('')}</ul>` +
+           `</span><button class="dm-open" data-goal="${esc(m.goal_id)}" ` +
+           `data-lane="${esc(m.lane)}">answer</button></div>`;
   // The orchestrator's own conversation, rendered in full: this one is not a
   // summary of something you can open elsewhere, it IS the thing.
   if (m.kind === 'you')
     return `<div class="dm said"><span class="dm-at">${at}</span>` +
            `<span class="dm-body">${esc(m.text)}</span></div>`;
+  // The harness asking on its own initiative. Marked, and never drawn as `you`:
+  // the thread is the record of who decided what, and it is worth nothing if
+  // the machine's own prompts appear over the operator's name.
+  if (m.kind === 'harness')
+    return `<div class="dm said harness"><span class="dm-at">${at}</span>` +
+           `<span class="dm-body"><span class="who">harness</span>${esc(_firstLine(m.text))}</span></div>`;
   if (m.kind === 'amp') {
     if (m.status === 'running')
       return `<div class="dm amp working"><span class="dm-at">${at}</span>` +
@@ -895,8 +921,8 @@ async function loadChat() {
     loadChat.timer = setTimeout(loadChat, 2000);
   feed.querySelectorAll('.dm-open').forEach((b) =>
     b.addEventListener('click', () =>
-      b.dataset.consult
-        ? openConsult(b.dataset.lane, b.dataset.consult)
+      b.dataset.consult ? openConsult(b.dataset.lane, b.dataset.consult)
+        : b.dataset.goal ? openGoal(b.dataset.lane, b.dataset.goal)
         : openWorkerLog(b.dataset.lane, b.dataset.task)
     )
   );
@@ -1761,6 +1787,13 @@ function openConsult(lane, cid) {
   if (lane !== state.sel) select(lane);
   state.consult = cid;          // what showTab's load will settle on
   showTab('ask');
+}
+
+/** Open a goal expanded, which is where its answer box is. */
+function openGoal(lane, gid) {
+  if (lane && lane !== state.sel) select(lane);
+  state.goal = gid;
+  showTab('goals');
 }
 
 async function sendChat() {

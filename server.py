@@ -1094,6 +1094,18 @@ def _pipeline_ticker():
             _drain_queue()
         except Exception:
             traceback.print_exc()
+        # A goal that stopped to ask something is the one halt the harness is
+        # not allowed to clear on its own - so it is handed to the orchestrator
+        # instead, which reads what can be read and puts what cannot in front of
+        # the operator as one decision rather than a wall of prose. Blocking,
+        # deliberately: it runs on this thread so two triages cannot overlap on
+        # a single orchestrator session, and the tick is 60s against a turn of
+        # perhaps 30.
+        try:
+            for gid in amp.triage_blocked_goals(BASE_URL):
+                print(f"amp: triaged blocked goal {gid}")
+        except Exception:
+            traceback.print_exc()
 
 
 def _obligation_ticker():
@@ -1542,11 +1554,23 @@ def chat_payload() -> dict:
     # stored, because it is the thing itself rather than a summary of it.
     for t in amp.orchestrator_turns():
         msgs.append({
-            "kind": "you" if t["role"] == "you" else "amp",
+            "kind": {"you": "you", "harness": "harness"}.get(t["role"], "amp"),
             "id": t["id"], "at": t["at"], "text": t.get("text") or "",
             "status": t.get("status"), "cost_usd": t.get("cost_usd"),
             "num_turns": t.get("num_turns"),
         })
+    # A goal that stopped to ask something, as a question rather than as one
+    # more line of activity. Derived, so it disappears from the thread the
+    # moment it is answered and cannot outlive the thing it is about - the same
+    # reason task activity is derived. It carries every question in full: the
+    # note that used to stand in for this truncated three questions into 400
+    # characters, which is enough to know a lane stopped and not enough to
+    # answer it.
+    for q in amp.blocked_questions():
+        msgs.append({"kind": "question", "id": f"q:{q['goal_id']}", "at": q["at"],
+                     "lane": q["lane"], "goal_id": q["goal_id"],
+                     "questions": q["questions"], "triaged": bool(q["triaged_at"]),
+                     "text": q["questions"][0]})
     for lane, recs in amp.board().get("tasks", {}).items():
         for rec in recs:
             tid, backend = rec.get("task_id"), rec.get("backend")

@@ -1196,10 +1196,17 @@ def orchestrator_brief(base_url: str) -> str:
 
 
 def orchestrator_ask(text: str, *, base_url: str, model: str | None = None,
-                     budget: float | None = None) -> dict:
+                     budget: float | None = None, role: str = "you") -> dict:
     """One orchestrator turn: record it, run it, record the reply.
 
     Blocking. The console runs it on a thread so the feed can show it working.
+
+    `role` is who is asking. It was hard-coded to `you`, which was true while the
+    only way in was the operator typing - and stops being true the moment the
+    harness asks something on its own. A feed that shows the harness's own
+    prompts under the operator's name is a feed you cannot use to work out who
+    decided what, which is most of what the thread is for. `harness` is
+    rendered differently and is never attributed to them.
     """
     cfg = config()
     model = model or cfg.get("orchestrator_model", DEFAULT_ORCH_MODEL)
@@ -1208,7 +1215,7 @@ def orchestrator_ask(text: str, *, base_url: str, model: str | None = None,
     o = orchestrator()
     prior = o.get("session_id")
     turn_id = uuid.uuid4().hex[:12]
-    orch_append({"id": f"u{turn_id}", "at": now(), "role": "you", "text": text})
+    orch_append({"id": f"u{turn_id}", "at": now(), "role": role, "text": text})
     orch_append({"id": turn_id, "at": now(), "role": "amp", "status": "running",
                  "text": "", "model": model})
 
@@ -5211,9 +5218,152 @@ def answer_goal(gid: str, text: str) -> dict:
         g["stopped_on"] = None
         g["state"] = "running"
         g["rounds"] = 0
+        # These questions are answered, so the triage that read them is spent.
+        # Left set, a goal that stops again later - on something else entirely -
+        # is treated as already looked at and nobody ever looks.
+        g["triaged_at"] = None
         save_goal(g)
     goal_log(gid, f"you answered: {text[:300]}")
     return goal_review(gid, f"The operator answers your questions:\n\n{text}")
+
+
+# --------------------------------------------------- getting asked, and answering
+#
+# A goal that cannot go on without a decision stops and says what it needs. That
+# much always worked. What did not is everything after: the question went into
+# the feed as one truncated line among the dispatches, nothing ever looked at it
+# again, and the lane stayed stopped until somebody happened to scroll past it.
+# Four goals were sitting like that at once.
+#
+# Two things fix it, and they are different things.
+#
+# The first is that the question belongs in the thread AS A QUESTION - every
+# part of it, with the goal it came from, and somewhere to type the answer. That
+# is `blocked_questions()`, derived from the board like the rest of the feed so
+# it cannot drift from it.
+#
+# The second is triage, and it is where the care goes. Doctrine rule 6 names
+# what is Travis's: what to build, what counts as good enough, what to spend,
+# what to publish, what to entrench. Those are most of what a stopped goal asks
+# about, and a harness that answered them would be a harness that had quietly
+# taken the decisions the escalation floor exists to protect. So triage is
+# ALLOWED TO ANSWER ONLY FROM EVIDENCE - what the repository, a prior ruling or
+# a spec already says - and is required to hand everything else back with the
+# choice stated plainly enough to answer in a word. Reading it out is worth a
+# lot on its own: a goal asking three questions of which one is a matter of
+# record is a goal that stops for one decision instead of three.
+
+TRIAGE_RULES = """A goal has stopped because it asked for a decision. Deal with it now.
+
+Goal {gid} in lane {lane}. Its objective:
+
+{objective}
+
+It asks:
+
+{questions}
+
+Take each question separately and put it in exactly one of two piles.
+
+EVIDENCE - the answer is already recorded somewhere you can read: in this
+repository, in a spec under docs/spec/, in an architect ruling, in a commit, in
+a prior finding. Go and read it, and answer with what it says and where you read
+it. "The spec at X says Y" is an answer. "I think Y" is not - if you are
+reasoning rather than reading, it is not this pile.
+
+TRAVIS - doctrine rule 6: what to build, what counts as good enough, what to
+spend, what to publish, what to entrench. Anything needing money, credentials,
+an account, a deployment target, or permission is his by definition. So is any
+question whose honest answer is a preference. You must not answer these, and you
+must not talk the goal into a smaller version of the same decision.
+
+If every question is EVIDENCE, answer them all together:
+
+  curl -s -X POST {base}/api/goal/answer \\
+       -H 'content-type: application/json' \\
+       -d '{{"goal_id":"{gid}","text":"..."}}'
+
+That restarts the goal, so only do it when you have actually read the answers.
+
+If any question is TRAVIS, do not call that endpoint at all - a partial answer
+restarts the goal with the real decision still unmade. Instead reply to him
+here, in under 80 words: the lane, the one decision, the options as you
+understand them, and what you already settled from evidence so he is not asked
+that part. If you found the evidence pile is empty, say that too.
+
+Reply with what you did, not with a plan to do it."""
+
+
+def operator_blocked_goals() -> list[dict]:
+    """Goals stopped because they asked something only a person can settle.
+
+    The counterpart to `budget_stopped`. Both read `blocked`; one is a goal that
+    ran out of budget, this one is a goal waiting for an answer, and they need
+    different things done to them.
+    """
+    return [r for r in goals()
+            if r.get("state") == "blocked" and r.get("stopped_on") == "operator"]
+
+
+def blocked_questions() -> list[dict]:
+    """Every outstanding question, whole, with the goal that asked it."""
+    out = []
+    for row in operator_blocked_goals():
+        g = load_goal(row["id"])
+        if not g or not g.get("questions"):
+            continue
+        out.append({"goal_id": g["id"], "lane": g.get("lane"),
+                    "at": g.get("updated_at") or g.get("opened_at"),
+                    "objective": g.get("objective") or "",
+                    "questions": list(g["questions"]),
+                    "triaged_at": g.get("triaged_at")})
+    return out
+
+
+def mark_triaged(gid: str):
+    with _GOAL_LOCK:
+        g = load_goal(gid)
+        if g:
+            g["triaged_at"] = now()
+            save_goal(g)
+
+
+def triage_blocked_goals(base_url: str) -> list[str]:
+    """Hand ONE newly stopped goal to the orchestrator, and only one.
+
+    Marked BEFORE the call, not after. A turn that dies partway through has
+    still spent a budget and may still have answered the goal, and a retry loop
+    around a model call is how a stopped lane becomes an expensive stopped lane.
+    Once, or not at all.
+
+    One per call rather than all of them, for two reasons that both bite. The
+    orchestrator is a single conversation, so two turns at once is not a queue
+    but a corrupted thread. And this blocks its caller: four goals stopped
+    together - which is what actually happened - would be four opus turns back
+    to back, holding the heartbeat for minutes and spending four budgets before
+    anyone saw the first answer. At one a minute the backlog still clears in
+    four, and the first reply arrives while the rest are still waiting.
+    """
+    if not (config().get("autonomy") or {}).get("triage", True):
+        return []
+    if orch_busy():
+        return []
+    row = next((r for r in blocked_questions() if not r.get("triaged_at")), None)
+    if not row:
+        return []
+    gid = row["goal_id"]
+    mark_triaged(gid)
+    try:
+        orchestrator_ask(
+            TRIAGE_RULES.format(
+                gid=gid, lane=row["lane"], base=base_url,
+                objective=row["objective"][:1500],
+                questions="\n".join(f"{i}. {q}" for i, q in enumerate(row["questions"], 1))),
+            base_url=base_url, role="harness")
+    except Exception as e:
+        goal_log(gid, f"triage failed: {e}")
+        return []
+    return [gid]
 
 
 def close_goal(gid: str, state: str = "abandoned") -> dict:
