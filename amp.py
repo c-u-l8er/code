@@ -5063,6 +5063,18 @@ def idle_goals() -> list[dict]:
 
     Deliberately NOT time-based. A goal is idle when no task is out and no live
     process is judging it, both of which are facts rather than estimates.
+
+    The liveness test has to come FIRST. This used to skip any goal with no
+    `todo` task before ever asking who was on it, on the reasoning that a review
+    would close it - and that is true exactly while a review is still running.
+    A goal reaches "no running task, no todo task" in only two ways: it is being
+    reviewed right now, or its review was interrupted. The second one is the
+    halt, and it was the one case the guard threw away, so the goal sat in
+    `running` with every task done and nothing left alive to close it. `prism`
+    sat like that for two hours behind a `reviewing_pid` whose process was gone.
+
+    A goal with nothing left to send is not a problem for the caller either:
+    `goal_dispatch` finds no `todo`, and resumes the interrupted review itself.
     """
     out = []
     for row in goals():
@@ -5073,8 +5085,6 @@ def idle_goals() -> list[dict]:
             continue
         if any(t.get("state") == "running" for t in g.get("tasks") or []):
             continue
-        if not any(t.get("state") == "todo" for t in g.get("tasks") or []):
-            continue                      # nothing to send; a review will close it
         pid = g.get("reviewing_pid")
         if pid and pid == os.getpid():
             continue                      # this process is judging it right now
