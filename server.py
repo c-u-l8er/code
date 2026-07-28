@@ -250,6 +250,11 @@ def state_payload() -> dict:
             # the restart itself is failing - which is worth seeing, and used to
             # be invisible because a quiet goal counted as a healthy one.
             "goals_idle": len(amp.idle_goals()),
+            # Goals deliberately waiting out a capacity limit rather than being
+            # judged for it. Counted separately from idle because a held goal is
+            # working as intended and an idle one is not.
+            "goals_held": sum(1 for g in live_goals
+                              if (amp.load_goal(g["id"]) or {}).get("hold_until", "") > amp.now()),
             # What is currently stopping the pipeline from feeding itself. Empty
             # is the normal, running state; anything here is waiting on you.
             "escalations": amp.escalations(),

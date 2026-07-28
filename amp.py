@@ -37,7 +37,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent                   # the program (this repo)
@@ -5039,8 +5039,68 @@ def idle_goals() -> list[dict]:
             continue                      # this process is judging it right now
         if pid and pid_alive(pid):
             continue                      # some other live console has it
+        if g.get("hold_until") and g["hold_until"] > now():
+            continue                      # waiting out a capacity limit
         out.append(g)
     return out
+
+
+# ------------------------------------------------------- waiting out a limit
+#
+# There are two reasons a worker can fail, and treating them the same is what
+# takes the whole fleet down at once. A worker that failed AT THE WORK left
+# something behind to judge, and the architect spends a round judging it. A
+# worker that never got to start - the subscription window is spent, the API is
+# overloaded - left nothing, and there is nothing to judge.
+#
+# The second kind arrives in every lane within seconds of the first, because
+# they all draw on one account. Reviewing those failures costs a round per goal
+# per attempt, and rounds are capped, so a limit lasting an hour ends with every
+# goal stopped on `too many rounds` and no worker left running. Then the limit
+# lifts and nothing restarts, because nothing is left to restart. That is the
+# day-scale halt: the fleet does not crash, it spends itself out against a wall.
+#
+# So a capacity failure costs no round and no judgement. The task goes back to
+# `todo`, the goal is held for a while, and the heartbeat picks it up when the
+# hold expires - which is what a person would have done.
+
+CAPACITY_MARKERS = (
+    "usage limit", "rate limit", "rate_limit", "429", "529",
+    "overloaded", "quota", "try again later", "temporarily unavailable",
+)
+CAPACITY_HOLD_S = 600
+
+
+def capacity_problem(rec: dict) -> str | None:
+    """Whether a worker failed for want of capacity rather than at the work."""
+    if rec.get("status") not in ("failed", "cancelled"):
+        return None
+    # `error` and `killed` only, never the worker's own prose. A worker that
+    # merely WROTE about rate limits has not hit one, and the same mistake -
+    # scanning a report for markers the report is allowed to discuss - already
+    # cost us once in `diagnose_session`.
+    blob = " ".join(str(rec.get(k) or "") for k in ("error", "killed")).lower()
+    return next((m for m in CAPACITY_MARKERS if m in blob), None)
+
+
+def goal_hold(gid: str, seconds: int, why: str):
+    """Put a goal down for a while without spending anything on it."""
+    with _GOAL_LOCK:
+        g = load_goal(gid)
+        if not g:
+            return
+        for t in g["tasks"]:
+            if t.get("state") == "running":
+                t["state"] = "todo"       # it never ran; it is still owed
+        g["hold_until"] = ts_in(seconds)
+        save_goal(g)
+    goal_log(gid, f"held {seconds // 60}m: {why}")
+
+
+def ts_in(seconds: int) -> str:
+    """A `now()`-shaped stamp `seconds` from now, so the two compare as strings."""
+    return (datetime.now(timezone.utc)
+            + timedelta(seconds=seconds)).isoformat(timespec="seconds")
 
 
 def pid_alive(pid: int) -> bool:
@@ -5057,6 +5117,11 @@ def goal_worker_done(gid: str, lane_name: str, rec: dict) -> dict:
     if not g:
         return {}
     task_id = rec.get("goal_task")
+    limit = capacity_problem(rec)
+    if limit:
+        goal_hold(gid, CAPACITY_HOLD_S,
+                  f"{limit} - the worker never started, so there is nothing to judge")
+        return load_goal(gid) or {}
     killed = rec.get("killed") or (rec.get("status") == "failed")
     with _GOAL_LOCK:
         g = load_goal(gid)
