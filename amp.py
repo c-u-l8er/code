@@ -3202,7 +3202,8 @@ def _codex_usage(stdout: str, prompt: str, reply: str) -> dict:
     return {"total_tokens": (len(prompt) + len(reply)) // 4, "estimated": True}
 
 
-def codex_chat(messages: list[dict], model_key: str, max_tokens: int = 8000) -> dict:
+def codex_chat(messages: list[dict], model_key: str, max_tokens: int = 8000,
+               *, web: bool = False) -> dict:
     """The architect, answered by `codex exec` against your ChatGPT subscription.
 
     Returns the shape `openrouter_chat` returns, because the two call sites read
@@ -3228,6 +3229,12 @@ def codex_chat(messages: list[dict], model_key: str, max_tokens: int = 8000) -> 
     sees is not what the worker will be working on. Worth watching; the fix, if
     it turns out to matter, is to point it at the worktree deliberately rather
     than to pretend it cannot see.
+
+    `web` lets the round search the internet. It is off by default and turned on
+    per call rather than in config, because a round that can go and read the
+    world answers a different question from one that can only read this
+    workspace, and which of the two you wanted is a property of the question and
+    not of the machine.
     """
     if not codex_available():
         die("codex CLI not found. Install it (npm i -g @openai/codex), or point "
@@ -3242,6 +3249,8 @@ def codex_chat(messages: list[dict], model_key: str, max_tokens: int = 8000) -> 
         out = Path(td) / "reply.md"
         cmd = ["codex", "exec", "--json", "--skip-git-repo-check",
                "-s", "read-only", "-C", td, "-o", str(out)]
+        if web:
+            cmd += ["-c", "tools.web_search=true"]
         if model:
             cmd += ["-m", model]
         cmd.append("-")          # the packet is tens of KB: stdin, never argv
@@ -3918,16 +3927,31 @@ def openrouter_chat(messages: list[dict], model_key: str, max_tokens: int = 8000
         die(f"OpenRouter unreachable: {e.reason}")
 
 
-def architect_chat(messages: list[dict], model_key: str, max_tokens: int = 8000) -> dict:
+def web_search_backend() -> bool:
+    """Whether the architect, as currently configured, can look at the internet.
+
+    Asked rather than assumed, because a caller that wants the world and gets a
+    round which quietly could not reach it would get back plausible recall
+    presented as research. The one caller that wants this says so in its answer.
+    """
+    return architect_backend() == "codex"
+
+
+def architect_chat(messages: list[dict], model_key: str, max_tokens: int = 8000,
+                   *, web: bool = False) -> dict:
     """One architect round, wherever the architect currently lives.
 
     Every path that consults the architect goes through here, so switching
     backend is a settings change and not a code change, and so there is exactly
     one place to look when asking what a round costs and who it asks.
+
+    `web` is a request, not a guarantee - only the codex backend can honour it.
+    Ask `web_search_backend()` first if the difference matters to what you say
+    about the answer.
     """
     backend = architect_backend()
     if backend == "codex":
-        return codex_chat(messages, model_key, max_tokens)
+        return codex_chat(messages, model_key, max_tokens, web=web)
     if backend == "claude":
         return claude_chat(messages, role_model("architect"), max_tokens)
     return openrouter_chat(messages, model_key, max_tokens)
@@ -6315,6 +6339,251 @@ def _direction_context(g: dict, sections: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
+# ------------------------------------------------------------------- exploring
+#
+# A review answers "and then what" about ONE goal that just finished. That is
+# the right question most of the time and it is why it fires on a goal closing.
+# But it means proposals only ever arrive behind finished work, so the moment
+# the fleet is held - by a gate, by a bar, by there being nothing left in a lane
+# - is exactly the moment nothing new can appear. Exploring is the other door:
+# it is asked for, it reads across every lane at once instead of down one, and
+# it may go and look outside the workspace.
+#
+# It is deliberately NOT on the heartbeat. A button that manufactures work on a
+# timer manufactures work.
+
+EXPLORE_SYSTEM = (
+    "You are the consulting architect for an operator's whole stack, not for one lane of "
+    "it. Nothing has just finished. You are being asked, deliberately, where else there is "
+    "to go - so the answers worth giving are the ones a review of a single finished goal "
+    "structurally cannot see.\n\n"
+    "You are given the operator's mission and doctrine, how far each lane's evidence has "
+    "actually got, what the work in every lane has reported back, every question already "
+    "open, and everything already proposed - including what was turned down.\n\n"
+    "Three places to look, in this order:\n"
+    "1. ACROSS LANES. What one lane has learned or built that another lane is stuck "
+    "without. What two lanes are each solving separately. What a lane's finding implies "
+    "somewhere it was never reported. This is the highest-value thing here and it is the "
+    "one thing nobody else in this system is ever asked.\n"
+    "2. OUTSIDE. If you can search the web, do: a standard, a released tool, a published "
+    "result, or a change in the world that makes something here cheaper, unnecessary, or "
+    "newly possible. Cite what you actually read.\n"
+    "3. REFRAMING. Something the doctrine assumes that could be tested cheaply, or an "
+    "objective everything else is waiting on that nobody has stated.\n\n"
+    "Reply with one JSON object and nothing else:\n"
+    "{\n"
+    '  "assessment": "where the stack stands as a whole and what you went looking for, '
+    '2-4 sentences",\n'
+    '  "next": [{"objective": "one objective, what has to be true when it is finished",\n'
+    '            "lane": "which lane it belongs to, from the list you were given",\n'
+    '            "why": "what it buys, in terms of the mission or an open question",\n'
+    '            "origin": "cross_lane|outside|reframe",\n'
+    '            "sources": ["url you actually read, for origin=outside"],\n'
+    '            "confidence": 0.0,\n'
+    '            "need": 0.0,\n'
+    '            "why_need": "which rung moves, or which open question closes, if it lands",\n'
+    '            "cost_usd": 0.0,\n'
+    '            "headroom": 0.0,\n'
+    '            "why_headroom": "the move that would raise this, or that there is none",\n'
+    '            "unknowns": ["what this needs that is not established to exist"]}],\n'
+    '  "research": [{"question": "what we do not know", "why": "why it matters",\n'
+    '                "settled_by": "the observation or experiment that would answer it",\n'
+    '                "lane": "which lane it bears on"}],\n'
+    '  "exhausted": false,\n'
+    '  "why_exhausted": "if there is genuinely nothing here worth proposing, say why"\n'
+    "}\n\n"
+    "Rules:\n"
+    "- At most three objectives, and fewer is a better answer than three padded. This is "
+    "not a backlog and it is not a brainstorm: everything you return will be scored, ranked "
+    "against everything already waiting, and possibly started by a worker fleet tonight.\n"
+    "- Returning nothing is a real answer. If everything you can see is already open, "
+    "already proposed, already turned down, or blocked on something only the operator can "
+    "supply, return an empty list, set `exhausted` to true, and say which of those it is. "
+    "An invented objective costs more than an empty answer, because it will be worked.\n"
+    "- Do not restate anything on the lists you were given, in any wording. Do not re-"
+    "propose something that was dismissed unless something has actually changed, and if so "
+    "say in `why` what changed.\n"
+    "- `lane` must be one of the lanes you were given. If an objective genuinely belongs to "
+    "no existing lane, that is worth saying in `assessment` - it is the operator's call to "
+    "open one, not yours.\n"
+    "- `origin` must be honest. `outside` means you searched and read something; if you did "
+    "not search, nothing is `outside`. `sources` may not contain a URL you did not read - "
+    "an invented citation is worse than no citation, because it will be believed.\n"
+    + _SCORE_RULES + "\n"
+    "- `need` is the rule that matters most here. Exploring with nothing to react to is how "
+    "plausible filler gets written. Anything you cannot say a rung or an open question for "
+    "is low, and low is the correct score - do not round it up to justify having answered.\n"
+    "- You are proposing. The operator decides what gets built and what gets adopted into "
+    "the doctrine. Do not write as if the decision is made."
+)
+
+
+def _explore_context(lane: str | None, *, web: bool) -> str:
+    """The whole stack at once, which is the thing a per-goal review never sees."""
+    sections = doctrine_sections()
+    cfg = config()
+    names = sorted(cfg.get("lanes") or {})
+    parts = [mission_block().strip(),
+             doctrine_block("The doctrine this stack is held to").strip()]
+
+    open_theses = _section(sections, "open theses", "open questions")
+    if open_theses:
+        parts.append(f"# {open_theses['title']}\n\n{open_theses['body']}")
+
+    stands = _need_block(lane or "")
+    if stands:
+        parts.append(stands)
+
+    rows = []
+    for name in names:
+        ln = cfg["lanes"][name] or {}
+        live = [g for g in goals(name) if g["state"] in ("planning", "running", "blocked")]
+        rec = lane_record(name)
+        rows.append(f"- **{name}** ({ln.get('repo') or ln.get('path')}): "
+                    f"{len(live)} goal(s) open, "
+                    + (f"{rec['done']}/{rec['n']} of its last settled goals finished"
+                       if rec["n"] else "nothing settled yet"))
+    parts.append("# The lanes\n\n" + "\n".join(rows))
+
+    # Every lane's findings together, which is the raw material for the only
+    # question this call is uniquely able to answer. A finding reported in one
+    # lane is invisible to that lane's own review of any other lane, so if there
+    # is a connection to be made, this is the only place it can be made.
+    fs = findings()[:40]
+    if fs:
+        by: dict[str, list] = {}
+        for f in fs:
+            by.setdefault(f.get("lane") or "unfiled", []).append(f)
+        parts.append("# What the work has reported back, every lane\n\n"
+                     + "\n\n".join(
+                         f"## {ln}\n" + "\n".join(
+                             f"- **{f['bearing']}** ({f.get('source')}): {f['text'][:400]}"
+                             for f in items)
+                         for ln, items in sorted(by.items())))
+
+    live = [g for g in goals() if g["state"] in ("planning", "running", "blocked")]
+    if live:
+        parts.append("# Already being worked, do not propose these again\n\n"
+                     + "\n".join(f"- ({g['lane']}) {g['objective'][:200]}" for g in live))
+
+    op = proposals()
+    if op:
+        parts.append("# Already proposed and waiting, do not restate them\n\n"
+                     + "\n".join(f"- ({p.get('lane')}) [{p.get('kind')}] {p.get('text', '')[:200]}"
+                                 for p in op[:30]))
+
+    # Shown on purpose. Without it the same idea comes back every time the
+    # button is pressed, and dismissing something would stop meaning anything.
+    dis = proposals(state="dismissed")[:20]
+    if dis:
+        parts.append("# Already turned down by the operator, do not re-propose these\n\n"
+                     + "\n".join(f"- ({p.get('lane')}) {p.get('text', '')[:200]}" for p in dis))
+
+    parts.append("# Whether you can look outside\n\n"
+                 + ("You have web search. Use it, and cite what you read."
+                    if web else
+                    "You have NO web search on this round. Nothing may be marked `outside`, "
+                    "and you may not cite a URL. Answer from what you were given."))
+    return "\n\n".join(parts)
+
+
+def explore_direction(lane: str | None = None, *, web: bool = True) -> dict:
+    """Go looking for direction instead of waiting for a goal to finish.
+
+    Costs one architect call. Manual only - there is no heartbeat path into
+    here, and there should not be one.
+    """
+    if not architect_available():
+        return {"ok": False, "error": architect_off_reason()}
+    can_web = bool(web) and web_search_backend()
+
+    model = config().get("consult_model", DEFAULT_CONSULT)
+    resp = architect_chat([{"role": "system", "content": EXPLORE_SYSTEM},
+                           {"role": "user", "content": _explore_context(lane, web=can_web)}],
+                          model, web=can_web)
+    text = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    out = _json_reply(text)
+    if not out:
+        return {"ok": False, "error": "the architect's answer could not be read as JSON",
+                "raw": text[:2000]}
+
+    rev = {"id": "d" + uuid.uuid4().hex[:9], "at": now(), "lane": lane,
+           "goal_id": None, "goal": "",
+           "kind": "explore", "web": can_web,
+           "assessment": str(out.get("assessment") or "")[:2000],
+           # No ladder. A rung moves when evidence moves it, and this call
+           # produced no evidence - it read what was already there.
+           "ladder": [],
+           "exhausted": bool(out.get("exhausted")),
+           "why_exhausted": str(out.get("why_exhausted") or "")[:600],
+           "tokens": (resp.get("usage") or {}).get("total_tokens") or 0}
+
+    known = set(config().get("lanes") or {})
+    seen = {_norm_prompt(p.get("text", "")) for p in direction_store().get("proposals", [])}
+    fresh, misfiled = [], []
+    for n in (out.get("next") or [])[:3]:
+        obj = str((n or {}).get("objective") or "").strip()
+        if not obj or _norm_prompt(obj) in seen:
+            continue
+        want = str(n.get("lane") or "").strip()
+        if want not in known:
+            # Not silently refiled into whatever lane was on screen. A proposal
+            # in the wrong lane is worked by the wrong worker against the wrong
+            # tree, and the operator would have no way to see it happened.
+            misfiled.append({"objective": obj[:200], "lane": want})
+            continue
+        seen.add(_norm_prompt(obj))
+        origin = str(n.get("origin") or "").strip()
+        fresh.append({"id": "p" + uuid.uuid4().hex[:9], "at": now(), "kind": "goal",
+                      "lane": want, "text": obj[:1000],
+                      "why": str(n.get("why") or "")[:1000], "state": "open",
+                      "review_id": rev["id"],
+                      # Tagged so calibration can one day ask the only question
+                      # that makes this button worth its call: whether anything
+                      # explored is ever adopted, and ever moves a rung.
+                      "source": "explore",
+                      "origin": origin if origin in ("cross_lane", "outside", "reframe") else "",
+                      "sources": [str(u)[:300] for u in (n.get("sources") or [])
+                                  if str(u).strip().startswith("http")][:6],
+                      **_scored(n)})
+    for r in (out.get("research") or [])[:3]:
+        qn = str((r or {}).get("question") or "").strip()
+        if not qn or _norm_prompt(qn) in seen:
+            continue
+        seen.add(_norm_prompt(qn))
+        want = str(r.get("lane") or "").strip()
+        fresh.append({"id": "p" + uuid.uuid4().hex[:9], "at": now(), "kind": "question",
+                      "lane": want if want in known else lane,
+                      "text": qn[:1000], "why": str(r.get("why") or "")[:1000],
+                      "settled_by": str(r.get("settled_by") or "")[:1000],
+                      "state": "open", "review_id": rev["id"], "source": "explore"})
+
+    with _DIRECTION_LOCK:
+        store = direction_store()
+        store.setdefault("proposals", []).extend(fresh)
+        store.setdefault("reviews", []).append(rev)
+        _save_direction(store)
+
+    ngoal = sum(1 for p in fresh if p["kind"] == "goal")
+    nq = sum(1 for p in fresh if p["kind"] == "question")
+    add_note(f"explored{' the web and' if can_web else ''} every lane: "
+             + rev["assessment"][:400]
+             + (f" — {ngoal} goal(s) proposed" if ngoal else "")
+             + (f", {nq} open question(s)" if nq else "")
+             + (" — nothing worth proposing: " + rev["why_exhausted"][:200]
+                if rev["exhausted"] else "")
+             + ("".join(f" — proposed for an unknown lane {m['lane']!r}, dropped: "
+                        f"{m['objective'][:120]}" for m in misfiled)),
+             lane=lane)
+
+    rev["proposals"] = fresh
+    rev["misfiled"] = misfiled
+    rev["ok"] = True
+    # Nothing is auto-adopted here, whatever the auto-adopt setting says. This
+    # ran because a person pressed a button; the same person can press adopt.
+    return rev
+
+
 _SCORE_FIELDS = ('"confidence": 0.0, "need": 0.0, "why_need": "...", "cost_usd": 0.0, '
                  '"headroom": 0.0, "why_headroom": "...", "unknowns": ["..."]')
 
@@ -6793,6 +7062,9 @@ def direction_view(lane: str | None = None) -> dict:
         "rungs": lane_rungs(),
         "max_sharpen": SHARPEN_MAX_ROUNDS,
         "sharpen_floor": SHARPEN_FLOOR,
+        # So the button can say what it is about to do rather than promising
+        # research and then answering from recall.
+        "can_web": web_search_backend(),
         "doctrine_state": doctrine_state(),
         "doctrine_path": str(DOCTRINE_PATH),
         # A lane whose goal is finished and never reviewed is exactly where the

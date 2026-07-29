@@ -1519,6 +1519,43 @@ function dirSection(s, cls) {
     `<div class="md">${md(s.body)}</div></section>`;
 }
 
+// Where an explored proposal came from. Said on the card because "we searched
+// the web" is a claim, and a claim with nothing to click is one you have to
+// take on trust.
+const ORIGIN_WORD = {
+  cross_lane: 'found by cross-referencing what the lanes have reported',
+  outside: 'found by looking outside this workspace',
+  reframe: 'found by re-reading the doctrine',
+};
+
+/** An outward link that survives whatever a model put in the string. */
+function link(u) {
+  const s = String(u || '');
+  if (!/^https?:\/\//i.test(s)) return esc(s);
+  const href = encodeURI(s).replace(/"/g, '%22').replace(/</g, '%3C').replace(/>/g, '%3E');
+  return `<a href="${href}" target="_blank" rel="noreferrer noopener">` +
+    `${esc(s.replace(/^https?:\/\//i, '').slice(0, 64))}</a>`;
+}
+
+function originLine(p) {
+  if (p.source !== 'explore') return '';
+  const src = (p.sources || []).map(link).join(' · ');
+  return `<div class="dorigin">${esc(ORIGIN_WORD[p.origin] || 'found by exploring')}` +
+    (src ? ` — ${src}` : '') + `</div>`;
+}
+
+/** The other way a proposal can appear: asked for, rather than waited for. */
+function exploreBar(d) {
+  const web = !!d.can_web;
+  return `<div class="dexp"><button id="btn-explore" class="primary">` +
+    (web ? 'Look for more — search, cross-reference, brainstorm' : 'Look for more') +
+    `</button><span class="muted" id="explore-status">` +
+    `reads every lane at once and cross-references what each has reported` +
+    (web ? ', and searches the web'
+         : '. This architect backend cannot search the web, so nothing will be cited') +
+    `. A review needs a goal to have finished; this does not.</span></div>`;
+}
+
 function renderDirection(d) {
   const el = $('dir-out');
   if (!d) { el.textContent = 'nothing to show'; return; }
@@ -1552,6 +1589,7 @@ function renderDirection(d) {
     scores(p, d) +
     `<b>${mdi(p.text)}</b>` +
     (p.why ? `<div class="muted">${mdi(p.why)}</div>` : '') +
+    originLine(p) +
     (p.what_changed ? `<div class="changed">sharpened: ${mdi(p.what_changed)}</div>` : '') +
     (p.alternate_of ? `<div class="changed">another route to the same end</div>` : '') +
     ((p.unknowns || []).length
@@ -1592,14 +1630,39 @@ function renderDirection(d) {
     (qs ? `<div class="dqs"><div class="muted">Proposed by the work, not yet in the doctrine ` +
       `— only you can put one there:</div>${qs}</div>` : '') + `</section>` +
     `<section class="dsec"><h4>Where there is left to go</h4>` +
+    exploreBar(d) +
     calBlock(d.calibration, bar) +
     (props || '<div class="empty">No proposals. One appears when a goal finishes and the ' +
-      'architect judges the lane has somewhere left to travel.</div>') +
+      'architect judges the lane has somewhere left to travel — or when you go looking ' +
+      'above.</div>') +
     (revs ? `<h5>Recent reviews</h5>${revs}` : '') + `</section>` +
     dirSection(d.ladder, '') + dirSection(d.values, '') + dirSection(d.owed, '') +
     `<div class="muted dfoot">The two sections above are read from <code>` +
     `${esc(d.doctrine_path || 'DOCTRINE.md')}</code> and are injected verbatim into every ` +
     `plan, every review, and every worker prompt.</div>`;
+
+  // Wired here rather than in wireDirection because this section is rebuilt on
+  // every load, which throws the old node and its handler away with it.
+  const ex = $('btn-explore');
+  if (ex) ex.addEventListener('click', async () => {
+    ex.disabled = true;
+    ex.textContent = d.can_web ? 'searching and cross-referencing…' : 'cross-referencing…';
+    $('explore-status').textContent =
+      'one architect call across every lane. This takes a while.';
+    const r = await post('/api/direction/explore', { lane: state.sel || null });
+    const rev = r.review || {};
+    const n = (rev.proposals || []).length;
+    // Into the pane head, not the line above: loadDirection rebuilds this
+    // section and would throw the answer away with the button that asked for it.
+    $('dir-status').innerHTML = r.ok
+      ? (n ? `${n} new ${n === 1 ? 'thing' : 'things'} to look at`
+           : 'nothing new worth proposing' +
+             (rev.why_exhausted ? ` — ${esc(rev.why_exhausted)}` : '')) +
+        ((rev.misfiled || []).length
+          ? ` · ${rev.misfiled.length} dropped for naming a lane that does not exist` : '')
+      : `<span class="err">${esc(r.error || 'failed')}</span>`;
+    loadDirection();
+  });
 
   el.querySelectorAll('.fi-x').forEach((b) =>
     b.addEventListener('click', async () => {

@@ -893,6 +893,20 @@ def do_direction_review(body: dict) -> dict:
     return {"ok": bool(rev.get("ok")), "review": rev, "error": rev.get("error")}
 
 
+def do_direction_explore(body: dict) -> dict:
+    """Go looking for direction across every lane instead of waiting for one.
+
+    The other door into the same list. A review needs a goal to have finished,
+    so when the fleet is held there is nothing to review and nothing new can
+    appear - which is the moment you most want somewhere to go. Slower and
+    dearer than a review because it can search the web.
+    """
+    lane = body.get("lane") or None
+    web = body.get("web")
+    rev = amp.explore_direction(lane, web=True if web is None else bool(web))
+    return {"ok": bool(rev.get("ok")), "review": rev, "error": rev.get("error")}
+
+
 def do_direction_proposal(body: dict) -> dict:
     """Adopt a proposed objective as a real goal, or turn it down.
 
@@ -1894,6 +1908,8 @@ class Handler(BaseHTTPRequestHandler):
             # one of the three that starts work, and it is a separate word.
             if u.path == "/api/direction/review":
                 return self._send(200, do_direction_review(body))
+            if u.path == "/api/direction/explore":
+                return self._send(200, do_direction_explore(body))
             if u.path == "/api/direction/proposal":
                 return self._send(200, do_direction_proposal(body))
             if u.path == "/api/direction/auto":

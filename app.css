@@ -975,6 +975,18 @@ pre.diff, .ruling {
    because "the architect can't move this" is not "this is dead". */
 .dp-s.dim { opacity: .55; }
 
+/* Going looking, rather than waiting for a goal to close. Sits at the top of
+   the section it fills, because when that section is empty it is the only thing
+   on the page that can do anything about it. */
+.dexp { display: flex; align-items: baseline; gap: 12px; margin: 0 0 12px; }
+.dexp button { flex: 0 0 auto; }
+.dexp .muted { font-size: 11px; line-height: 1.6; }
+
+/* Where an explored proposal came from, and what was actually read. */
+.dorigin { font-size: 11px; color: var(--muted); margin: 4px 0 0; }
+.dorigin a { color: var(--accent); text-decoration: none; }
+.dorigin a:hover { text-decoration: underline; }
+
 .cal { font-size: 11px; color: var(--muted); margin: 0 0 10px; line-height: 1.9; }
 .cal b { color: var(--fg); }
 .calb { display: inline-block; margin-left: 10px; }
