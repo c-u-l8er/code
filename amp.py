@@ -5672,8 +5672,16 @@ def run_check(cmd: str, cwd: Path) -> tuple[int | None, str]:
                   f"held. Output is unreadable; treat this check as unrun.)")
 
 
-def run_goal_checks(gid: str) -> list[dict]:
-    """Run every done-item's check in the lane worktree. Exit code is the answer."""
+def run_goal_checks(gid: str, only: set[str] | None = None) -> list[dict]:
+    """Run every done-item's check in the lane worktree. Exit code is the answer.
+
+    `only` narrows it to the named conditions. There is one caller: a check that
+    has just been written needs running to find out whether it says anything,
+    and re-running the forty that already passed to learn that would cost
+    minutes and answer a question nobody asked. The write-back below already
+    ignores conditions it has no result for, so a narrowed run cannot clear the
+    dates on the ones it skipped.
+    """
     g = load_goal(gid)
     wt = WORKTREE_DIR / g["lane"]
     if not wt.exists():
@@ -5681,7 +5689,7 @@ def run_goal_checks(gid: str) -> list[dict]:
     out = []
     for d in g["done"]:
         cmd = d.get("check")
-        if not cmd:
+        if not cmd or (only is not None and d["text"] not in only):
             continue
         try:
             code, body = run_check(cmd, wt)
@@ -6335,14 +6343,21 @@ def publish_report(gid: str, *, rerun: bool = True) -> dict:
     if rerun and not rep["blocked"]:
         run_goal_checks(gid)
         g = load_goal(gid) or g
-    elif rerun:
+    else:
+        # Set wherever the checks were NOT re-run, which now includes the case a
+        # caller asked for. It used to be set only when a blocker had already
+        # skipped them, so `rerun=False` - the cheap path the pull-requests tab
+        # reads every lane through - came back indistinguishable from a report
+        # whose checks had just passed. Exit codes with no date on them are the
+        # thing this whole gate exists to distrust.
         rep["stale_checks"] = True
     dod = g.get("done") or []
     if not dod:
         rep["blocked"].append("this goal has no definition of done, so there is nothing to gate on")
     for d in dod:
         cond = {"text": d.get("text"), "check": d.get("check"),
-                "exit": d.get("check_exit"), "met": bool(d.get("met"))}
+                "exit": d.get("check_exit"), "met": bool(d.get("met")),
+                "waived": d.get("waived"), "uncheckable": d.get("uncheckable")}
         if not d.get("check"):
             cond["verdict"] = "no check - judgement only, rung `spec`"
         elif d.get("check_exit") is None:
@@ -6352,10 +6367,18 @@ def publish_report(gid: str, *, rerun: bool = True) -> dict:
         else:
             cond["verdict"] = f"failed, exit {d.get('check_exit')}"
         rep["conditions"].append(cond)
+    # A waiver does not make a condition pass. It is a named person taking
+    # responsibility for one that did not, and it stops the gate rather than
+    # satisfying it - which is why `unproven` counts it and `blocked` does not.
+    # The distinction is the whole point: the verdict on the row still says what
+    # actually happened, the PR body says who waived it and why, and nothing
+    # anywhere claims a check passed. See `waive_condition` for who may do this.
     unproven = [c for c in rep["conditions"] if c.get("verdict") != "passed"]
-    if unproven:
+    standing = [c for c in unproven if not c.get("waived")]
+    rep["waived"] = [c for c in unproven if c.get("waived")]
+    if standing:
         rep["blocked"].append(
-            f"{len(unproven)} of {len(rep['conditions'])} done-conditions are not "
+            f"{len(standing)} of {len(rep['conditions'])} done-conditions are not "
             f"backed by a check that passed just now")
 
     rep["ok"] = not rep["blocked"]
@@ -6378,6 +6401,18 @@ def publish_body(rep: dict, g: dict) -> str:
             lines.append(f"  - `{c['check']}` &rarr; **{c['verdict']}**")
         else:
             lines.append(f"  - {c['verdict']}")
+        # Named here, on the condition itself, and not gathered into a footnote.
+        # A waiver is the one thing in this description a reviewer must not miss,
+        # and a list at the bottom is a list nobody reads next to the item it is
+        # about.
+        if c.get("waived"):
+            w = c["waived"]
+            lines.append(f"  - :warning: **waived by {w.get('by', 'the operator')}** "
+                         f"on {str(w.get('at', ''))[:10]} &mdash; {w.get('why') or 'no reason given'}")
+    if rep.get("waived"):
+        lines += ["", f"> **{len(rep['waived'])} of these {len(rep['conditions'])} conditions "
+                      f"were not proven by a check.** They were waived by hand so this could be "
+                      f"handed over. Nothing automated decided they were satisfied."]
     tasks = [t for t in (g.get("tasks") or []) if t.get("state") == "done"]
     if tasks:
         lines += ["", "## What was done", ""] + [f"- {t['text']}" for t in tasks]
@@ -6431,6 +6466,510 @@ def publish_goal(gid: str, *, dry_run: bool = True) -> dict:
         g.setdefault("log", []).append({"at": now(), "text": f"opened a pull request: {url}"})
         save_goal(g)
     return rep
+
+
+# --------------------------------------------------------------- pull requests
+#
+# The handoff, seen across every lane at once instead of one goal at a time.
+#
+# It was already possible to publish a goal - the button has been on the goal
+# panel for weeks. What was not possible was noticing that nobody ever had. The
+# first reading of this view answered that: NINETEEN goals finished, ZERO pull
+# requests, ever. Every one of those is work that ran, passed its own checks,
+# and stopped inside a worktree on this machine, and no screen in the console
+# said so, because each goal panel showed one goal and each one looked fine.
+#
+# So the tab is built around the two questions a per-goal view structurally
+# cannot answer:
+#
+#   what is finished and has never been handed to anyone
+#   what has been handed over and is not being tested on the other side
+#
+# The second is the user's sentence - "make sure tests and benchmarks run or are
+# made" - and it has two halves that are easy to confuse. On the GitHub side, a
+# pull request with an empty check rollup is one nothing is testing; and a
+# rollup that is entirely SKIPPED renders as a green tick while having run
+# nothing at all, which is worse than red. Both are named here as what they are.
+#
+# On our side, "or are made" is the harder half. A done-condition with no check
+# is a claim at rung `spec` wearing the costume of `in_tree` - the gate already
+# refuses to publish on one, correctly, and until now that was the end of it:
+# thirty-one such conditions sat across the board with nothing that could move
+# them. `write_checks` asks the architect for the missing command, which is the
+# only move here that produces new evidence rather than new prose - a command
+# that runs is an event, and its exit code is a fact about the repository. What
+# it must never become is a way to paint a tick on a condition nobody checked,
+# so: a command that cannot fail is refused before it is stored, the architect
+# is allowed to answer that no command can decide a condition, and a check
+# written this way carries who wrote it for the rest of its life.
+#
+# And `waive_condition`, which is the pressure valve. A gate with no exit is a
+# gate people walk around outside the tool, and then the record is gone. A
+# waiver does not make a condition pass - the verdict on the row still says
+# exactly what happened - it records a person taking responsibility for handing
+# over work that was not proven, and it prints that, in those words, in the pull
+# request body where the reviewer will see it.
+#
+# Nothing here merges anything, and there is no button that could. See the
+# comment above `publish_report`: the harness makes the case and stops.
+
+GH_PR_FIELDS = ("number,title,url,isDraft,headRefName,baseRefName,createdAt,"
+                "statusCheckRollup")
+GH_TIMEOUT = 45
+
+
+def pr_repos() -> list[dict]:
+    """One entry per distinct repository the lanes point at.
+
+    Keyed on the repository and not on the lane, because two lanes can be two
+    pieces of work in ONE repository - `trvm` and `wrlm` are both c-u-l8er/TRVM
+    - and asking GitHub once per lane would list every pull request twice, each
+    copy filed under a different lane, as though there were two of them.
+    """
+    by_repo: dict[str, dict] = {}
+    for name, cfg in sorted((config().get("lanes") or {}).items()):
+        repo = (cfg or {}).get("repo")
+        if not repo:
+            continue
+        d = by_repo.setdefault(repo, {"repo": repo, "lanes": [],
+                                      "dir": str((ROOT / (cfg.get("path") or ".")).resolve())})
+        d["lanes"].append(name)
+    return sorted(by_repo.values(), key=lambda r: r["repo"])
+
+
+def _check_state(item: dict) -> str:
+    """One rollup entry, as one of four words.
+
+    GitHub returns two different shapes through the same list - a CheckRun
+    carries `status` and `conclusion`, a StatusContext carries `state` - and
+    reading only one of them silently drops half of somebody's CI.
+
+    SKIPPED is kept apart from SUCCESS deliberately. GitHub renders a skipped
+    job with the same green tick as a passing one, and a workflow whose every
+    job was skipped by a path filter is a pull request that has been tested by
+    nothing while looking fully green. That is the exact failure this tab is
+    supposed to catch, so it cannot be folded into the word `passed`.
+    """
+    status = (item.get("status") or "").upper()
+    if status and status != "COMPLETED":
+        return "pending"
+    v = (item.get("conclusion") or item.get("state") or "").upper()
+    if v in ("SUCCESS", "NEUTRAL"):
+        return "passed"
+    if v == "SKIPPED":
+        return "skipped"
+    if v in ("PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "EXPECTED", ""):
+        return "pending"
+    return "failed"
+
+
+def _rollup(pr: dict) -> dict:
+    """What the other side's automation has actually said about this branch."""
+    items = pr.get("statusCheckRollup") or []
+    counts = {"passed": 0, "failed": 0, "pending": 0, "skipped": 0}
+    for i in items:
+        counts[_check_state(i)] += 1
+    if not items:
+        # The finding. Not an absence of news - it is news: this branch is being
+        # proposed for merge and no automation on the far side will ever have an
+        # opinion about it.
+        verdict = "none"
+    elif counts["failed"]:
+        verdict = "failing"
+    elif counts["pending"]:
+        verdict = "running"
+    elif counts["passed"]:
+        verdict = "passing"
+    else:
+        verdict = "skipped"
+    failing = [i.get("name") or i.get("context") or "?" for i in items
+               if _check_state(i) == "failed"]
+    return {"verdict": verdict, "total": len(items), "failing": failing[:6], **counts}
+
+
+def open_prs() -> dict:
+    """Every open pull request across every lane repository, with its checks.
+
+    Returns the repositories alongside the pull requests, and that is not
+    packaging. A repository GitHub would not answer about has no pull requests
+    in this reply, which is the same shape as a repository with none - and those
+    two must never render the same way. The repository row carries `why` so the
+    difference survives as far as the screen.
+
+    Asked of GitHub rather than read from the goals: a pull request opened by
+    hand, from another machine, or by somebody else is still a pull request
+    against work this harness is doing, and a list built from our own
+    `pr_url` fields would be a list of what we remember doing.
+
+    One thread per repository. Ten sequential round-trips to GitHub is ten
+    seconds of a tab that is expected to open, and each thread writes only into
+    its own slot - there is no shared accumulator here to lock.
+    """
+    repos = pr_repos()
+    got: dict[str, dict] = {}
+
+    def ask(r):
+        try:
+            p = subprocess.run(["gh", "pr", "list", "--repo", r["repo"], "--state", "open",
+                                "--json", GH_PR_FIELDS, "--limit", "30"],
+                               capture_output=True, text=True, timeout=GH_TIMEOUT)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            got[r["repo"]] = {"why": f"gh did not answer: {e}", "prs": []}
+            return
+        if p.returncode != 0:
+            got[r["repo"]] = {"why": last_line(redact(p.stderr or p.stdout)), "prs": []}
+            return
+        try:
+            listed = json.loads(p.stdout or "[]")
+        except ValueError:
+            got[r["repo"]] = {"why": "gh answered with something that is not JSON", "prs": []}
+            return
+        got[r["repo"]] = {"why": None, "prs": listed}
+
+    threads = [threading.Thread(target=ask, args=(r,), daemon=True) for r in repos]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(GH_TIMEOUT + 5)
+
+    # `pr_url` is matched back on so a pull request this harness opened is shown
+    # as ours. It is a lookup and never a filter: a PR with no goal behind it
+    # still belongs on this list, and saying "we did not open this one" is more
+    # use than leaving it out.
+    mine = {g.get("pr_url"): g for g in (load_goal(x["id"]) or {} for x in goals())
+            if g.get("pr_url")}
+    out = []
+    for r in repos:
+        res = got.get(r["repo"]) or {"why": "this repository was never asked", "prs": []}
+        for pr in res["prs"]:
+            g = mine.get(pr.get("url")) or {}
+            out.append({"repo": r["repo"], "lanes": r["lanes"],
+                        "number": pr.get("number"), "title": pr.get("title"),
+                        "url": pr.get("url"), "draft": bool(pr.get("isDraft")),
+                        "head": pr.get("headRefName"), "base": pr.get("baseRefName"),
+                        "at": pr.get("createdAt"), "checks": _rollup(pr),
+                        "goal_id": g.get("id"), "lane": g.get("lane")})
+        r["why"] = res["why"]
+        r["open"] = len(res["prs"])
+    out.sort(key=lambda p: p.get("at") or "", reverse=True)
+    return {"prs": out, "repos": repos}
+
+
+def condition_tally(g: dict) -> dict:
+    """How much of one goal's definition of done is backed by something that ran.
+
+    Four buckets and not two, because "no check" and "a check that has never
+    run" fail for different reasons and are fixed by different people - one
+    needs a command written, the other needs a command executed - and a single
+    `unproven` number sends the operator to the wrong one half the time.
+    """
+    t = {"passed": 0, "failed": 0, "unrun": 0, "unchecked": 0,
+         "judgement": 0, "waived": 0, "total": 0, "gaps": [], "checks": []}
+    for d in (g.get("done") or []):
+        t["total"] += 1
+        if d.get("waived"):
+            t["waived"] += 1
+        if not d.get("check"):
+            # Already asked, and the answer was that no command can decide it.
+            # Counted apart so the pile of unasked ones is not padded by the
+            # ones there is nothing further to do about.
+            if d.get("uncheckable"):
+                t["judgement"] += 1
+            else:
+                t["unchecked"] += 1
+                t["gaps"].append(d.get("text"))
+            continue
+        t["checks"].append({"text": d.get("text"), "check": d.get("check"),
+                            "exit": d.get("check_exit"), "at": d.get("check_at"),
+                            "by": d.get("check_by")})
+        if d.get("check_exit") is None:
+            t["unrun"] += 1
+        elif d.get("check_exit") == 0:
+            t["passed"] += 1
+        else:
+            t["failed"] += 1
+    return t
+
+
+def pr_view() -> dict:
+    """The handoff across the whole workspace: what is stuck, and where.
+
+    Every report is built with `rerun=False`. Re-running the checks of nineteen
+    finished goals would be minutes of builds fired off by opening a tab, and -
+    worse - it would run them in worktrees that other lanes' workers are live
+    in. The reports therefore carry `stale_checks`, and the button that actually
+    publishes re-runs everything for real before it pushes anything.
+    """
+    ident = _whoami("github")
+    todo = [g for g in goals() if g.get("state") == "done"]
+    rows: list[dict] = []
+    lock = threading.Lock()
+
+    def look(s):
+        try:
+            rep = publish_report(s["id"], rerun=False)
+        except Exception as e:                 # a broken worktree is not a crash
+            rep = {"ok": False, "goal_id": s["id"], "lane": s.get("lane"),
+                   "blocked": [f"this goal could not be read: {redact(str(e))[:200]}"],
+                   "conditions": [], "commits": []}
+        g = load_goal(s["id"]) or {}
+        rep["objective"] = (g.get("objective") or "").split("\n\n")[0]
+        rep["tally"] = condition_tally(g)
+        rep["pr_url"] = g.get("pr_url")
+        with lock:
+            rows.append(rep)
+
+    threads = [threading.Thread(target=look, args=(s,), daemon=True) for s in todo]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(120)
+
+    # Ready first, then whatever is closest to ready. `blocked` is a list of
+    # sentences, and its length is how many separate things are wrong - which is
+    # the only ordering here that is a fact rather than a preference.
+    rows.sort(key=lambda r: (bool(r.get("pr_url")), len(r.get("blocked") or []),
+                             r.get("lane") or ""))
+    asked = open_prs()
+    live = asked["prs"]
+    return {
+        "github": {"provider": "github", "signin": DEPLOY_SIGNIN["github"], **ident},
+        # The annotated ones from the call that was actually made, not a second
+        # `pr_repos()`. A fresh list would carry no `why`, and every repository
+        # GitHub refused would silently become one with nothing open.
+        "repos": asked["repos"],
+        "open": live,
+        "ready": rows,
+        # The three counts the tab exists for, each one a number nothing else in
+        # the console can produce.
+        "handoff_ready": sum(1 for r in rows if r.get("ok") and not r.get("pr_url")),
+        "finished_unshipped": sum(1 for r in rows if not r.get("pr_url")),
+        "untested": sum(1 for p in live if p["checks"]["verdict"] in ("none", "skipped")),
+        "gaps": sum(r["tally"]["unchecked"] for r in rows if r.get("tally")),
+    }
+
+
+# ----------------------------------------------------- writing a missing check
+
+CHECK_WRITE_SYSTEM = (
+    "You are the consulting architect. A goal has finished and cannot be handed over, because "
+    "some of its done-conditions were never given a command that decides them. A condition "
+    "nobody can check is somebody's opinion, and this harness does not let an opinion open a "
+    "pull request.\n\n"
+    "For each condition below, give the ONE shell command that decides it.\n\n"
+    "Reply with one JSON object and nothing else:\n"
+    "{\n"
+    '  "checks": [{"text": "the condition, copied word for word",\n'
+    '              "check": "a shell command, or null",\n'
+    '              "why": "one sentence: what exit 0 would prove, or why no command can"}]\n'
+    "}\n\n"
+    "Rules:\n"
+    "- Copy `text` EXACTLY. It is how your answer is matched back to the condition; a reworded "
+    "one is discarded.\n"
+    "- The command runs from the root of the worktree shown below, non-interactively, with no "
+    "network guaranteed. It must exit 0 when the condition holds and NON-ZERO when it does not.\n"
+    "- It has to be able to fail. `true`, `echo ...`, or anything that exits 0 whatever the "
+    "repository contains will be rejected before it is stored, and it would be worse than "
+    "nothing: it turns an honest gap into a green tick.\n"
+    "- Prefer a command that already exists in the repository - the test runner, the benchmark, "
+    "the conformance script - over a shell expression you invent. Ground it in the files listed "
+    "below; a check naming a file nobody has is a check that fails for the wrong reason.\n"
+    "- If no command can decide a condition, answer `null` and say why in one sentence. That is "
+    "a real answer and it is recorded. Do not invent a command that tests something adjacent and "
+    "easier - a check for the wrong thing is the only outcome here worse than no check."
+)
+
+_ALWAYS_TRUE = re.compile(r"^\s*(true|:|exit\s+0|echo\b[^;&|]*)\s*$", re.I)
+
+
+def worthless_check(cmd: str) -> str | None:
+    """Why this command could not be evidence about anything, or None.
+
+    Deliberately not a quality bar. A weak check that genuinely runs something
+    is still a check, and judging how good it is belongs to whoever reviews the
+    pull request. This catches the single outcome that is actively harmful: a
+    command that exits 0 no matter what the repository contains, which would
+    convert an honest gap into a passing condition and take the gate with it.
+    """
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return "it is empty"
+    parts = [p.strip() for p in re.split(r"&&|\|\||;|\n", cmd) if p.strip()]
+    if parts and all(_ALWAYS_TRUE.match(p) for p in parts):
+        return "it exits 0 whatever the repository contains, so it cannot fail"
+    return None
+
+
+def write_checks(gid: str, *, apply: bool = False) -> dict:
+    """Ask the architect for the commands that are missing, and optionally keep them.
+
+    Two steps, like `improve_goal`: the first answers and the operator reads it,
+    the second commits to it. The reason is specific rather than ceremonial - a
+    check is the thing this whole harness treats as outranking every judgement,
+    so one arriving from a model deserves to be looked at by a person once
+    before it starts deciding whether work may be handed over.
+
+    Applying does three things and they are all the point: the command is
+    stored, it is stamped with who wrote it, and it is RUN. The run is not a
+    formality. A check that has never executed proves nothing, and the exit code
+    that comes back here is the first real evidence the condition has ever had.
+    """
+    g = load_goal(gid)
+    if not g:
+        return {"ok": False, "error": f"no goal {gid!r}"}
+    missing = [d for d in (g.get("done") or [])
+               if not d.get("check") and not d.get("uncheckable")]
+    if not missing:
+        return {"ok": False, "error": "every condition on this goal either has a check or has "
+                                      "already been ruled uncheckable"}
+    if not architect_available():
+        return {"ok": False, "error": architect_off_reason()}
+
+    wt = WORKTREE_DIR / g["lane"]
+    doc = (f"# Objective\n\n{g.get('objective')}\n\n"
+           f"# Where the command will run\n\n`{wt}` (lane `{g['lane']}`)\n\n"
+           + goal_brief(g["lane"])
+           + "\n\n# Conditions with no check\n\n"
+           + "\n".join(f"- {d['text']}" for d in missing))
+    plan, raw = _goal_chat(g, CHECK_WRITE_SYSTEM, doc)
+    if not plan:
+        goal_log(gid, "the architect's answer about missing checks could not be read as JSON",
+                 raw=raw[:2000])
+        return {"ok": False, "error": "the architect's answer could not be read as JSON"}
+
+    want = {d["text"] for d in missing}
+    proposed, dropped = [], []
+    for c in (plan.get("checks") or []):
+        text = str(c.get("text") or "").strip()
+        if text not in want:
+            # Named rather than silently ignored. A reworded condition is the
+            # one failure mode of matching on text, and an operator who is told
+            # "3 of 4 came back" will go and look; one who is told nothing will
+            # believe the fourth had no answer.
+            dropped.append(text[:120])
+            continue
+        cmd = (c.get("check") or "").strip() or None
+        why = " ".join(str(c.get("why") or "").split())[:400]
+        bad = worthless_check(cmd) if cmd else None
+        proposed.append({"text": text, "check": None if bad else cmd,
+                         "why": why, "refused": bad,
+                         "verdict": "refused" if bad else ("check" if cmd else "judgement")})
+    unanswered = sorted(want - {p["text"] for p in proposed})
+    out = {"ok": True, "goal_id": gid, "lane": g["lane"], "applied": False,
+           "proposed": proposed, "dropped": dropped, "unanswered": unanswered}
+    if not apply:
+        return out
+
+    with _GOAL_LOCK:
+        g = load_goal(gid)
+        by_text = {p["text"]: p for p in proposed}
+        wrote = ruled = 0
+        for d in g.get("done") or []:
+            p = by_text.get(d["text"])
+            # `d.get("check")` again under the lock: this function makes two
+            # calls a minute apart with a model round-trip between them, and a
+            # worker or a replan can have given the condition a check in the
+            # meantime. Overwriting one that somebody else wrote with one from
+            # a stale reading is the race worth closing here.
+            if not p or d.get("check") or d.get("uncheckable"):
+                continue
+            if p["check"]:
+                d["check"] = p["check"]
+                # Carried for the life of the condition. A check written by a
+                # model that was shown the condition it had to satisfy is not
+                # the same evidence as one written alongside the work, and a
+                # reviewer weighing `live_deployed` is entitled to know which
+                # kind they are reading.
+                d["check_by"] = "architect"
+                d["check_written_at"] = now()
+                d["check_why"] = p["why"]
+                wrote += 1
+            elif p["verdict"] == "judgement":
+                d["uncheckable"] = p["why"] or "the architect gave no command and no reason"
+                d["uncheckable_at"] = now()
+                ruled += 1
+            # A REFUSED command falls through and changes nothing, which took a
+            # test to notice. It used to land in the branch above, because a
+            # refusal and a judgement both arrive with `check` set to None - so
+            # a condition whose only offered check was `true` was recorded as
+            # one no command can decide, carrying the model's justification for
+            # the bad command as the reason. That is the exact failure
+            # `worthless_check` exists to stop, arriving one line after it
+            # succeeded: the gap count fell, nothing was checked, and the
+            # sentence on the record was false. It stays a gap, and it can be
+            # asked again.
+        save_goal(g)
+
+    out["applied"] = True
+    out["wrote"] = wrote
+    out["ruled_uncheckable"] = ruled
+    goal_log(gid, f"the architect wrote {wrote} missing check(s) and ruled {ruled} "
+                  f"condition(s) undecidable by command")
+    if wrote:
+        # Only the new ones. See `run_goal_checks`: re-running the forty that
+        # already passed would cost minutes and answer nothing that was asked.
+        out["results"] = run_goal_checks(gid, only={p["text"] for p in proposed if p["check"]})
+        out["tally"] = condition_tally(load_goal(gid) or {})
+    return out
+
+
+def waive_condition(gid: str, text: str, why: str, *, by: str = "operator") -> dict:
+    """Record that a person is handing over work one condition did not prove.
+
+    This does NOT mark the condition met and it does not make its check pass.
+    Everything on the record still says exactly what happened - see the verdicts
+    in `publish_report`, which are untouched by this. What it does is stop that
+    unproven condition blocking the handoff, under a name and a reason, both of
+    which are printed in the pull request body where the reviewer will read them
+    next to the condition they are about.
+
+    The reason is required, and a waiver with nothing to say is refused. The
+    entire value of this is the sentence; without one it is a way of deleting a
+    gate quietly, which is what people do instead when a gate has no exit.
+
+    Nothing automated may call this. No ticker path reaches it, and the argument
+    is the same as for publishing: a waiver is somebody accepting a consequence,
+    and a program accepting a consequence on its own behalf is not accepting
+    anything.
+    """
+    why = " ".join((why or "").split())
+    if len(why) < 8:
+        return {"ok": False, "error": "a waiver needs a reason - it is the only thing that "
+                                      "makes it different from deleting the condition"}
+    with _GOAL_LOCK:
+        g = load_goal(gid)
+        if not g:
+            return {"ok": False, "error": f"no goal {gid!r}"}
+        d = next((x for x in (g.get("done") or []) if x.get("text") == text), None)
+        if not d:
+            return {"ok": False, "error": "no condition on this goal says that"}
+        if d.get("check") and d.get("check_exit") == 0:
+            # Refused rather than allowed-and-ignored. A waiver on a condition
+            # that passed is a record of an anxiety, and it would read on the
+            # pull request as though something had gone wrong here.
+            return {"ok": False, "error": "that condition's check passed - there is nothing "
+                                          "to waive"}
+        d["waived"] = {"at": now(), "by": by, "why": why}
+        save_goal(g)
+    goal_log(gid, f"{by} waived an unproven condition: {text[:120]} - {why[:200]}")
+    add_note(f"goal {gid} ({g['lane']}): {by} waived \"{text[:80]}\" - {why[:160]}",
+             lane=g.get("lane"))
+    return {"ok": True, "report": publish_report(gid, rerun=False)}
+
+
+def unwaive_condition(gid: str, text: str) -> dict:
+    """Take a waiver back. The gate closes again immediately."""
+    with _GOAL_LOCK:
+        g = load_goal(gid)
+        if not g:
+            return {"ok": False, "error": f"no goal {gid!r}"}
+        d = next((x for x in (g.get("done") or []) if x.get("text") == text), None)
+        if not d or not d.get("waived"):
+            return {"ok": False, "error": "that condition is not waived"}
+        d.pop("waived", None)
+        save_goal(g)
+    goal_log(gid, f"a waiver was withdrawn from: {text[:120]}")
+    return {"ok": True, "report": publish_report(gid, rerun=False)}
 
 
 # ------------------------------------------------------- what can be deployed
@@ -6529,12 +7068,21 @@ DEPLOY_WHOAMI = {
                    "no": r"^.*not authenticated.*$"},
     # A bare username, alone on the line.
     "npm": {"cmd": ["npm", "whoami"], "who": (r"^\s*([\w.@/-]+)\s*$",)},
+    # Not a deploy target - nothing is shipped to GitHub - but the identical
+    # question asked of a fourth CLI, and the pull-requests tab needs the same
+    # answer this table already knows how to get. It stays out of the Publish
+    # tab's identity list on its own: that list is derived from the providers
+    # the discovered targets actually name, and no marker file names this one.
+    "github": {"cmd": ["gh", "auth", "status"],
+               "who": (r"Logged in to \S+ account (\S+)",),
+               "no": r"^.*not logged in.*$"},
 }
 
 DEPLOY_SIGNIN = {
     "fly": "flyctl auth login",
     "cloudflare": "wrangler login",
     "npm": "npm login",
+    "github": "gh auth login",
 }
 
 

@@ -1105,6 +1105,51 @@ pre.diff, .ruling {
 /* Deployable, and no lane owns it: no worker will ever be pointed at it. */
 .dep-orphan { color: var(--warn); }
 
+/* Pull requests. Two lists, and the visual weight is deliberately on the second
+   one: what is open on GitHub is already visible on GitHub, and what is finished
+   here and has never left the machine is visible nowhere else. */
+.prs { padding: 4px 2px 40px; overflow: auto; font-size: 12px; }
+.prs h4 { margin: 20px 0 8px; font-size: 12px; color: var(--muted);
+          font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.pr-who { padding-bottom: 10px; }
+.pr-row { display: grid; grid-template-columns: 2.2fr 1fr 1fr; gap: 12px;
+          padding: 9px 0; border-top: 1px solid var(--line); line-height: 1.6; }
+.pr-row a { color: #8ab4d8; }
+/* A repository with nothing open, and one nobody could ask - same row, and the
+   colour is the only thing that separates them. See the `why` in the markup. */
+.pr-quiets { padding-top: 8px; }
+.pr-quiet { display: flex; gap: 10px; padding: 4px 0; font-size: 11px; }
+.pr-goal { border: 1px solid var(--line); border-radius: 8px;
+           padding: 10px 12px; margin-bottom: 10px; }
+/* The ones that could go right now. The only green on this pane. */
+.pr-go { border-color: #2e5d3a; }
+.pr-goal-head { display: grid; grid-template-columns: 2.4fr 1.2fr; gap: 12px;
+                line-height: 1.6; }
+.pr-goal-act { padding-top: 8px; }
+.pr-goal-act a { color: #8ab4d8; font-size: 11px; }
+.pr-write {
+  background: #1e2b38; color: #cfe2f5; border: 1px solid #35506b;
+  border-radius: 6px; padding: 4px 10px; font-size: 11px; cursor: pointer;
+}
+.pr-write:hover { background: #2c3d51; }
+.pr-tally { font-size: 11px; }
+/* Every sentence here is one separate thing that is wrong. They are stacked
+   rather than joined with semicolons so the count is readable at a glance. */
+.pr-blocked { color: var(--warn); font-size: 11px; line-height: 1.7;
+              padding-top: 8px; }
+.pr-clear { color: var(--ok); }
+.pr-conds { padding-top: 8px; border-top: 1px solid var(--line); margin-top: 8px; }
+.pr-cond { display: grid; grid-template-columns: 2.6fr 1fr auto; gap: 12px;
+           padding: 5px 0; font-size: 11px; line-height: 1.6; }
+.pr-cond code { font-size: 10.5px; color: #cfe2f5; }
+.pr-waive, .pr-unwaive {
+  background: #2a2118; color: #d8c39a; border: 1px solid #5c4a2e;
+  border-radius: 6px; padding: 3px 8px; font-size: 10.5px; cursor: pointer;
+}
+.pr-waive:hover, .pr-unwaive:hover { background: #3a2e20; }
+.pr-log { font-size: 11px; padding-top: 6px; }
+.pr-log:empty { display: none; }
+
 /* Specs. One lane's design documents and the loop that sharpens them. Plain on
    purpose: the interesting thing on this pane is an argument between two models,
    and styling it as a dashboard would make it look decided. */

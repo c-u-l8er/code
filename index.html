@@ -74,6 +74,7 @@
       <button class="tab" data-tab="history">History</button>
       <button class="tab" data-tab="rulings">Rulings</button>
       <button class="tab" data-tab="settings">Settings</button>
+      <button class="tab" data-tab="prs">Pull requests</button>
       <button class="tab" data-tab="publish">Publish</button>
     </nav>
 
@@ -300,6 +301,29 @@ If the architect asks for a file by name it is fetched and sent without another 
          list kept by hand is wrong the first time somebody adds a service. The
          identities are asked of each provider rather than inferred from a file,
          because a token that exists is not a token that works. -->
+    <!-- The handoff, across every lane at once. The board answers "what is being
+         worked on"; this answers the two questions that come after it and that
+         nothing else on screen asks: what is finished and has never been handed
+         to anyone, and what has been handed over that nothing is testing.
+
+         The four numbers along the top are counted from goals and from GitHub's
+         own answers, never from a model's summary of either. Nothing on this
+         tab merges anything, and there is no button here that could. -->
+    <div class="pane" id="pane-prs">
+      <div class="pane-head">
+        <h3>What has been handed over</h3>
+        <div class="row">
+          <button id="btn-pr-reload">Re-check</button>
+          <span class="muted" id="pr-status"></span>
+        </div>
+      </div>
+      <p class="muted">Every repository the lanes point at is asked what is open on
+      it. A pull request's checks are whatever GitHub says they are &mdash; a rollup
+      that is entirely skipped is shown as skipped and not as green, because a tick
+      over nothing that ran is worse than a cross.</p>
+      <div id="pr-out" class="prs">loading&hellip;</div>
+    </div>
+
     <div class="pane" id="pane-publish">
       <div class="pane-head">
         <h3>What could be deployed</h3>

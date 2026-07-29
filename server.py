@@ -1878,6 +1878,54 @@ def do_deploy_history(body: dict) -> dict:
     return {"ok": True, "runs": list(reversed(rows))[:100]}
 
 
+def do_prs() -> dict:
+    """The handoff across every lane: what is finished, and what is being tested.
+
+    The slowest read in the console and worth it once, on opening the tab. It
+    asks GitHub about every lane repository and builds a publish report for every
+    finished goal. Neither is on the heartbeat: a pull request appears when
+    somebody opens one, and the checks behind these reports are read from disk
+    rather than re-run, which is exactly why they are marked stale.
+    """
+    return {"ok": True, **amp.pr_view()}
+
+
+def do_pr_report(body: dict) -> dict:
+    """One goal's gate, in full - every condition and what decided it."""
+    gid = (body.get("goal_id") or "").strip()
+    g = amp.load_goal(gid)
+    if not g:
+        return {"ok": False, "error": f"no goal {gid!r}"}
+    rep = amp.publish_report(gid, rerun=bool(body.get("rerun")))
+    return {"ok": True, "report": rep, "tally": amp.condition_tally(g)}
+
+
+def do_pr_write_checks(body: dict) -> dict:
+    """Ask the architect for the commands a goal never got, and keep them or not.
+
+    `apply` is false by default for the same reason `publish` is over on deploy:
+    a check outranks every judgement in this harness, so one arriving from a
+    model gets read by a person before it starts deciding whether work may be
+    handed over.
+    """
+    return amp.write_checks((body.get("goal_id") or "").strip(),
+                            apply=body.get("apply") is True)
+
+
+def do_pr_waive(body: dict) -> dict:
+    """Record a person taking responsibility for an unproven condition.
+
+    Reachable only from here. Nothing on the ticker calls into it, and that is
+    deliberate - the value of a waiver is entirely that somebody accepted a
+    consequence, and a program cannot accept one on its own behalf.
+    """
+    gid = (body.get("goal_id") or "").strip()
+    text = body.get("text") or ""
+    if body.get("undo") is True:
+        return amp.unwaive_condition(gid, text)
+    return amp.waive_condition(gid, text, body.get("why") or "")
+
+
 def do_set_lane_mode(body: dict) -> dict:
     """Change what a lane may START. Never stops what it is already doing.
 
@@ -2537,6 +2585,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_lanes())
             if u.path == "/api/deploy":
                 return self._send(200, do_deploy())
+            if u.path == "/api/prs":
+                return self._send(200, do_prs())
             if u.path == "/api/workspaces":
                 return self._send(200, do_workspaces())
             if u.path == "/api/supervisor":
@@ -2742,6 +2792,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_deploy_cancel(body))
             if u.path == "/api/deploy/history":
                 return self._send(200, do_deploy_history(body))
+            if u.path == "/api/pr/report":
+                return self._send(200, do_pr_report(body))
+            if u.path == "/api/pr/write-checks":
+                return self._send(200, do_pr_write_checks(body))
+            if u.path == "/api/pr/waive":
+                return self._send(200, do_pr_waive(body))
             if u.path == "/api/auth/start":
                 return self._send(200, do_auth_start())
             if u.path == "/api/auth/code":

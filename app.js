@@ -2757,6 +2757,253 @@ function wireLaneModes() {
   $('btn-set-open').onclick = openSettings;
 }
 
+// ------------------------------------------------------- pull requests
+//
+// Two lists that answer two different questions, and they are kept apart on
+// purpose. The top one is what has been handed over and what the other side's
+// automation says about it. The bottom one is what is finished here and has
+// never been handed to anyone - which nothing else in this console can show,
+// because the board stops caring about a goal the moment it reads `done`.
+//
+// The counts at the top are counted from goals and from GitHub's own replies.
+// None of them is a model's summary of either, and none of them is stored.
+
+/** One rollup, as a phrase that says what ran rather than a colour.
+ *
+ *  `skipped` is deliberately not folded into `passing`. A workflow whose every
+ *  job was skipped reports a green tick on GitHub while having tested nothing,
+ *  and that is the single most misleading state on this whole tab - it looks
+ *  like the strongest evidence available and it is the absence of evidence. */
+function prChecks(c) {
+  if (!c) return '<span class="muted">not asked</span>';
+  const n = c.total || 0;
+  const cls = { passing: 'ok', failing: 'err', running: 'warn',
+                skipped: 'warn', none: 'err' }[c.verdict] || 'muted';
+  const words = {
+    none: 'nothing is testing this',
+    skipped: `all ${n} check${n === 1 ? '' : 's'} skipped &mdash; nothing actually ran`,
+    failing: `${c.failed} of ${n} failing`,
+    running: `${c.pending} of ${n} still running`,
+    passing: `${c.passed} of ${n} passed`,
+  }[c.verdict] || c.verdict;
+  return `<span class="${cls}">${words}</span>`;
+}
+
+/** What one goal's definition of done is actually backed by.
+ *
+ *  Four numbers rather than a percentage. "no check written" and "check never
+ *  run" are fixed by two different people doing two different things, and one
+ *  blended score sends the operator to the wrong one half the time. */
+function prTally(t) {
+  if (!t) return '';
+  const bits = [];
+  if (t.passed) bits.push(`<span class="ok">${t.passed} proven</span>`);
+  if (t.failed) bits.push(`<span class="err">${t.failed} failing</span>`);
+  if (t.unrun) bits.push(`<span class="warn">${t.unrun} never run</span>`);
+  if (t.unchecked) bits.push(`<span class="err">${t.unchecked} with no check</span>`);
+  if (t.judgement) bits.push(`<span class="muted">${t.judgement} judgement</span>`);
+  if (t.waived) bits.push(`<span class="warn">${t.waived} waived</span>`);
+  return `<span class="pr-tally">${bits.join(' &middot; ')} of ${t.total}</span>`;
+}
+
+function renderPrs(v) {
+  const gh = v.github || {};
+  const who = gh.ok
+    ? `<span class="dep-ok">gh signed in as ${esc(gh.who || 'someone')}</span>`
+    : !gh.installed
+      ? `<span class="err">gh is not installed &mdash; nothing here can be asked</span>`
+      : `<button class="dep-login" data-provider="github">Sign in to GitHub</button>`;
+
+  // The headline. Nineteen finished goals and zero pull requests was the first
+  // thing this view ever said, and it is the reason it exists: work that is
+  // finished and has never left the machine is invisible everywhere else.
+  const toll =
+    `<div class="dep-toll"><b>${v.finished_unshipped} finished ` +
+    `goal${v.finished_unshipped === 1 ? '' : 's'} ${v.finished_unshipped === 1 ? 'has' : 'have'} ` +
+    `never been handed to anyone.</b> ` +
+    (v.handoff_ready
+      ? `${v.handoff_ready} of them could go right now.`
+      : `None of them can go as things stand &mdash; each row says what stops it.`) +
+    (v.gaps
+      ? ` ${v.gaps} done-condition${v.gaps === 1 ? '' : 's'} across them ` +
+        `${v.gaps === 1 ? 'has' : 'have'} no command that decides ` +
+        `${v.gaps === 1 ? 'it' : 'them'} at all.`
+      : '') +
+    `</div>` +
+    (v.untested
+      ? `<div class="dep-toll"><b>${v.untested} open pull ` +
+        `request${v.untested === 1 ? '' : 's'} ${v.untested === 1 ? 'is' : 'are'} not being ` +
+        `tested by anything.</b> Either no checks are configured, or every check that ` +
+        `exists was skipped. A merge from here is a merge on somebody's word.</div>`
+      : '');
+
+  const open = (v.open || []).map((p) =>
+    `<div class="pr-row">` +
+    `<div><a href="${esc(p.url)}" target="_blank">#${esc(String(p.number))}</a> ` +
+    `<b>${esc(p.title || '')}</b>${p.draft ? ' <span class="muted">(draft)</span>' : ''}` +
+    `<div class="muted">${esc(p.repo)} &middot; ${esc(p.head || '?')} &rarr; ` +
+    `${esc(p.base || '?')} &middot; opened ${esc((p.at || '').slice(0, 10))}</div></div>` +
+    // A pull request with no goal behind it is listed, and said out loud. It is
+    // not ours to explain, but it is on a repository a lane owns, and leaving
+    // it out would make this list look like the whole truth when it is not.
+    `<div>${p.goal_id
+      ? `<span class="muted">from ${esc(p.lane || '')} &middot; ${esc(p.goal_id)}</span>`
+      : `<span class="muted">nothing here opened this</span>`}</div>` +
+    `<div>${prChecks(p.checks)}</div></div>`).join('');
+
+  // A repository GitHub would not answer about must never render like one with
+  // nothing open. Same shape, opposite meaning.
+  const quiet = (v.repos || []).filter((r) => r.why || !r.open).map((r) =>
+    `<div class="pr-quiet"><b>${esc(r.repo)}</b> ` +
+    `<span class="muted">${esc((r.lanes || []).join(', '))}</span> ` +
+    (r.why ? `<span class="err">${esc(r.why)}</span>`
+           : `<span class="muted">nothing open</span>`) + `</div>`).join('');
+
+  const ready = (v.ready || []).map((r) => {
+    const conds = (r.conditions || []).filter((c) => c.verdict !== 'passed').map((c) =>
+      `<div class="pr-cond">` +
+      `<div>${esc(c.text || '')}` +
+      (c.check ? `<div class="muted"><code>${esc(c.check)}</code></div>` : '') +
+      (c.waived
+        ? `<div class="warn">waived by ${esc(c.waived.by || 'the operator')} &mdash; ` +
+          `${esc(c.waived.why || 'no reason given')}</div>`
+        : '') +
+      `</div>` +
+      `<div class="muted">${esc(c.verdict || '')}</div>` +
+      `<div>${c.waived
+        ? `<button class="pr-unwaive" data-goal="${esc(r.goal_id)}" ` +
+          `data-text="${esc(c.text)}">Undo waiver</button>`
+        : `<button class="pr-waive" data-goal="${esc(r.goal_id)}" ` +
+          `data-text="${esc(c.text)}">Waive&hellip;</button>`}</div></div>`).join('');
+    return `<div class="pr-goal${r.ok ? ' pr-go' : ''}">` +
+      `<div class="pr-goal-head"><div><b>${esc(r.lane || '')}</b> ` +
+      `<span class="muted">${esc(r.goal_id || '')}</span>` +
+      `<div>${esc(r.objective || '')}</div>` +
+      `<div class="muted">${r.ahead ? `${esc(String(r.ahead))} commit${r.ahead === 1 ? '' : 's'} ahead` : 'nothing ahead'}` +
+      (r.stale_checks
+        // Said on every row, because it is the difference between "this passed"
+        // and "this passed at some point". The publish button re-runs for real.
+        ? ' &middot; <span class="warn">these are stored exit codes, not a run just now</span>'
+        : '') + `</div>` +
+      `<div>${prTally(r.tally)}</div></div>` +
+      `<div class="pr-goal-act">` +
+      (r.pr_url
+        ? `<a href="${esc(r.pr_url)}" target="_blank">already handed over</a>`
+        : (r.tally && r.tally.unchecked
+            ? `<button class="pr-write" data-goal="${esc(r.goal_id)}">` +
+              `Write the ${r.tally.unchecked} missing check${r.tally.unchecked === 1 ? '' : 's'}</button>`
+            : '')) +
+      `</div></div>` +
+      (r.blocked && r.blocked.length
+        ? `<div class="pr-blocked">${r.blocked.map((b) => esc(b)).join('<br>')}</div>`
+        : `<div class="pr-blocked pr-clear">nothing is stopping this one</div>`) +
+      (conds ? `<div class="pr-conds">${conds}</div>` : '') +
+      `<div class="pr-log" data-prlog="${esc(r.goal_id || '')}"></div>` +
+      `</div>`;
+  }).join('');
+
+  $('pr-out').innerHTML =
+    `<div class="pr-who">${who}</div>` + toll +
+    `<h4>Open on GitHub</h4>` +
+    (open ? `<div class="pr-list">${open}</div>`
+          : `<span class="muted">nothing is open on any repository a lane points at</span>`) +
+    (quiet ? `<div class="pr-quiets">${quiet}</div>` : '') +
+    `<h4>Finished here</h4>` +
+    (ready ? ready : `<span class="muted">no goal has reached done</span>`);
+
+  document.querySelectorAll('.dep-login').forEach((b) => {
+    b.onclick = () => providerLogin(b.dataset.provider);
+  });
+  document.querySelectorAll('.pr-write').forEach((b) => {
+    b.onclick = () => writeChecks(b.dataset.goal);
+  });
+  document.querySelectorAll('.pr-waive').forEach((b) => {
+    b.onclick = () => waiveCondition(b.dataset.goal, b.dataset.text);
+  });
+  document.querySelectorAll('.pr-unwaive').forEach((b) => {
+    b.onclick = () => waiveCondition(b.dataset.goal, b.dataset.text, true);
+  });
+}
+
+function setPrLog(gid, html) {
+  const el = document.querySelector(`[data-prlog="${CSS.escape(gid)}"]`);
+  if (el) el.innerHTML = html;
+}
+
+/** Ask the architect for the missing commands, show them, then keep them.
+ *
+ *  Two round trips and not one. The first stores nothing, which is what makes
+ *  the confirm meaningful: the operator is approving the specific commands that
+ *  are about to become this goal's evidence, not the idea of having some. A
+ *  command that cannot fail is refused before it is ever offered, and is shown
+ *  as refused so the gap is visibly still a gap. */
+async function writeChecks(gid) {
+  setPrLog(gid, 'asking the architect for the commands that are missing…');
+  const r = await post('/api/pr/write-checks', { goal_id: gid, apply: false });
+  if (!r.ok) { setPrLog(gid, `<span class="err">${esc(r.error)}</span>`); return; }
+  const lines = (r.proposed || []).map((p) =>
+    `${p.verdict === 'refused' ? 'REFUSED' : p.verdict === 'judgement' ? 'NO COMMAND' : 'CHECK'}` +
+    `  ${p.text}\n    ${p.check || p.refused || p.why}`);
+  const keep = (r.proposed || []).filter((p) => p.verdict !== 'refused').length;
+  if (!keep) {
+    setPrLog(gid, `<span class="err">nothing usable came back</span><pre class="dep-tail">` +
+      `${esc(lines.join('\n'))}</pre>`);
+    return;
+  }
+  setPrLog(gid, `<pre class="dep-tail">${esc(lines.join('\n'))}</pre>`);
+  if (!confirm(lines.join('\n\n') +
+      `\n\nStore these ${keep} and run them? They become this goal's evidence.`)) {
+    setPrLog(gid, 'nothing was stored');
+    return;
+  }
+  const a = await post('/api/pr/write-checks', { goal_id: gid, apply: true });
+  if (!a.ok) { setPrLog(gid, `<span class="err">${esc(a.error)}</span>`); return; }
+  const res = (a.results || []).map((x) => `exit ${x.exit}  ${x.text}`).join('\n');
+  setPrLog(gid, `<span class="ok">stored ${a.wrote}, ruled ${a.ruled_uncheckable} ` +
+    `undecidable</span><pre class="dep-tail">${esc(res)}</pre>`);
+  loadPrs();
+}
+
+/** Sign for a condition that did not pass, or take the signature back.
+ *
+ *  This never marks the condition met and never changes its verdict. A waiver
+ *  is a named person taking responsibility for shipping without the evidence,
+ *  and it is printed in the pull request body next to the condition it is
+ *  about - because the point is that whoever reads it downstream sees it too.
+ *  The gate exists so that this is a decision somebody makes rather than a step
+ *  they route around outside the tool, where nothing records it. */
+async function waiveCondition(gid, text, undo) {
+  if (undo) {
+    const r = await post('/api/pr/waive', { goal_id: gid, text, undo: true });
+    if (!r.ok) { setPrLog(gid, `<span class="err">${esc(r.error)}</span>`); return; }
+    loadPrs();
+    return;
+  }
+  const why = prompt(`Ship without proving this?\n\n${text}\n\n` +
+    `Say why. It goes in the pull request, with your name on it.`);
+  if (!why) return;
+  const r = await post('/api/pr/waive', { goal_id: gid, text, why });
+  if (!r.ok) { setPrLog(gid, `<span class="err">${esc(r.error)}</span>`); return; }
+  loadPrs();
+}
+
+async function loadPrs() {
+  // Said out loud: this asks GitHub about every repository and reads every
+  // finished goal's worktree, so the pause is real and a silent one looks broken.
+  $('pr-status').textContent = 'asking GitHub, and reading every finished goal…';
+  try {
+    renderPrs(await api('/api/prs'));
+    $('pr-status').textContent = '';
+  } catch (e) {
+    $('pr-out').innerHTML = `<span class="err">${esc(String(e.message || e))}</span>`;
+    $('pr-status').textContent = '';
+  }
+}
+
+function wirePrs() {
+  $('btn-pr-reload').onclick = loadPrs;
+}
+
 // ------------------------------------------------------------------- publish
 //
 // The providers go first and the services second, which is the opposite of what
@@ -4130,6 +4377,11 @@ function showTab(name) {
   // network, and none of it changes on its own - a credential changes when the
   // operator signs in, which is the moment they are looking at this tab.
   if (name === 'publish') loadDeploy();
+  // Same rule, and for a stronger reason: this one asks GitHub about every
+  // repository AND shells into every finished goal's worktree. Polling it on a
+  // timer would put that load on the network and on other lanes' trees forever,
+  // to answer a question nobody is currently reading the answer to.
+  if (name === 'prs') loadPrs();
 }
 
 document.querySelectorAll('.tab').forEach((t) =>
@@ -4153,6 +4405,7 @@ wireDirection();
 wireSpecs();
 wireLaneModes();
 wireDeploy();
+wirePrs();
 wireMission();
 wireReports();
 refresh();
