@@ -547,9 +547,12 @@ pre.diff, .ruling {
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 24px 0;
   z-index: 10;
 }
 .modal.hidden { display: none; }
+/* A sheet taller than the window scrolls inside itself rather than running off
+ * the bottom, where the Close button becomes unreachable. */
 .sheet {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -557,10 +560,15 @@ pre.diff, .ruling {
   padding: 20px 22px;
   width: 520px;
   max-width: 92vw;
+  max-height: 100%;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 12px;
 }
+/* In a scrolling column, flex would otherwise squash tall children (the mission
+ * textarea) instead of letting the sheet scroll. */
+.sheet > * { flex-shrink: 0; }
 .sheet h3 { margin: 0; font-size: 14px; }
 .sheet p { margin: 0; line-height: 1.6; }
 .sheet #si-code { flex: 1 1 auto; width: auto; }
