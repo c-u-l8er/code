@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>code &mdash; the open-source control plane for coding agents</title>
+<!-- Kept near 155 characters, which is roughly what a search result renders
+     before truncating. The long version read fine in the file and was cut
+     mid-clause on the page that matters. -->
+<meta name="description" content="Run many coding agents at once. Each gets its own git worktree and its own spending cap, and a second model checks its work. Nothing merges itself. Apache-2.0.">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="code — the open-source control plane for coding agents">
+<meta property="og:description" content="Every worker on its own branch, under its own spending cap, reviewed by a model that did not write the code. Nothing merges itself. Apache-2.0, zero dependencies, your own subscriptions.">
+
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='25' x='2' font-size='24' font-family='monospace' fill='%23ffb347'>%26</text></svg>">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<a class="skip" href="#what">Skip to content</a>
+
+<nav id="nav">
+  <a class="brand" href="#top">
+    <span class="amp">[&amp;]</span><span class="name">code</span>
+  </a>
+  <div class="navlinks">
+    <a href="#what">How it works</a>
+    <a href="#lanes">Lanes</a>
+    <a href="#doctrine">Doctrine</a>
+    <a href="#byos">Your subs</a>
+    <a href="#start">Install</a>
+  </div>
+  <div class="navcta">
+    <a class="ghost" href="https://github.com/c-u-l8er/code">GitHub</a>
+    <a class="btn" href="#start">Get it</a>
+  </div>
+</nav>
+
+<!-- ============================ HERO ============================ -->
+<header id="top" class="hero">
+  <div class="grain" aria-hidden="true"></div>
+  <div class="wrap">
+
+    <div class="eyebrow">
+      <!-- This pill names the actual licence, and code/LICENSE is the Apache-2.0
+           text with the copyright line filled in. The headline below calls the
+           project open-source in the largest type on the page, so the claim has
+           to be checkable from the repo root, not just asserted here. -->
+      <span class="pill">Apache-2.0</span>
+      <span class="pill">zero dependencies</span>
+      <span class="pill">your subscriptions</span>
+    </div>
+
+    <!-- t3.codes' headline, verbatim, at its measurements (DM Sans 500 / 76px /
+         -.035em). "Control plane" is the load-bearing word: this thing does not
+         write code, it decides which worker runs where, on what budget, and
+         whether the result is allowed to land. -->
+    <h1>
+      The open-source<br>
+      control plane<br>
+      for coding agents.
+    </h1>
+
+    <!-- Three sentences, one job each: what it is, what it does, who checks it.
+         "Nothing merges itself" moved down here when the headline changed —
+         it is the sharpest promise on the page and should not have been lost
+         with the old h1. -->
+    <p class="lede">
+      <b>code</b> is one window for the whole fleet. It dispatches Claude&nbsp;Code or
+      Codex into any repo you own &mdash; each worker in its own git worktree, each
+      under its own spending cap. Nothing merges itself: every report a worker
+      files is checked by a second model that did not write the code.
+    </p>
+
+    <div class="herocta">
+      <a class="btn big" href="#start">Install &amp; run</a>
+      <a class="ghost big" href="https://github.com/c-u-l8er/code">Read the source</a>
+    </div>
+
+    <p class="fineprint">
+      Runs on your machine, on <b>your</b> Claude and ChatGPT subscriptions. No keys
+      resold, no quota resold, no account to make, nothing phoning home.
+    </p>
+
+    <!-- Structural preview of the real console shell: lane rail, eight tabs,
+         detail pane, orchestrator dock. Every string renders as a bar instead
+         of as text. The shape of the tool is the point; what any given lane
+         actually says is the operator's business, not the landing page's.
+         Decorative in full, so it is hidden from assistive tech and holds no
+         focusable controls. -->
+    <div class="console preview" id="console" aria-hidden="true">
+      <div class="cbar">
+        <span class="dots"><i></i><i></i><i></i></span>
+        <span class="cpath"><i class="gl" style="width:164px"></i></span>
+        <span class="clive"><i class="beat"></i><i class="gl ok" style="width:24px"></i></span>
+      </div>
+
+      <div class="chead">
+        <div class="cbrand"><span class="amp">[&amp;]</span> <b>code</b></div>
+        <div class="chealth">
+          <span class="h"><i class="dot ok"></i><i class="gl" style="width:40px"></i></span>
+          <span class="h"><i class="dot ok"></i><i class="gl" style="width:31px"></i></span>
+          <span class="h"><i class="dot ok"></i><i class="gl" style="width:46px"></i></span>
+        </div>
+        <div class="cactions">
+          <span class="meter wide" id="c-credit"><span></span></span>
+          <span class="cbtn ghosted"><i class="gl" style="width:24px"></i></span>
+        </div>
+      </div>
+
+      <div class="cbody">
+        <aside class="clanes">
+          <div class="csec"><i class="gl" style="width:32px"></i><i class="gl dim push" style="width:54px"></i></div>
+          <ul id="c-lanes"></ul>
+        </aside>
+
+        <section class="cdetail">
+          <div class="ctabs" id="c-tabs"></div>
+          <div class="cview" id="c-view"></div>
+        </section>
+      </div>
+
+      <div class="cdock">
+        <div class="dk-head"><i class="gl" style="width:58px"></i><i class="dk-min"></i></div>
+        <div class="dk-feed" id="c-dockfeed"></div>
+        <div class="dk-compose"><i class="gl dim" style="width:74px"></i><i class="dk-send"></i></div>
+      </div>
+    </div>
+
+    <p class="caption">
+      The console's actual layout &mdash; a lane per repo, eight tabs deep, orchestrator
+      dock bottom-right. Contents left unreadable on purpose. Hover or tap a lane or a tab.
+    </p>
+  </div>
+</header>
+
+<!-- ============================ WHAT ============================ -->
+<section id="what" class="band">
+  <div class="wrap">
+    <h2 class="sec">Three roles. Three models. Three switches.</h2>
+    <p class="sub">
+      Every agent system eventually asks the same question &mdash; who decides? <b>code</b>
+      answers it up front by splitting the work into three jobs that never do each
+      other's, and putting a kill switch on each. Off means <i>refused</i>, not hidden:
+      whatever would have used a role you switched off stops and says so.
+    </p>
+
+    <div class="roles">
+      <article class="role">
+        <div class="rk">01</div>
+        <h3>You manage</h3>
+        <p>
+          You write the mission &mdash; the one piece of text in the entire system no agent
+          may write. You set direction, judge evidence and decide what gets spent.
+          You do not babysit steps.
+        </p>
+        <ul>
+          <li>Mission per workspace</li>
+          <li>Ratify the doctrine</li>
+          <li>Set the autonomy bar</li>
+        </ul>
+      </article>
+
+      <article class="role hot">
+        <div class="rk">02</div>
+        <h3>Workers code</h3>
+        <p>
+          Claude&nbsp;Code by default, <code>codex exec</code> per lane if you want it.
+          Each runs headless in an isolated worktree, budget-capped, resumable, with
+          its full transcript readable in the console.
+        </p>
+        <ul>
+          <li><code>claude -p</code> &nbsp;/&nbsp; <code>--resume</code></li>
+          <li>One <code>amp/&lt;lane&gt;</code> worktree each</li>
+          <li>Reply mid-task without losing session</li>
+        </ul>
+      </article>
+
+      <article class="role">
+        <div class="rk">03</div>
+        <h3>An architect rules</h3>
+        <p>
+          When a lane stalls, the console builds a packet &mdash; commits, working tree,
+          the uncommitted diff, the branch diff, recent dispatches, a digest of what
+          the worker actually did &mdash; and escalates. The ruling is saved and relayed.
+        </p>
+        <ul>
+          <li>Packets built, not pasted</li>
+          <li>Asks for files, gets them, no round trip</li>
+          <li>Rulings kept and searchable</li>
+        </ul>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ LANES ============================ -->
+<section id="lanes" class="band alt">
+  <div class="wrap split">
+    <div class="copy">
+      <span class="tag">Isolation</span>
+      <h2>A worker can't touch your checkout.</h2>
+      <p>
+        Every lane gets its own branch and its own worktree before a single token is
+        spent. Workers write there and nowhere else &mdash; which is what makes it safe to
+        run nine of them at once against a tree you are also typing in.
+      </p>
+      <p>
+        And when the work comes back, <b>apply refuses to merge.</b> It lands the diff in
+        the worktree and stops. The merge is a decision, and decisions are yours.
+      </p>
+      <ul class="checks">
+        <li>One branch, one worktree, one worker</li>
+        <li>Your working copy stays byte-identical while they run</li>
+        <li>Per-lane backend, branch, model and budget</li>
+        <li>State lives in <code>.amp/</code>, never in your repo</li>
+      </ul>
+    </div>
+    <div class="codeblock">
+      <div class="cbBar"><span>lane isolation</span><button class="copybtn" data-copy="#iso">copy</button></div>
+      <pre id="iso"><code><span class="c"># register a repo as a lane</span>
+<span class="p">$</span> amp lane add trvm --path TRVM --branch main
+
+<span class="c"># dispatch — the worktree is created first</span>
+<span class="p">$</span> amp dispatch trvm <span class="s">"Close the w=64 measurement gap."</span> --cap 2.00
+  <span class="d">git worktree add -B amp/trvm .amp/worktrees/trvm main</span>
+  <span class="d">claude -p … --permission-mode acceptEdits --session-id 9f3a…</span>
+  <span class="ok">→ task t-0192  running  $0.00 / $2.00</span>
+
+<span class="c"># your checkout, meanwhile</span>
+<span class="p">$</span> git status --short
+<span class="d">(nothing)</span>
+</code></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ GOALS ============================ -->
+<section class="band">
+  <div class="wrap split rev">
+    <div class="copy">
+      <span class="tag">Goals</span>
+      <h2>State what must be true. Not what to type.</h2>
+      <p>
+        A goal is one objective, not a task list. The architect reads it against the
+        real repository and writes the definition of done and the tasks itself, then
+        sends the first worker. Roughly twenty seconds from sentence to running work.
+      </p>
+      <p>
+        Each proposed goal is scored with the odds it <b>finishes</b> &mdash; every
+        done-condition met, without stopping to ask you for something. You set the bar
+        with one slider. Above it, work starts on its own. Below it, it waits in
+        Direction with its reason showing.
+      </p>
+
+      <div class="slider" id="autonomy">
+        <div class="slrow">
+          <span class="sllab">Start a proposed goal without asking me</span>
+          <output id="sl-out">70%</output>
+        </div>
+        <input id="sl" type="range" min="0" max="100" step="5" value="70" aria-label="Autonomy threshold">
+        <p class="slnote" id="sl-note"></p>
+      </div>
+    </div>
+
+    <div class="goalcard">
+      <div class="gc-head">
+        <span class="gc-state run">running</span>
+        <span class="gc-odds">78% odds of finishing</span>
+      </div>
+      <h4>Every published benchmark number states its method.</h4>
+      <div class="gc-sec">Definition of done</div>
+      <ul class="gc-dod">
+        <li><i class="tick">✓</i> Each figure names a baseline</li>
+        <li><i class="tick">✓</i> Run count and exclusions recorded</li>
+        <li><i class="tick run">◍</i> Ordering bias stated where it could select</li>
+        <li><i class="tick">·</i> A check exits non-zero when one is missing</li>
+      </ul>
+      <div class="gc-sec">Tasks</div>
+      <ol class="gc-tasks">
+        <li class="done">Inventory every published figure <span>$0.31</span></li>
+        <li class="done">Add method block to each <span>$0.88</span></li>
+        <li class="live">Write the obligation check <span>$0.12 / $1.00</span></li>
+        <li>Wire it into the board</li>
+      </ol>
+      <div class="gc-foot"><span>spent $1.31</span><span>lane <b>trvm</b></span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ DOCTRINE ============================ -->
+<section id="doctrine" class="band alt">
+  <div class="wrap">
+    <span class="tag ctr">The part nobody else has</span>
+    <h2 class="sec">Every claim lands on a rung.</h2>
+    <p class="sub">
+      Agents are fluent, and fluency is exactly what makes "done" worthless. So <b>code</b>
+      injects a doctrine verbatim into every plan, every worker prompt and every review,
+      and it starts by deleting the words agents hide in. There is no checkmark. There is
+      no percentage. There are five rungs, and when in doubt you downgrade.
+    </p>
+
+    <div class="ladder" id="ladder">
+      <button class="rung" data-r="0">
+        <span class="rn">spec</span>
+        <span class="rd">Specified, possibly schema'd. No implementation.</span>
+      </button>
+      <button class="rung" data-r="1">
+        <span class="rn">in_tree</span>
+        <span class="rd">Implemented and tested &mdash; but only against stubs, simulators or single-process round-trips. The code exists; the system is unproven.</span>
+      </button>
+      <button class="rung" data-r="2">
+        <span class="rn">live_local</span>
+        <span class="rd">Exercised end-to-end against its real substrate at least once, on a developer machine.</span>
+      </button>
+      <button class="rung" data-r="3">
+        <span class="rn">live_deployed</span>
+        <span class="rd">Runs in production and has been exercised there.</span>
+      </button>
+      <button class="rung" data-r="4">
+        <span class="rn">external</span>
+        <span class="rd">Validated by someone who is not us.</span>
+      </button>
+    </div>
+
+    <h3 class="mini">And seven rules that outrank the output.</h3>
+    <div class="rules">
+      <div class="rule"><b>1 &middot; A check outranks an opinion.</b> Where a condition can be settled by a command, the exit code is the answer and no report overrides it.</div>
+      <div class="rule"><b>2 &middot; Do not fabricate.</b> Not counts, not statuses, not provenance, not coverage. An invented number is worse than a missing one, because it stops the question being asked.</div>
+      <div class="rule"><b>3 &middot; Name the gap.</b> A known hole stays visible and stays labelled. Honest gaps are load-bearing.</div>
+      <div class="rule"><b>4 &middot; Measure before you claim.</b> A speedup without a method is a rumour. If the measurement ordering could have selected the result, say so.</div>
+      <div class="rule"><b>5 &middot; Retract out loud.</b> Retract by name, in the same place you published. A quiet correction is a second error.</div>
+      <div class="rule"><b>6 &middot; Some decisions are yours.</b> What to build, what is good enough, what to spend, what to publish. Flag them and stop.</div>
+      <div class="rule"><b>7 &middot; Commit so work survives; verify so it is worth surviving.</b> Never end holding a commit nobody has built.</div>
+    </div>
+
+    <div class="owed">
+      <div class="owedhead">Every report ends here. One section. Four answers.</div>
+      <div class="owedgrid">
+        <div class="ow adv"><b>advanced</b><span>moved a named claim up a named rung, with the evidence</span></div>
+        <div class="ow con"><b>contradicted</b><span>something we believed is false &mdash; this outranks the rest of the report</span></div>
+        <div class="ow pro"><b>proposed</b><span>a new thesis worth adopting, stated so it could be wrong</span></div>
+        <div class="ow non"><b>none</b><span>ordinary work. Common, and entirely acceptable.</span></div>
+      </div>
+      <p class="owedfoot">Do not manufacture a finding to have something to say &mdash; rule 2 covers that too.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ OBLIGATIONS ============================ -->
+<section class="band">
+  <div class="wrap split">
+    <div class="copy">
+      <span class="tag">Obligations</span>
+      <h2>Things that have to keep being true.</h2>
+      <p>
+        Register a command as a standing obligation and the console runs it on the
+        heartbeat. When it stops exiting zero it surfaces above the board, and it stays
+        there until it passes. Rule 1, wired to the wall.
+      </p>
+      <p>
+        Above it sits one thing only: what the <i>work</i> said about the doctrine. A stale
+        build is a chore. A contradiction is news, and it is ranked like news.
+      </p>
+      <ul class="checks">
+        <li>Timed out checks get their process group killed, not just their shell</li>
+        <li>Findings from workers rank above anything the harness noticed itself</li>
+        <li>A supervisor reads mission, doctrine, goals and failures &mdash; and only recommends</li>
+      </ul>
+    </div>
+
+    <div class="stack">
+      <div class="alertrow find">
+        <span class="al">contradicted</span>
+        <span class="at">The 664-empty-cell result had no preimage. Retracting it by name.</span>
+        <span class="am">trvm &middot; 11m</span>
+      </div>
+      <div class="alertrow obl">
+        <span class="al">failing</span>
+        <span class="at"><code>python3 checks/trvm_bench_published.py</code> &mdash; exit 1</span>
+        <span class="am">4m</span>
+      </div>
+      <div class="alertrow ok">
+        <span class="al">passing</span>
+        <span class="at"><code>mix test</code> &mdash; 116 laws, exit 0</span>
+        <span class="am">4m</span>
+      </div>
+      <div class="alertrow sup">
+        <span class="al">supervisor</span>
+        <span class="at">Two lanes are advancing a claim the mission does not name. Recommend closing one.</span>
+        <span class="am">reading</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ BYOS ============================ -->
+<section id="byos" class="band alt">
+  <div class="wrap">
+    <span class="tag ctr">Bring your own subscriptions</span>
+    <h2 class="sec">Nothing here resells you your own quota.</h2>
+    <p class="sub">
+      <b>code</b> shells out to CLIs you already have, signed in to accounts you already
+      pay for. Two of the three tiers spend no metered money at all, and the one that
+      does has a switch, a balance readout and a per-dispatch cap.
+    </p>
+
+    <div class="subs">
+      <div class="subcard">
+        <div class="sc-h"><b>Claude subscription</b><span class="sc-tag free">no metered spend</span></div>
+        <div class="sc-m">opus &middot; sonnet &middot; haiku</div>
+        <p>The default worker. Signed in once from the console, which stores a long-lived worker token so background lanes stop depending on whatever credentials a terminal happens to carry.</p>
+        <code class="sc-cmd">amp login</code>
+      </div>
+      <div class="subcard">
+        <div class="sc-h"><b>ChatGPT subscription</b><span class="sc-tag free">no metered spend</span></div>
+        <div class="sc-m">codex exec</div>
+        <p>Optional per lane. Device-code sign-in from the console; the window notices when you approve it. Best-of-<i>k</i> attempts, each with its own diff to read.</p>
+        <code class="sc-cmd">Settings → Connect ChatGPT</code>
+      </div>
+      <div class="subcard">
+        <div class="sc-h"><b>OpenRouter credit</b><span class="sc-tag paid">metered &middot; switchable</span></div>
+        <div class="sc-m">luna &middot; terra &middot; sol</div>
+        <p>The architect tier, cheapest first. One master switch turns off every path that can spend it. Reading your remaining balance is a free request and keeps working either way.</p>
+        <code class="sc-cmd">amp credits</code>
+      </div>
+    </div>
+
+    <div class="spendbar">
+      <div class="sb"><b>Default cap</b><span>$1.00 per dispatch</span></div>
+      <div class="sb"><b>Real cost</b><span>on the board, per task, per goal</span></div>
+      <div class="sb"><b>Budget spent</b><span>says so &mdash; never retires a lane in silence</span></div>
+      <div class="sb"><b>Rate limited</b><span>waits it out instead of spending the fleet against it</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SURFACE ============================ -->
+<section class="band">
+  <div class="wrap">
+    <h2 class="sec">Eight panes. No mystery state.</h2>
+    <p class="sub">Everything a worker did is readable from the same window that started it.</p>
+    <div class="grid8">
+      <div class="g8"><b>Dispatch</b><span>Send the task. Reply to it mid-flight without losing the session.</span></div>
+      <div class="g8"><b>Goals</b><span>Objective, definition of done, task list, spend, and the questions it is blocked on.</span></div>
+      <div class="g8"><b>Direction</b><span>The bet, what the work is held to, what the work said back, and what we still do not know.</span></div>
+      <div class="g8"><b>Log</b><span>The worker's real transcript, streamed live, thinking optional.</span></div>
+      <div class="g8"><b>Diff</b><span>What actually changed on the branch. Apply lands it locally and stops.</span></div>
+      <div class="g8"><b>Ask GPT-5.6</b><span>Threaded escalation with the packet built for you.</span></div>
+      <div class="g8"><b>History</b><span>Rescans the agent sessions already on your disk &mdash; including the ones that look wrong.</span></div>
+      <div class="g8"><b>Rulings</b><span>Every architect decision, kept, named and re-readable.</span></div>
+    </div>
+    <p class="caption ctr">Plus a dock in the corner: the orchestrator thread that runs the others.</p>
+  </div>
+</section>
+
+<!-- ============================ START ============================ -->
+<section id="start" class="band alt">
+  <div class="wrap">
+    <span class="tag ctr">Apache-2.0</span>
+    <h2 class="sec">Clone it, read it, change it.</h2>
+    <p class="sub">
+      One Python file for the harness, one for the server, one HTML page for the console.
+      No package manager, no build step, no lockfile, no runtime dependencies &mdash; the
+      standard library and the CLIs you already installed. Fork it, ship it, sell it;
+      the licence only asks that you keep the notice.
+    </p>
+
+    <div class="codeblock big">
+      <div class="cbBar"><span>quickstart</span><button class="copybtn" data-copy="#qs">copy</button></div>
+      <pre id="qs"><code><span class="p">$</span> git clone https://github.com/c-u-l8er/code
+<span class="p">$</span> cd code
+
+<span class="c"># preflight: worker CLIs, keys, lane bindings</span>
+<span class="p">$</span> python3 amp.py doctor
+
+<span class="c"># connect a long-lived worker token, once</span>
+<span class="p">$</span> python3 amp.py login
+
+<span class="c"># open the console</span>
+<span class="p">$</span> python3 amp.py serve
+  <span class="ok">→ http://localhost:8787</span>
+</code></pre>
+    </div>
+
+    <div class="cmds">
+      <div class="cmdcol">
+        <div class="cmdh">The whole CLI</div>
+        <ul>
+          <li><code>doctor</code><span>preflight: worker CLIs, keys, lane bindings</span></li>
+          <li><code>serve</code><span>launch the browser console</span></li>
+          <li><code>lane</code><span>manage lanes</span></li>
+          <li><span class="cc"><code>lanes</code> <code>board</code></span><span>what exists, and what it is doing</span></li>
+          <li><code>dispatch</code><span>send a task to a lane's worker</span></li>
+          <li><code>reply</code><span>answer a worker mid-task; resumes its session</span></li>
+        </ul>
+      </div>
+      <div class="cmdcol">
+        <div class="cmdh">&nbsp;</div>
+        <ul>
+          <li><code>poll</code><span>refresh the board</span></li>
+          <li><code>diff</code><span>show a task's diff</span></li>
+          <li><code>apply</code><span>land it in the worktree &mdash; never merges</span></li>
+          <li><code>packet</code><span>build an architect packet zip</span></li>
+          <li><code>ask</code><span>build the packet <i>and</i> send it</span></li>
+          <li><code>credits</code><span>OpenRouter credit remaining</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="reqs">
+      <span><b>Requires</b></span>
+      <span>Python 3</span><span class="sep">/</span>
+      <span>git</span><span class="sep">/</span>
+      <span>a POSIX machine (macOS, Linux)</span><span class="sep">/</span>
+      <span>the agent CLIs you want to drive</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ STATUS ============================ -->
+<section class="band status">
+  <div class="wrap">
+    <h2 class="sec small">Where this actually is</h2>
+    <p class="sub narrow">
+      There is no star count on this page, no testimonial wall and no logo strip,
+      because rule&nbsp;2 applies to the marketing too. So here is the honest rung.
+    </p>
+    <div class="statusrow">
+      <div class="st"><span class="rung-chip live">live_local</span><b>The console</b><span>Dispatch, worktrees, transcripts, escalation and rulings have been driven end-to-end against real Claude Code and real repos, on one developer machine.</span></div>
+      <div class="st"><span class="rung-chip tree">in_tree</span><b>Full autonomous fleet</b><span>Goal planning, auto-adoption and the idle sweep are implemented and exercised, but not yet run unattended for a long stretch.</span></div>
+      <div class="st"><span class="rung-chip spec">untested</span><b>The premise</b><span>That a governed multi-worker board beats one good agent in one good chat. This is the bet. Nobody outside has tried to break it.</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ CTA ============================ -->
+<section class="finale">
+  <div class="wrap">
+    <h2>Your agents deserve a board,<br>not a scrollback buffer.</h2>
+    <p>Nine lanes, one window, and a rule that a check outranks an opinion.</p>
+    <div class="herocta">
+      <a class="btn big" href="https://github.com/c-u-l8er/code">Clone from GitHub</a>
+      <a class="ghost big" href="#start">Read the quickstart</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap fwrap">
+    <div class="fbrand">
+      <span class="amp">[&amp;]</span> <b>code</b>
+      <p>Part of the [&amp;] stack &mdash; structural composition, temporal loops, and diagnostic measurement.</p>
+    </div>
+    <div class="flinks">
+      <a href="https://github.com/c-u-l8er/code">GitHub</a>
+      <a href="#doctrine">Doctrine</a>
+      <a href="#start">Install</a>
+      <a href="https://github.com/c-u-l8er/code/issues">Issues</a>
+      <a href="https://github.com/c-u-l8er/code/blob/main/LICENSE">Apache-2.0</a>
+    </div>
+  </div>
+  <div class="wrap fbot">
+    <span>Runs on your machine, on your subscriptions.</span>
+    <span>Built with the doctrine it ships.</span>
+  </div>
+</footer>
+
+<script src="site.js"></script>
+</body>
+</html>
