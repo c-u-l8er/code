@@ -74,6 +74,7 @@
       <button class="tab" data-tab="history">History</button>
       <button class="tab" data-tab="rulings">Rulings</button>
       <button class="tab" data-tab="settings">Settings</button>
+      <button class="tab" data-tab="publish">Publish</button>
     </nav>
 
     <div class="pane active" id="pane-dispatch">
@@ -287,8 +288,69 @@ If the architect asks for a file by name it is fetched and sent without another 
       than one that is paused.</p>
       <div id="lm-out" class="lanes">loading&hellip;</div>
     </div>
+
+    <!-- Not a deploy button. The mission is to move lanes off `live_local` and
+         onto `live_deployed`, a rung moves when evidence moves it, and that
+         evidence is a deploy that happened - so the first question is whether a
+         deploy COULD happen, and nothing here knew. It cost the fleet directly:
+         every proposal in a free lane sat under a bar with the reason written
+         on it in the architect's own words, unread.
+
+         The targets are discovered from disk rather than configured, because a
+         list kept by hand is wrong the first time somebody adds a service. The
+         identities are asked of each provider rather than inferred from a file,
+         because a token that exists is not a token that works. -->
+    <div class="pane" id="pane-publish">
+      <div class="pane-head">
+        <h3>What could be deployed</h3>
+        <div class="row">
+          <button id="btn-dep-reload">Re-check</button>
+          <span class="muted" id="dep-status"></span>
+        </div>
+      </div>
+      <p class="muted">Each provider is asked its own <code>whoami</code>, so what is
+      shown is what a deploy would actually find rather than what a config file claims.
+      Signing in opens a page in the browser; the console keeps asking the provider until
+      the provider says yes &mdash; never until the CLI says so.</p>
+      <div id="dep-out" class="deploy">loading&hellip;</div>
+    </div>
   </section>
 </main>
+
+<!-- The three strips that used to stack under the header. They were pushing the
+     board itself below the fold, and a permanent wall of text is one nobody
+     reads - so they live behind the Notifications button now. Still three
+     separate lists, still in the same order: a finding is news about what we
+     believe, an obligation is a chore the harness noticed, and a watch item is
+     a fact off the board. Merging them would let a stale docs build sit at the
+     same weight as a contradiction. -->
+<aside id="notify" class="notify hidden">
+  <div class="notify-head">
+    <h3>Notifications</h3>
+    <span class="muted" id="notify-sub"></span>
+    <button id="btn-notify-close" title="Close">&times;</button>
+  </div>
+  <div class="notify-body">
+    <div class="nsec">
+      <h4>What the work said</h4>
+      <p class="muted">Claims about the doctrine that nobody has told you yet. A
+      contradiction means something we believed and acted on is false.</p>
+      <div id="findings" class="findings hidden"></div>
+    </div>
+    <div class="nsec">
+      <h4>Standing obligations</h4>
+      <p class="muted">Things that have to keep being true and currently do not.</p>
+      <div id="obligations" class="obligations hidden"></div>
+    </div>
+    <div class="nsec">
+      <h4>Worth knowing about</h4>
+      <p class="muted">What the harness can see is wrong, off the board and the
+      worktrees &mdash; not a model's opinion.</p>
+      <div id="watch" class="watch hidden"></div>
+    </div>
+    <div class="notify-empty" id="notify-empty">Nothing to read.</div>
+  </div>
+</aside>
 
 <div id="dock" class="dock">
   <div class="dock-head" id="dock-head">

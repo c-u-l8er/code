@@ -2350,6 +2350,129 @@ class CodexLogin:
         self.pid, self.fd = None, None
 
 
+# What each deploy provider's sign-in actually is, as a command. Both of these
+# are the same shape as the ChatGPT flow and NOT the Claude one: they print a
+# URL, the operator approves it in a browser, and the CLI polls the provider
+# itself and exits. There is nothing to paste back.
+LOGIN_CMD = {
+    "fly": ["flyctl", "auth", "login"],
+    "cloudflare": ["wrangler", "login"],
+}
+
+
+class ProviderLogin:
+    """Drives a deploy provider's browser sign-in from the console.
+
+    One class for both providers rather than one each, because unlike the two
+    model CLIs they genuinely are the same flow, and the thing that decides
+    whether it worked is the same for both: the provider's own `whoami`, run
+    fresh afterwards. The buffer says what the CLI claims. `whoami` says what a
+    deploy would actually find, which is the only claim worth putting on screen
+    - the failure this avoids is telling the operator they are signed in and
+    then having nine services fail to deploy.
+
+    Why this is worth building at all, stated where it can be checked: ten
+    deployable services in this workspace, ten of them stranded, and the mission
+    is to move lanes onto `live_deployed`. The architect said so itself from two
+    independent call paths across eleven lanes - "the remaining uncertainties
+    require operator-controlled deployed machines, credentials, spending, or
+    acceptance decisions" - while sharpening spent four rounds per proposal
+    being told the wording was not the problem.
+    """
+
+    WIDTH = 400            # both wrap the authorize URL into fragments if narrow
+    IDLE = 0.5
+    TTL = 10 * 60
+
+    URL_RE = re.compile(r"https://\S+")
+
+    def __init__(self, provider: str):
+        self.provider = provider
+        self.pid: int | None = None
+        self.fd: int | None = None
+        self.buf = ""
+        self.url: str | None = None
+        self.started = 0.0
+
+    def start(self, timeout: float = 60.0) -> dict:
+        """Launch the flow and return the URL the operator has to approve."""
+        cmd = LOGIN_CMD.get(self.provider)
+        if not cmd:
+            raise RuntimeError(f"nothing here knows how to sign in to {self.provider!r}")
+        if not shutil.which(cmd[0]):
+            raise RuntimeError(f"{cmd[0]} is not installed, so there is nothing to sign in to")
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            env = dict(os.environ)
+            # An ambient token would let the CLI answer from the environment
+            # rather than running the flow that was asked for, and the operator
+            # would be signed in as whoever that token belongs to.
+            for k in ("FLY_API_TOKEN", "FLY_ACCESS_TOKEN",
+                      "CLOUDFLARE_API_TOKEN", "CF_API_TOKEN"):
+                env.pop(k, None)
+            chrome = browser_cmd()
+            if chrome:
+                env["BROWSER"] = chrome
+            os.execvpe(cmd[0], cmd, env)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, self.WIDTH, 0, 0))
+        # `flyctl` upgrades itself on first run and prints a progress bar for
+        # thirty seconds before it says anything useful, which is why the wait
+        # here is generous and why the caller is told this can be slow.
+        self.buf = pty_read(self.fd, self.buf, time.time() + timeout,
+                            self.URL_RE.search, self.IDLE)
+        m = self.URL_RE.search(self.buf)
+        if not m:
+            self.close()
+            raise RuntimeError(f"{cmd[0]} did not offer a sign-in URL:\n"
+                               + last_message(self.buf, 4))
+        self.url = m.group(0).rstrip(".,")
+        self.started = time.time()
+        return {"url": self.url}
+
+    def poll(self) -> dict:
+        """Where the flow has got to: pending, connected, or failed and why."""
+        if self.fd is None:
+            return {"state": "failed", "error": "sign-in is not running"}
+        # Keep draining, so a complaint printed while nobody was looking is in
+        # the buffer by the time the error message needs it.
+        self.buf = pty_read(self.fd, self.buf, time.time() + 0.2, lambda b: False, 0.1)
+        try:
+            done, _ = os.waitpid(self.pid, os.WNOHANG)
+        except (OSError, TypeError):
+            done = -1
+        if done == 0:
+            # Asked even while the child is still up. `wrangler login` leaves a
+            # server running after it has written the credential, so waiting for
+            # the process to exit would report a completed sign-in as pending
+            # for as long as the operator was willing to watch it.
+            if _whoami(self.provider).get("ok"):
+                self.close()
+                return {"state": "connected"}
+            if time.time() - self.started > self.TTL:
+                self.close()
+                return {"state": "failed", "error": "that sign-in expired - start again"}
+            return {"state": "pending", "url": self.url}
+        self.pid = None          # reaped already; close() must not wait on it
+        self.close()
+        if _whoami(self.provider).get("ok"):
+            return {"state": "connected"}
+        return {"state": "failed",
+                "error": self._reason() or "sign-in did not complete - try again"}
+
+    def _reason(self) -> str | None:
+        """The CLI's own complaint, preferred over an exit code nobody can read."""
+        for ln in reversed(redact(self.buf).splitlines()):
+            s = " ".join(ln.split())
+            if re.match(r"(error|failed)\b", s, re.I) or \
+               re.search(r"\b(expired|denied|timed out|rejected)\b", s, re.I):
+                return s
+        return None
+
+    def close(self):
+        pty_close(self.pid, self.fd)
+        self.pid, self.fd = None, None
+
+
 # ---------------------------------------------------------------- supervision
 
 
@@ -6226,6 +6349,151 @@ def publish_goal(gid: str, *, dry_run: bool = True) -> dict:
     return rep
 
 
+# ------------------------------------------------------- what can be deployed
+#
+# The mission is to move lanes off `live_local` and onto `live_deployed`, and a
+# rung moves when evidence moves it - so `live_deployed` needs a deploy that
+# actually happened, which needs a credential that actually works. Nothing in
+# the harness knew whether one did.
+#
+# It cost the fleet directly and took a cross-tabulation to see. Eleven lanes,
+# three running goals against a cap of ten, and every proposal in a lane that
+# was free sat under a bar. The architect had written the reason on each one and
+# nothing was reading it: "the low confidence comes from unestablished deployed
+# access", "success now depends on deployed hosts, access, and installed real
+# implementations", "the remaining uncertainties require operator-controlled
+# deployed machines, credentials, spending, or acceptance decisions". Two
+# independent call paths, eleven lanes, the same sentence. Sharpening had spent
+# two to four rounds on most of them being told the wording was not the problem.
+#
+# So this is not a deploy button. It is the answer to "which credential is
+# missing, and what does that cost us" - discovered from disk and checked by
+# asking the provider, because the two failures worth catching are a target
+# nobody registered and a login everybody assumed.
+
+# What marks a directory as deployable, and by whom. Discovered, never
+# configured: a list of deploy targets kept by hand is a list that is wrong the
+# first time somebody adds a service and does not think to come here.
+DEPLOY_MARKERS = (
+    ("fly", "fly.toml"),
+    ("cloudflare", "wrangler.toml"),
+    ("cloudflare", "wrangler.jsonc"),
+    ("cloudflare", "wrangler.json"),
+)
+
+# How to ask each provider who we are. A command, not a token check: a token
+# that exists is not a token that works, and the difference is a deploy that
+# fails after the operator has been told they are signed in.
+DEPLOY_WHOAMI = {
+    "fly": ["flyctl", "auth", "whoami"],
+    "cloudflare": ["wrangler", "whoami"],
+    "npm": ["npm", "whoami"],
+}
+
+DEPLOY_SIGNIN = {
+    "fly": "flyctl auth login",
+    "cloudflare": "wrangler login",
+    "npm": "npm login",
+}
+
+
+def deploy_targets() -> list[dict]:
+    """Every deployable thing in the workspace, found by looking.
+
+    Two levels deep from the workspace root and no further: a `fly.toml` inside
+    `node_modules` is a dependency's, not ours, and one six directories down is
+    a vendored copy. Both would be reported as ours and neither would deploy.
+
+    A target is reported with the lane that owns it where one does, and without
+    one where none does. That second case is the one worth having: a service
+    with a `fly.toml` and no lane is a thing that can be deployed and that no
+    worker is ever going to look at.
+    """
+    lanes_by_path = {}
+    for name, cfg in (config().get("lanes") or {}).items():
+        p = (cfg or {}).get("path") or ""
+        lanes_by_path.setdefault(str((ROOT / p).resolve()), name)
+    skip = {"node_modules", ".git", "_build", "deps", "old_scrap", "dist", ".amp"}
+    out: list[dict] = []
+    for provider, marker in DEPLOY_MARKERS:
+        for path in list(ROOT.glob(marker)) + list(ROOT.glob(f"*/{marker}")) \
+                + list(ROOT.glob(f"*/*/{marker}")):
+            if skip & set(path.parts):
+                continue
+            d = path.parent.resolve()
+            out.append({"provider": provider, "dir": str(d),
+                        "rel": str(d.relative_to(ROOT)) if d != ROOT else ".",
+                        "marker": marker, "lane": lanes_by_path.get(str(d))})
+    # A directory can carry two markers - a Worker in front of a Fly backend is
+    # an ordinary shape - so this is keyed on the pair, not on the directory.
+    seen, uniq = set(), []
+    for t in sorted(out, key=lambda t: (t["provider"], t["rel"])):
+        k = (t["provider"], t["dir"])
+        if k not in seen:
+            seen.add(k)
+            uniq.append(t)
+    return uniq
+
+
+def _whoami(provider: str) -> dict:
+    """Ask one provider who we are, and report what it said rather than a guess.
+
+    A timeout is a `no`, not an exception: every one of these reaches the
+    network, and this is called from a request thread. An install that is
+    missing and a login that is absent are reported apart, because they are
+    different problems with different fixes and the operator would otherwise be
+    told to sign in to something that is not installed.
+    """
+    cmd = DEPLOY_WHOAMI.get(provider)
+    if not cmd:
+        return {"ok": False, "installed": False, "who": None,
+                "why": f"nothing here knows how to check {provider!r}"}
+    if not shutil.which(cmd[0]):
+        return {"ok": False, "installed": False, "who": None,
+                "why": f"{cmd[0]} is not installed"}
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return {"ok": False, "installed": True, "who": None,
+                "why": f"{cmd[0]} did not answer: {e}"}
+    text = redact((r.stdout + r.stderr).strip())
+    if r.returncode != 0:
+        return {"ok": False, "installed": True, "who": None,
+                "why": last_line(text) or f"{cmd[0]} says we are not signed in"}
+    # The first non-empty line. `wrangler whoami` prints a table and `flyctl`
+    # prints one address; taking the whole buffer would put a box-drawing
+    # diagram through the middle of a status row.
+    return {"ok": True, "installed": True, "who": last_line(text, first=True),
+            "why": None}
+
+
+def last_line(text: str, first: bool = False) -> str:
+    """The one line of a command's output worth putting in a status row."""
+    lines = [" ".join(l.split()) for l in (text or "").splitlines() if l.strip()]
+    return (lines[0] if first else lines[-1]) if lines else ""
+
+
+def deploy_view() -> dict:
+    """What could be deployed, what it needs, and whether that thing works now.
+
+    The count that matters is `stranded`: targets whose provider we cannot sign
+    in to. That number is the mission's own ceiling written down - each one is a
+    service that can never produce the evidence `live_deployed` requires, no
+    matter how many workers are pointed at it.
+    """
+    targets = deploy_targets()
+    want = sorted({t["provider"] for t in targets} | {"npm"})
+    ident = {p: _whoami(p) for p in want}
+    for t in targets:
+        t["signed_in"] = bool(ident.get(t["provider"], {}).get("ok"))
+    return {"targets": targets,
+            "identities": [{"provider": p, "signin": DEPLOY_SIGNIN.get(p), **ident[p]}
+                           for p in want],
+            "stranded": sum(1 for t in targets if not t["signed_in"]),
+            "lanes_stranded": sorted({t["lane"] for t in targets
+                                      if t["lane"] and not t["signed_in"]})}
+
+
 # ------------------------------------------------------------------ direction
 #
 # A goal answers "what has to be true next". Nothing so far answers "and then
@@ -6647,7 +6915,42 @@ def proposal_hold(p: dict) -> str | None:
         return f"{c:.0%} odds of finishing, under the {bar:.0%} bar you set"
     if need < nbar:
         return f"the mission wants it {need:.0%}, under the {nbar:.0%} bar you set"
+    # Over the bars and still holding room to improve. Clearing the bars says
+    # the objective is worth starting; it does not say it is worth starting AS
+    # WRITTEN, and those are different questions that this function used to
+    # answer with one number. `headroom` is the architect's own claim that
+    # reading it again would raise its score - so adopting on the spot spends a
+    # worker on a version somebody has already said is not the best available
+    # one, and the improvement can never be made afterwards because adoption is
+    # what retires the proposal.
+    #
+    # Only on a STATED number. `headroom` absent is nobody having judged it, not
+    # a claim of nothing to do, and holding work on a field that was never
+    # written is the failure `_num` returns None to avoid.
+    #
+    # `sharpen_converged` is the exit, and it has to be here or this is a trap:
+    # an architect that keeps asserting headroom while the rounds stop moving
+    # the odds would hold the objective for ever. Converged means the measured
+    # gain died or the spend cap hit, and either way the next round buys
+    # nothing, so the objective starts at whatever it reached.
+    if held_for_sharpening(p):
+        return (f"{p['headroom']:.0%} room left to improve it, over the "
+                f"{SHARPEN_FLOOR:.0%} worth another look — sharpening it first")
     return None
+
+
+def held_for_sharpening(p: dict) -> bool:
+    """Whether the only thing between this objective and a worker is a rewrite.
+
+    Split out and named because two things need the answer and they must not
+    disagree: `proposal_hold`, which stops the adoption, and the panel, which
+    has to say whether the operator is being asked for something. Every other
+    hold waits on a person; this one waits on a call the harness makes itself,
+    and rendering them the same way tells the operator to go and do something
+    about a queue that is already draining.
+    """
+    head = p.get("headroom")
+    return head is not None and head >= SHARPEN_FLOOR and not sharpen_converged(p)
 
 
 def lane_record(lane_name: str, n: int = 8) -> dict:
@@ -9672,8 +9975,13 @@ def sharpen_converged(p: dict) -> str | None:
 def sharpenable() -> list[dict]:
     """Open proposals that are being held back and are worth another look.
 
-    A proposal above the bars is left alone: it is already going to be adopted,
-    and spending an architect call to agree with it buys nothing.
+    Held back now includes held back BY its own headroom - see `proposal_hold`.
+    This used to skip anything above the bars on the reasoning that it was
+    already going to be adopted and a call to agree with it bought nothing. What
+    that missed is that clearing the bars and being well written are different
+    facts: three docs objectives sat at 96-98% odds with 62-80% room to improve
+    and no sharpening round ever run, because every one of them was too good to
+    be looked at again and would have started as first drafted.
 
     Unscored first, because a proposal nobody has judged is not being held back
     for a reason - it is simply unjudged, and one call turns it into something
@@ -10001,6 +10309,7 @@ def direction_view(lane: str | None = None) -> dict:
         # button that disappears has to be able to say whether the objective
         # stopped improving or was cut off by the spend cap.
         "proposals": sorted([{**p, "hold": proposal_hold(p), "worth": worth(p),
+                              "hold_is_sharpen": held_for_sharpening(p),
                               "sharpen_rounds": int(p.get("sharpen_rounds") or 0),
                               "sharpen_gain": sharpen_gain(p),
                               "sharpen_done": sharpen_converged(p)}

@@ -1809,6 +1809,17 @@ def do_lanes() -> dict:
     return amp.lanes_view()
 
 
+def do_deploy() -> dict:
+    """What could be deployed, what credential it needs, and whether that works.
+
+    Slow enough to be worth saying so: it runs each provider's own `whoami`, and
+    those reach the network. Asked on opening the tab rather than on the
+    heartbeat, because a credential does not change on its own - it changes when
+    the operator signs in, which is the moment they are looking at this.
+    """
+    return {"ok": True, **amp.deploy_view()}
+
+
 def do_set_lane_mode(body: dict) -> dict:
     """Change what a lane may START. Never stops what it is already doing.
 
@@ -1887,6 +1898,47 @@ def do_auth_code(body: dict) -> dict:
             _LOGIN = None
         amp.store_claude_token(token)
     return {"ok": True, "connected": True}
+
+
+# The deploy providers sign in the same way the ChatGPT flow does - a URL, a
+# browser, and a CLI that polls and exits - so this is the same two-call shape.
+# One slot, not one per provider: two sign-ins at once would each hold a pty
+# waiting on the same operator and the same browser, and the second one would be
+# approving a page the first one opened.
+_PROVIDER_LOGIN: amp.ProviderLogin | None = None
+_PROVIDER_LOCK = threading.Lock()
+
+
+def do_provider_login(body: dict) -> dict:
+    global _PROVIDER_LOGIN
+    provider = (body.get("provider") or "").strip()
+    with _PROVIDER_LOCK:
+        if _PROVIDER_LOGIN:
+            _PROVIDER_LOGIN.close()
+        lg = amp.ProviderLogin(provider)
+        try:
+            out = lg.start()
+        except (RuntimeError, OSError) as e:
+            return {"ok": False, "error": amp.redact(str(e))}
+        _PROVIDER_LOGIN = lg
+        amp.open_url(out["url"])
+        return {"ok": True, "provider": provider, **out}
+
+
+def do_provider_poll() -> dict:
+    """Has the operator approved it yet? Answered by the provider, not the CLI."""
+    global _PROVIDER_LOGIN
+    with _PROVIDER_LOCK:
+        lg = _PROVIDER_LOGIN
+        if not lg:
+            return {"ok": False, "state": "failed", "error": "no sign-in is running"}
+        try:
+            r = lg.poll()
+        except OSError as e:
+            r = {"state": "failed", "error": amp.redact(str(e))}
+        if r.get("state") != "pending":
+            _PROVIDER_LOGIN = None
+        return {"ok": r.get("state") == "connected", "provider": lg.provider, **r}
 
 
 # The ChatGPT flow is also two calls over one live pty, but the second one asks
@@ -2408,6 +2460,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_spec_candidates((q.get("lane") or [None])[0]))
             if u.path == "/api/lanes":
                 return self._send(200, do_lanes())
+            if u.path == "/api/deploy":
+                return self._send(200, do_deploy())
             if u.path == "/api/workspaces":
                 return self._send(200, do_workspaces())
             if u.path == "/api/supervisor":
@@ -2599,6 +2653,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_set_backend(body))
             if u.path == "/api/lane/mode":
                 return self._send(200, do_set_lane_mode(body))
+            if u.path == "/api/deploy/login":
+                return self._send(200, do_provider_login(body))
+            if u.path == "/api/deploy/poll":
+                return self._send(200, do_provider_poll())
             if u.path == "/api/auth/start":
                 return self._send(200, do_auth_start())
             if u.path == "/api/auth/code":

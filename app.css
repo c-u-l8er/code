@@ -1040,6 +1040,48 @@ pre.diff, .ruling {
 .lm-flight b { color: var(--fg); }
 .lm-flight ul { margin: 4px 0 0; padding-left: 16px; }
 
+/* ------------------------------------------------------------------ publish
+   Two blocks, in the order the question is actually asked: which credentials
+   work, and then what is waiting on them. The providers are laid out large and
+   the services small, because there are two or three of the first and ten of
+   the second, and ten small rows reading "cannot deploy" would suggest ten
+   problems when there is one. */
+.deploy { padding: 4px 2px 40px; overflow: auto; font-size: 12px; }
+
+/* The number the whole tab exists to show: what the missing credentials cost,
+   stated against the mission rather than as a status. Not red - nothing has
+   gone wrong here, it is a thing only the operator can do. */
+.dep-toll { font-size: 12px; line-height: 1.7; color: var(--muted);
+            border-left: 2px solid var(--warn); padding: 2px 0 2px 12px;
+            margin: 2px 0 16px; }
+.dep-toll b { color: var(--fg); }
+
+/* One provider. Three columns: who it is and what it holds up, what it said
+   when we asked, and the one thing that can be done about it. */
+.dep-id { display: grid; grid-template-columns: 1.1fr 1.6fr auto; gap: 12px;
+          align-items: start; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.dep-id b { font-size: 13px; }
+/* The provider's own words, kept verbatim - a paraphrase of "no access token
+   available" is how a console starts inventing the state of the world. */
+.dep-why { color: var(--muted); font-size: 11.5px; line-height: 1.6; }
+.dep-why code { font-size: 11px; color: #cfe2f5; }
+.dep-bad b { color: var(--warn); }
+.dep-ok { color: var(--ok); font-size: 11.5px; }
+.dep-login {
+  padding: 3px 11px; border-radius: 10px; cursor: pointer; font-size: 11px;
+  background: #23303f; border: 1px solid #3a5570; color: #cfe2f5;
+}
+.dep-login:hover { background: #2c3d51; }
+
+/* The services. Dimmed when stranded, never hidden - a service that cannot be
+   deployed is exactly the one worth being able to see. */
+.dep-list { padding-top: 14px; }
+.dep-row { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px;
+           padding: 5px 0; border-bottom: 1px solid var(--line); }
+.dep-shut b { color: var(--muted); }
+/* Deployable, and no lane owns it: no worker will ever be pointed at it. */
+.dep-orphan { color: var(--warn); }
+
 /* Specs. One lane's design documents and the loop that sharpens them. Plain on
    purpose: the interesting thing on this pane is an argument between two models,
    and styling it as a dashboard would make it look decided. */

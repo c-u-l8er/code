@@ -2757,6 +2757,114 @@ function wireLaneModes() {
   $('btn-set-open').onclick = openSettings;
 }
 
+// ------------------------------------------------------------------- publish
+//
+// The providers go first and the services second, which is the opposite of what
+// the data looks like and the right way round for the question. Ten services
+// were listed as undeployable for two reasons between them; ten rows say "there
+// are ten problems here" when there are two.
+
+function renderDeploy(v) {
+  const ids = (v.identities || []).map((i) => {
+    const mine = (v.targets || []).filter((t) => t.provider === i.provider);
+    // What the missing credential costs, in the only unit that matters here.
+    // "not signed in" is a state; "not signed in, and nine services cannot
+    // deploy because of it" is a reason to do something about it.
+    const cost = mine.length
+      ? `${mine.length} service${mine.length === 1 ? '' : 's'} ` +
+        (i.ok ? 'can deploy' : 'cannot deploy without this')
+      : 'nothing here needs it yet';
+    // A tool that is not installed and a login that has not happened are
+    // different problems with different fixes, and offering to sign in to
+    // something that is not installed sends the operator nowhere.
+    const act = i.ok
+      ? `<span class="dep-ok">signed in as ${esc(i.who || 'someone')}</span>`
+      : !i.installed
+        ? `<span class="muted">not installed</span>`
+        : `<button class="dep-login" data-provider="${esc(i.provider)}">Sign in</button>`;
+    return `<div class="dep-id${i.ok ? '' : ' dep-bad'}">` +
+      `<div><b>${esc(i.provider)}</b><div class="muted">${esc(cost)}</div></div>` +
+      `<div class="dep-why">${i.why ? esc(i.why) : ''}` +
+      (i.ok ? '' : `<div class="muted"><code>${esc(i.signin || '')}</code></div>`) +
+      `</div><div>${act}</div></div>`;
+  }).join('');
+
+  const rows = (v.targets || []).map((t) =>
+    `<div class="dep-row${t.signed_in ? '' : ' dep-shut'}">` +
+    `<div><b>${esc(t.rel)}</b> <span class="muted">${esc(t.marker)}</span></div>` +
+    `<div class="muted">${esc(t.provider)}</div>` +
+    // A deployable service no lane owns is the case worth surfacing: it can be
+    // deployed and no worker is ever going to look at it.
+    `<div>${t.lane ? esc(t.lane) : '<span class="dep-orphan">no lane owns this</span>'}</div>` +
+    `</div>`).join('');
+
+  const head = v.stranded
+    ? `<div class="dep-toll"><b>${v.stranded} of ${(v.targets || []).length} ` +
+      `cannot be deployed at all.</b> The mission moves lanes onto ` +
+      `<b>live_deployed</b>, and a rung moves when evidence moves it &mdash; so each ` +
+      `of these is a service that cannot produce that evidence, no matter how many ` +
+      `workers are pointed at it.` +
+      ((v.lanes_stranded || []).length
+        ? ` Lanes held by it: <b>${v.lanes_stranded.map(esc).join(', ')}</b>.` : '') +
+      `</div>`
+    : `<div class="dep-toll">Every deployable service has a credential that works.</div>`;
+
+  $('dep-out').innerHTML = head + ids +
+    (rows ? `<div class="dep-list">${rows}</div>`
+          : '<span class="muted">nothing deployable found</span>');
+  document.querySelectorAll('.dep-login').forEach((b) => {
+    b.onclick = () => providerLogin(b.dataset.provider);
+  });
+}
+
+async function loadDeploy() {
+  // Said out loud because it is slow and reaches the network: without this the
+  // tab looks broken for the seconds each provider takes to answer.
+  $('dep-status').textContent = 'asking each provider…';
+  try {
+    renderDeploy(await api('/api/deploy'));
+    $('dep-status').textContent = '';
+  } catch (e) {
+    $('dep-out').innerHTML = `<span class="err">${esc(String(e.message || e))}</span>`;
+    $('dep-status').textContent = '';
+  }
+}
+
+/** Start a browser sign-in and keep asking the PROVIDER whether it took.
+ *
+ *  Not the CLI. Both of these print something cheerful before the credential is
+ *  usable, and a console that believed them would report a working sign-in and
+ *  then watch every deploy fail. */
+async function providerLogin(provider) {
+  $('dep-status').textContent = `starting ${provider} sign-in — this can take a moment…`;
+  const r = await post('/api/deploy/login', { provider });
+  if (!r.ok) {
+    $('dep-status').innerHTML = `<span class="err">${esc(r.error || 'could not start it')}</span>`;
+    return;
+  }
+  $('dep-status').innerHTML =
+    `approve it in the browser: <a href="${esc(r.url)}" target="_blank">${esc(r.url)}</a>`;
+  for (let i = 0; i < 300; i++) {
+    await new Promise((s) => setTimeout(s, 2000));
+    const p = await post('/api/deploy/poll', {});
+    if (p.state === 'connected') {
+      $('dep-status').textContent = `${provider}: signed in`;
+      loadDeploy();
+      return;
+    }
+    if (p.state !== 'pending') {
+      $('dep-status').innerHTML =
+        `<span class="err">${esc(p.error || 'sign-in did not complete')}</span>`;
+      return;
+    }
+  }
+  $('dep-status').textContent = 'gave up waiting — press Sign in again when you are ready';
+}
+
+function wireDeploy() {
+  $('btn-dep-reload').onclick = loadDeploy;
+}
+
 function wireDirection() {
   $('dir-auto').onchange = async () => {
     const on = $('dir-auto').checked;
@@ -3905,6 +4013,10 @@ function showTab(name) {
   // Every time, not once: the counts are the point, and a stale `holding 3` is
   // worse than no number at all.
   if (name === 'settings') loadLanes();
+  // On open and nowhere else. Every row here costs a subprocess that reaches the
+  // network, and none of it changes on its own - a credential changes when the
+  // operator signs in, which is the moment they are looking at this tab.
+  if (name === 'publish') loadDeploy();
 }
 
 document.querySelectorAll('.tab').forEach((t) =>
@@ -3927,6 +4039,7 @@ wireGoals();
 wireDirection();
 wireSpecs();
 wireLaneModes();
+wireDeploy();
 wireMission();
 wireReports();
 refresh();
