@@ -3579,6 +3579,7 @@ function renderSolved(r) {
   box.innerHTML = `
     <div class="rp-reading">${esc(r.assessment || '')}</div>
     ${sec('Proposed, and now waiting with the rest',
+  renderMove(ws);
       (r.proposals || []).filter((p) => p.kind === 'goal'),
       (p) => `<li><b>${esc(p.lane)}</b> ${esc(p.text)}<br><span class="muted">${esc(p.why || '')}</span></li>`)}
     ${sec('Open questions it wants settled first',
@@ -3607,10 +3608,104 @@ async function solveReport(rid, btn) {
   btn.disabled = true;
   st.textContent = 'reading the report back and working out what it asks for';
   st.className = 'muted';
+// Moving a lane is the only control in this console that deletes state in order
+// to succeed: a lane leaves one config, some goal files leave one directory, and
+// git relocates a checked-out worktree. So it is two buttons, not one. The first
+// asks and changes nothing; the second only appears once there is an answer on
+// screen to have read, and it goes away again the moment the question changes.
+
+function renderMove(ws) {
+  const lanes = (state.lanes || []).map((l) => l.name);
+  const opt = (v, t) => `<option value="${esc(v)}">${esc(t)}</option>`;
+  const l = $('mv-lane');
+  const lh = lanes.length
+    ? lanes.map((n) => opt(n, n)).join('')
+    : opt('', 'no lanes in this workspace');
+  if (l._html !== lh) { l._html = lh; l.innerHTML = lh; }
+  const t = $('mv-to');
+  const others = (ws.list || []).filter((w) => w.slug !== ws.current);
+  const th = others.length
+    ? others.map((w) => opt(w.slug, w.name)).join('')
+    : opt('', 'there is nowhere else yet');
+  if (t._html !== th) { t._html = th; t.innerHTML = th; }
+  l.disabled = t.disabled = !lanes.length || !others.length;
+  $('btn-mv-check').disabled = l.disabled;
+}
+
+// Any change to what is being asked invalidates the answer on screen, so the
+// answer goes with it. Leaving a stale plan next to a live "Move it" is how you
+// move the lane you were looking at a minute ago.
+function moveReset() {
+  const out = $('mv-out');
+  if (out) out.innerHTML = '';
+  const go = $('btn-mv-do');
+  if (go) go.classList.add('hidden');
+}
+
+function wireMove() {
+  $('mv-lane').onchange = moveReset;
+  $('mv-to').onchange = moveReset;
+
+  $('btn-mv-check').onclick = async () => {
+    const lane = $('mv-lane').value;
+    const to = $('mv-to').value;
+    moveReset();
+    if (!lane || !to) return;
+    // The workspace this screen was showing when the choice was made, sent so
+    // the harness can refuse if something else moved it in between. Another
+    // console against this same state directory is a normal Wednesday here.
+    const r = await post('/api/lane/move',
+      { lane, to, from: (state.workspace || {}).current });
+    const out = $('mv-out');
+    if (!r.ok) {
+      out.innerHTML = `<div class="mv-no">${esc(r.error || 'refused')}</div>`;
+      return;
+    }
+    const left = Object.entries(r.left_behind || {});
+    out.innerHTML =
+      `<div class="mv-go"><b>${esc(lane)}</b> would move from ` +
+      `<b>${esc(r.from)}</b> to <b>${esc(r.to)}</b>.</div>` +
+      `<ul class="mv-list">` +
+      `<li>${r.goals} goal${r.goals === 1 ? '' : 's'} move${r.goals === 1 ? 's' : ''} with it</li>` +
+      `<li>${r.worktree
+        ? 'its worktree moves too, with anything uncommitted in it'
+        : 'no worktree — this lane has never been dispatched'}</li>` +
+      (left.length
+        ? `<li class="mv-stay">stays behind in ${esc(r.from)}: ` +
+          left.map(([k, n]) => `${n} ${esc(k)}`).join(', ') + `</li>`
+        : `<li>nothing else on record mentions it</li>`) +
+      `</ul>`;
+    $('btn-mv-do').classList.remove('hidden');
+  };
+
+  $('btn-mv-do').onclick = async () => {
+    const lane = $('mv-lane').value;
+    const to = $('mv-to').value;
+    if (!lane || !to) return;
+    const b = $('btn-mv-do');
+    b.disabled = true;
+    const r = await post('/api/lane/move',
+      { lane, to, apply: true, from: (state.workspace || {}).current });
+    b.disabled = false;
+    b.classList.add('hidden');
+    if (!r.ok || !r.moved) {
+      $('mv-out').innerHTML =
+        `<div class="mv-no">${esc(r.error || 'nothing moved')}</div>`;
+      return;
+    }
+    $('mv-out').innerHTML =
+      `<div class="mv-did"><b>${esc(lane)}</b> is now in <b>${esc(r.to)}</b>. ` +
+      `Switch to that workspace to see it.</div>`;
+    applyWorkspace(r.workspace);
+    refresh();
+  };
+}
+
   $('rp-solved').innerHTML = '';
   const r = await post('/api/report/solve', { report_id: rid });
   btn.disabled = false;
   if (!r.ok) {
+  moveReset();
     st.textContent = r.error || 'failed';
     st.className = 'err';
     return;
@@ -3918,6 +4013,12 @@ $('set-db-keep').onchange = (e) => dbSet('history_keep', e.target.value);
 $('set-db-sweep').onchange = (e) => dbSet('sweep_min', e.target.value);
 $('btn-db-backup').onclick = dbBackup;
 $('btn-db-verify').onclick = dbVerify;
+    // The lane list is one of the things a poll can change under this control -
+    // a move, an `lane add`, another session - and until this line was here it
+    // went on offering a lane that had already left. Picking it then failed with
+    // "there is no lane called plugins in core", which reads like the operator
+    // got it wrong when it was the screen that was out of date.
+    renderMove(s.workspace);
 $('btn-db-prune').onclick = dbPrune;
 // A plain navigation, not a fetch: the server sends it as an attachment and the
 // browser saves it where the operator keeps things. Holding a 20 MB database in
@@ -4421,3 +4522,4 @@ refresh();
 loadCredits();
 loadChat();
 setInterval(retimeStamps, 15000);
+wireMove();

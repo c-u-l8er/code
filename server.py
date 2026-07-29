@@ -1299,6 +1299,33 @@ def do_supervise() -> dict:
     reason it is a request rather than something a timer does. Nothing it returns
     is carried out - it names drift, it does not stop anything.
     """
+def do_lane_move(body: dict) -> dict:
+    """Move a lane, its goals and its worktree into another workspace.
+
+    Defaults to a DRY RUN, and the caller has to say `apply: true` to make it
+    happen. This is the only call in the console that deletes state as part of
+    succeeding - a lane leaves one config and some goal files leave one
+    directory - so the shape of it is: ask what would happen, read the answer,
+    then say do it.
+    """
+    lane = str(body.get("lane") or "").strip()
+    to = str(body.get("to") or "").strip()
+    if not lane or not to:
+        return {"ok": False, "error": "which lane, and to which workspace?"}
+    apply_ = bool(body.get("apply"))
+    # Which workspace the caller was looking at when it decided. Another console
+    # against this same state directory can move `current` between the dry run
+    # and the apply, and then "the lane I am looking at" names a different lane.
+    frm = str(body.get("from") or "").strip() or None
+    try:
+        out = amp.move_lane(lane, to, dry_run=not apply_, from_slug=frm)
+    except amp.WorkspaceError as e:
+        return {"ok": False, "error": str(e)}
+    if apply_:
+        amp.add_note(f"moved the {lane!r} lane to the {to!r} workspace")
+    return dict(out, workspace=amp.workspace_view())
+
+
     return amp.supervise_workspace()
 
 
@@ -2762,6 +2789,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_restart(body))
             if u.path == "/api/history/note":
                 return self._send(200, do_history_note(body))
+            if u.path == "/api/lane/move":
+                return self._send(200, do_lane_move(body))
             if u.path == "/api/history/ask":
                 return self._send(200, do_history_ask(body))
             if u.path == "/api/preview/start":

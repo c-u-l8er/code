@@ -1550,3 +1550,16 @@ pre.diff, .ruling {
   background: transparent; border: 1px solid var(--line); color: var(--muted);
 }
 .ws-row button:hover { color: var(--fg); border-color: var(--muted); }
+
+/* Moving a lane. The plan and the outcome read differently on purpose: one is a
+   question that has been answered, the other is a thing that has happened. */
+.mv-out { font-size: 12px; margin-top: 6px; }
+.mv-out:empty { display: none; }
+.mv-go { color: var(--fg); }
+.mv-list { margin: 4px 0 0; padding-left: 18px; color: var(--muted); }
+.mv-list .mv-stay { color: #d8b46a; }
+.mv-no { color: var(--bad); }
+.mv-did {
+  color: var(--ok); border-left: 2px solid var(--ok);
+  padding: 4px 0 4px 8px;
+}

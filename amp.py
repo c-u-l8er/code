@@ -2044,6 +2044,139 @@ def claude_token() -> str | None:
 def claude_env() -> dict:
     """Environment for a worker subprocess.
 
+# Every workspace-scoped store that can hold something about ONE lane, and how
+# to find that lane's records in it. Written out rather than discovered, because
+# a store nobody listed is a store whose contents are silently left behind - and
+# the whole point of the report below is that nothing is left behind silently.
+_LANE_STORES = (
+    ("findings", "FINDINGS_PATH", "findings"),
+    ("ideas", "IDEAS_PATH", "ideas"),
+    ("obligations", "OBLIGATIONS_PATH", "obligations"),
+    ("direction proposals", "DIRECTION_PATH", "proposals"),
+    ("reports", "REPORT_PATH", "reports"),
+)
+
+
+def _lane_leftovers(name: str) -> dict:
+    """How many records about this lane each store still holds.
+
+    Counted, not moved. Moving them would mean understanding five schemas well
+    enough to rewrite them, and getting one wrong loses a finding - which is the
+    record of something we believed and acted on. Counting them is honest and
+    cheap, and it turns "some history stayed behind" into a number the operator
+    can decide about.
+    """
+    out = {}
+    for label, gname, key in _LANE_STORES:
+        path = globals().get(gname)
+        if not path:
+            continue
+        blob = load_json(path, {})
+        rows = blob.get(key) if isinstance(blob, dict) else None
+        if not isinstance(rows, list):
+            continue
+        n = sum(1 for r in rows if isinstance(r, dict) and r.get("lane") == name)
+        if n:
+            out[label] = n
+    return out
+
+
+def move_lane(name: str, to_slug: str, *, dry_run: bool = False,
+              from_slug: str | None = None) -> dict:
+    """Move one lane, and the work recorded against it, into another workspace.
+
+    A workspace owns its lanes, its goals and its worktrees, so re-registering
+    the lane in the target and deleting it here would be a data loss dressed as
+    a reorganisation: the goals stay in the old workspace's `goals/`, and the
+    only place that says what this lane was asked to do stops being reachable
+    from the lane. So the goals move with it.
+
+    The worktree moves too, by `git worktree move`, so that uncommitted work in
+    a lane's tree survives the reorganisation. If git refuses - it does when the
+    tree is dirty in ways it cannot replay, or locked - the whole move is
+    refused rather than half-done. A lane whose config lives in one workspace
+    and whose tree is registered under another is a lane that will fail at
+    dispatch time, inside a worker, where nobody can see it.
+
+    What does NOT move is counted and reported. See `_lane_leftovers`.
+
+    `from_slug` is the workspace the caller BELIEVES this lane is in, and the
+    move is refused if that is not true. It reads like belt and braces until you
+    notice that `current` is one field in one shared file with no owner: two
+    consoles against this state directory - which is a normal Wednesday here -
+    fight over it, and the loser is a process that thinks it is in `core` while
+    the registry says `products`. Found live, by watching a second console on
+    another port walk every workspace out from under this one. Without this
+    check, "move the lane I am looking at" is a bet on nobody else having moved
+    the ground since the dry run.
+    """
+    reg = workspaces()
+    frm = reg["current"]
+    if from_slug and from_slug != frm:
+        raise WorkspaceError(
+            f"this asked to move {name!r} out of {from_slug!r}, but the harness is "
+            f"in {frm!r} now - something else moved it. Look again before moving "
+            "anything.")
+    if to_slug not in reg["workspaces"]:
+        raise WorkspaceError(f"there is no workspace called {to_slug!r}")
+    if to_slug == frm:
+        raise WorkspaceError(f"lane {name!r} is already in {frm!r}")
+
+    cfg = config()
+    lane = (cfg.get("lanes") or {}).get(name)
+    if lane is None:
+        raise WorkspaceError(f"there is no lane called {name!r} in {frm!r}")
+
+    # A worker mid-turn is writing into paths that are about to stop existing.
+    # This is the same refusal `switch_blocked` makes, narrowed to one lane.
+    if name in live_worker_lanes():
+        raise WorkspaceError(f"a worker is running in {name!r} - stop it or wait for it")
+
+    dest = workspace_dir(to_slug, reg)
+    dest_cfg_path = dest / "config.json"
+    dest_cfg = load_json(dest_cfg_path, {"lanes": {}, "consult_model": DEFAULT_CONSULT})
+    if name in (dest_cfg.get("lanes") or {}):
+        raise WorkspaceError(f"{to_slug!r} already has a lane called {name!r}")
+
+    mine = [g for g in (load_goal(s["id"]) or {} for s in goals()) if g.get("lane") == name]
+    wt = WORKTREE_DIR / name
+    dest_wt = dest / "worktrees" / name
+    plan = {"ok": True, "lane": name, "from": frm, "to": to_slug,
+            "goals": len(mine), "worktree": str(wt) if wt.exists() else None,
+            "left_behind": _lane_leftovers(name), "moved": False}
+    if dry_run:
+        return plan
+
+    # The worktree first. It is the only step that can fail for a reason outside
+    # this file, and doing it first means a failure leaves everything else where
+    # it was - rather than a config already rewritten to point at a tree that
+    # never arrived.
+    if wt.exists():
+        dest_wt.parent.mkdir(parents=True, exist_ok=True)
+        repo = (ROOT / lane["path"]).resolve()
+        p = run(["git", "worktree", "move", str(wt), str(dest_wt)], cwd=repo)
+        if p.returncode != 0:
+            raise WorkspaceError(
+                f"git would not move {name}'s worktree, so nothing was moved:\n"
+                + (p.stderr or p.stdout).strip()[:400])
+
+    # Write the copy before deleting the original, and go through `save_json` so
+    # the SQLite mirror holds the goal at its new path. A goal moved with
+    # `write_text` would arrive on disk and be invisible to `store`, so the
+    # history of a moved goal would end at the move.
+    (dest / "goals").mkdir(parents=True, exist_ok=True)
+    for g in mine:
+        save_json(dest / "goals" / f"{g['id']}.json", g)
+        goal_path(g["id"]).unlink(missing_ok=True)
+
+    dest_cfg.setdefault("lanes", {})[name] = lane
+    save_json(dest_cfg_path, dest_cfg)
+    cfg["lanes"].pop(name, None)
+    save_json(CONFIG_PATH, cfg)
+    plan["moved"] = True
+    return plan
+
+
     Workers must not depend on whatever credentials the launching shell happens
     to carry - the console has none. Connecting Claude once stores a long-lived
     token here and every worker gets it explicitly.

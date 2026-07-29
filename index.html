@@ -443,6 +443,21 @@ If the architect asks for a file by name it is fetched and sent without another 
       <button id="btn-ws-add">Create</button>
       <span class="muted" id="mi-ws-status"></span>
     </div>
+    <h4>Move a lane</h4>
+    <p class="muted">A lane belongs to one workspace, and so do its goals and its
+    worktree &mdash; so moving it moves all three, and uncommitted work in the
+    worktree comes with it. What is <em>not</em> moved is the history written about
+    the lane elsewhere: findings, proposals and reports stay with the workspace that
+    recorded them. Ask first, and it says how many of each before you decide.</p>
+    <div class="row">
+      <select id="mv-lane"></select>
+      <span class="muted">to</span>
+      <select id="mv-to"></select>
+      <button id="btn-mv-check">What would move?</button>
+      <button id="btn-mv-do" class="primary hidden">Move it</button>
+    </div>
+    <div id="mv-out" class="mv-out"></div>
+
 
     <div class="row"><button id="btn-mi-close">Close</button></div>
   </div>
