@@ -1185,6 +1185,24 @@ pre.diff, .ruling {
 .sp-n b { color: var(--fg); font-weight: 500; }
 .sp-n.ok b { color: var(--ok); }
 .sp-n.warn { color: var(--warn); }
+/* What is already live. A second heading inside the same pane, because the two
+   halves answer different questions and the second one has no buttons at all. */
+.dep-h { margin: 26px 0 0; padding-top: 18px; border-top: 1px solid var(--line);
+         font-size: 14px; }
+/* Serving something older than the tree. The same amber as a stranded service,
+   and for the same reason: finished work nobody outside this machine can see. */
+.dep-stale b { color: var(--warn); }
+/* The comparison did not happen - a sha this clone has never seen, or a project
+   that has never deployed. Deliberately NOT green and NOT amber: it is neither
+   agreement nor disagreement, and colouring it as either would be a claim. */
+.dep-unknown { color: var(--muted); font-size: 10.5px; }
+.dep-row code { font-size: 10.5px; color: var(--accent); }
+/* A build that did not finish. Red, and above the live line rather than in
+   place of it: the site is still up, serving the commit underneath. */
+.dep-broke { font-size: 11px; color: var(--bad); margin-top: 3px; }
+.dep-broke b { color: var(--bad); }
+.dep-alarm { border-left: 2px solid var(--bad); padding-left: 8px; }
+
 .sp-n.live { color: #cfe2f5; }
 /* The one number that decides anything. */
 .sp-n.worth b { color: #cfe2f5; }

@@ -1879,6 +1879,17 @@ def do_deploy_run(body: dict) -> dict:
     reached either because a field was omitted is the wrong default.
     """
     return amp.start_deploy((body.get("key") or "").strip(),
+def do_deploy_pages() -> dict:
+    """Every Cloudflare Pages site, and which commit each one is serving.
+
+    Its own call rather than part of `do_deploy`, because it is a wrangler
+    start-up per project - thirty-eight of them - and the answer to "which
+    credential is missing" should not wait behind the answer to "which commit is
+    live". The tab paints the first, then fills in the second.
+    """
+    return {"ok": True, **amp.cf_pages_view()}
+
+
                             publish=body.get("publish") is True)
 
 
@@ -2634,6 +2645,8 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/db/history":
                 return self._send(200, do_db_history((q.get("path") or [""])[0]))
             if u.path == "/api/db/changes":
+            if u.path == "/api/deploy/pages":
+                return self._send(200, do_deploy_pages())
                 # The feed a cloud sync will read. Exposed now because a sync
                 # that has to be designed against a database with no change
                 # log is a rewrite, not a feature.

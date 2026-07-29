@@ -336,6 +336,15 @@ If the architect asks for a file by name it is fetched and sent without another 
       shown is what a deploy would actually find rather than what a config file claims.
       Signing in opens a page in the browser; the console keeps asking the provider until
       the provider says yes &mdash; never until the CLI says so.</p>
+
+      <h3 class="dep-h">What is already live</h3>
+      <p class="muted">Cloudflare&rsquo;s own answer, not a config file&rsquo;s. Every one
+      of these Pages sites is built by Cloudflare when a commit lands on GitHub, so
+      there is nothing here to press &mdash; <b>the deploy is a push</b>. What is worth
+      knowing is the commit each site is serving, set against the commit in the tree:
+      that is the one claim about <code>live_deployed</code> on this screen that nobody
+      had to be trusted for.</p>
+      <div id="cf-out" class="deploy"><span class="muted">not asked yet</span></div>
       <div id="dep-out" class="deploy">loading&hellip;</div>
     </div>
   </section>

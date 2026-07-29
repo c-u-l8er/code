@@ -3345,6 +3345,105 @@ function svList(items, cls, extra) {
 
 function renderSupervisor(sup) {
   const el = $('mi-sup');
+// ------------------------------------------------------ what is already live
+//
+// The rest of this tab answers "could this be deployed". This answers "what IS
+// deployed", and it had been answering it from `wrangler.toml` - which found
+// exactly one Cloudflare service on an account serving twenty-two sites out of
+// this workspace, because every one of them is built by Cloudflare from a git
+// push and none of them is deployed from this machine.
+//
+// So there is no button on these rows, deliberately. `wrangler pages deploy`
+// would upload a build that no commit produced, straight past the integration
+// that owns the site - a deployment nobody could trace back to a sha, which is
+// the exact shape of the `live_deployed` claim this tab exists to make
+// checkable. The row carries the two commits and says nothing else.
+
+function renderPages(v) {
+  if (!v.asked) {
+    $('cf-out').innerHTML =
+      `<div class="dep-toll">${esc(v.why || 'Cloudflare would not say')}</div>`;
+    return;
+  }
+  const rows = (v.sites || []).map((s) => {
+    const g = s.git_state || {};
+    const live = s.live || {};
+    // Three states, and they are not degrees of the same thing. Level and
+    // behind are both comparisons that happened; the third is the comparison
+    // REFUSING to happen, and it must not read like agreement.
+    const dist = !s.rel
+      ? '<span class="dep-orphan">no directory here builds this</span>'
+      : g.ahead === null || g.ahead === undefined
+        ? `<span class="dep-unknown">${esc(g.why || 'never deployed')}</span>`
+        : g.ahead === 0
+          ? '<span class="dep-ok">serving HEAD</span>'
+          : `<span class="dep-behind">${g.ahead} commit${g.ahead === 1 ? '' : 's'} behind</span>`;
+    // A build that broke sits ABOVE the live line, not instead of it, because
+    // they are two facts and the site is still serving the older one. Reading
+    // the newest deployment as the live one is the mistake this section made
+    // for an hour: `docs` was reported live at a commit its build never
+    // finished, with a confident number beside it.
+    const f = live.failed;
+    const broke = f
+      ? `<div class="dep-broke">last build <b>${esc(f.state || 'did not finish')}</b>` +
+        (f.sha ? ` at <code>${esc(f.sha)}</code>` : '') +
+        ` &mdash; so the site is still serving what is below</div>`
+      : '';
+    // Every custom domain, and the pages.dev one dropped: the first is what the
+    // world types and the second is Cloudflare's plumbing.
+    const doms = (s.domains || []).filter((d) => !d.endsWith('.pages.dev'));
+    return `<div class="dep-row${s.stale ? ' dep-stale' : ''}${s.broken ? ' dep-broken' : ''}">` +
+      `<div><b>${esc(s.name)}</b> ` +
+      `<span class="muted">${doms.length ? esc(doms.join(', ')) : 'no custom domain'}</span>` +
+      broke +
+      `<div class="dep-last">` +
+      (live.sha
+        ? `live <code>${esc(live.sha)}</code>` +
+          (live.branch ? ` from ${esc(live.branch)}` : '') +
+          (g.head ? ` &middot; here <code>${esc(g.head)}</code>` : '') +
+          (live.age ? ` &middot; ${esc(live.age)}` : '')
+        : '<span class="muted">no production deployment</span>') +
+      `</div></div>` +
+      `<div class="muted">${esc(s.rel || '—')}</div>` +
+      `<div>${s.lane ? esc(s.lane) : '<span class="dep-orphan">no lane owns this</span>'}</div>` +
+      `<div class="dep-act">${dist}</div>` +
+      `</div>`;
+  }).join('');
+
+  // Above the stale count, because it is a different problem and it outranks
+  // it: "push again" is the fix for behind, and it is exactly what has already
+  // been tried on a site whose build is failing.
+  const broken = v.broken
+    ? `<div class="dep-toll dep-alarm"><b>${v.broken} site${v.broken === 1 ? '' : 's'} ` +
+      `${v.broken === 1 ? 'has' : 'have'} a production build that did not finish.</b> ` +
+      `Cloudflare kept serving the previous commit, so nothing is down &mdash; but the ` +
+      `commit that was pushed is not live and pushing it again will not change that.` +
+      ((v.lanes_broken || []).length
+        ? ` Lanes holding one: <b>${v.lanes_broken.map(esc).join(', ')}</b>.` : '') +
+      `</div>`
+    : '';
+
+  const head = v.stale
+    ? `<div class="dep-toll"><b>${v.stale} site${v.stale === 1 ? '' : 's'} ` +
+      `${v.stale === 1 ? 'is' : 'are'} serving a commit older than the tree.</b> ` +
+      `That work is finished, committed, and nobody outside this machine can see it. ` +
+      `These deploy on a push, so the fix is a push.` +
+      ((v.lanes_stale || []).length
+        ? ` Lanes holding one: <b>${v.lanes_stale.map(esc).join(', ')}</b>.` : '') +
+      `</div>`
+    : `<div class="dep-toll">Every site with a directory here is serving that directory&rsquo;s HEAD.</div>`;
+
+  const orph = v.orphans
+    ? `<div class="dep-toll muted">${v.orphans} of ${(v.sites || []).length} are built from ` +
+      `somewhere other than this workspace. They are listed so that the number on this ` +
+      `screen is the whole account rather than the part of it we recognise.</div>`
+    : '';
+
+  $('cf-out').innerHTML = broken + head + orph +
+    (rows ? `<div class="dep-list">${rows}</div>`
+          : '<span class="muted">no Pages projects on this account</span>');
+}
+
   const last = (sup || {}).last;
   if (!last) {
     el.innerHTML = '<div class="muted">No reading yet. Nothing has been held against ' +
@@ -3356,6 +3455,17 @@ function renderSupervisor(sup) {
     `<div class="verdict ${esc(v)}">${esc(VERDICT_WORD[v] || v)}` +
     `<span class="muted"> · ${esc(last.at || '')}` +
     (sup.stale ? ` · ${sup.since} change${sup.since === 1 ? '' : 's'} since` : '') +
+  // After, not with. This is a wrangler start-up per project and there are
+  // thirty-eight of them; making "which credential is missing" wait behind
+  // "which commit is live" would put half a minute in front of the answer the
+  // operator opened the tab for.
+  $('cf-out').innerHTML =
+    '<span class="muted">asking Cloudflare which commit each site is serving…</span>';
+  try {
+    renderPages(await api('/api/deploy/pages'));
+  } catch (e) {
+    $('cf-out').innerHTML = `<span class="err">${esc(String(e.message || e))}</span>`;
+  }
     `</span></div>` +
     `<div class="md">${md(last.summary || '')}</div>` +
     // Drift first. It is the only part of a reading that says something here is

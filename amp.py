@@ -7574,6 +7574,292 @@ def _npm_registry(package: str) -> dict:
     except ValueError:
         return {"versions": [], "latest": None, "known": False}
     v = [str(x) for x in (v if isinstance(v, list) else [v])]
+# --------------------------------------------------------- cloudflare pages
+#
+# `deploy_targets` finds one Cloudflare thing in this workspace, because it
+# looks for `wrangler.toml`. The account has THIRTY-EIGHT Pages projects, and
+# every one of them reports `Git Provider: Yes` - they are built by Cloudflare
+# when a commit lands on GitHub. There is no `wrangler.toml` to find because
+# nothing is deployed from this machine.
+#
+# So the Publish tab was reporting one deployable service on an account serving
+# twenty-two sites out of this workspace, and the mission's own question - which
+# lanes are on `live_deployed` - was being answered from the wrong evidence
+# entirely. The tab said `0 stranded` and meant it, and it was still blind.
+#
+# The fix is not a Publish button. For a git-connected project a `wrangler pages
+# deploy` is a DIRECT UPLOAD that competes with the git integration: it would
+# put a deployment on the account that no commit produced, which is precisely
+# the unfalsifiable `live_deployed` claim this whole section exists to prevent.
+# The deploy for these is a push, and the harness already has a tab for that.
+#
+# What is worth having is the thing only Cloudflare knows: WHICH COMMIT IS LIVE.
+# Set against the commit in the tree, that is a checkable sentence about the
+# world - "graphonomous.com is serving e648036, which is HEAD" or "pulse is two
+# commits behind" - and it is the first `live_deployed` evidence in this file
+# that nobody had to be trusted for.
+
+# Asking costs a wrangler start-up per project - about four seconds - and the
+# answer changes when a build finishes, not when a tab is opened. Five minutes
+# is long enough that clicking around the console does not re-ask, and short
+# enough that a deploy you just triggered shows up while you are still watching
+# for it.
+CF_TTL = 300
+_CF_CACHE: dict[str, tuple[float, object]] = {}
+_CF_LOCK = threading.Lock()
+
+
+def _cf(cmd: list[str], timeout: int = 60):
+    """One wrangler question, answered in JSON, or None.
+
+    None for every failure - not installed, not signed in, timed out, or
+    answering something that is not JSON - because there is exactly one thing
+    the caller can do about any of them and the identity row above already says
+    which it is. What must NOT happen is a half-answer: a project list that came
+    back empty because nobody is signed in reads identically to an account with
+    no projects, and one of those is a fact about Cloudflare while the other is
+    a fact about this laptop.
+    """
+    if not shutil.which(cmd[0]):
+        return None
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    # wrangler prints a version banner above the JSON, so this cannot just be
+    # `json.loads(stdout)` - it finds where the document starts.
+    text = r.stdout
+    i = min((text.find(c) for c in "[{" if text.find(c) >= 0), default=-1)
+    if i < 0:
+        return None
+    try:
+        return json.loads(text[i:])
+    except ValueError:
+        return None
+
+
+def cf_projects() -> list[dict] | None:
+    """Every Pages project on the account. None if Cloudflare would not say.
+
+    `--json` here is the table's own columns, not the API's record: a name, the
+    domains, whether a git provider is attached, and a RELATIVE time. That last
+    one is carried through as the string wrangler said rather than parsed into a
+    date, because "1 month ago" is not a timestamp and turning it into one would
+    invent a precision the answer does not have.
+    """
+    with _CF_LOCK:
+        hit = _CF_CACHE.get("projects")
+        if hit and time.time() - hit[0] < CF_TTL:
+            return hit[1]
+    raw = _cf(["wrangler", "pages", "project", "list", "--json"], timeout=90)
+    out = None
+    if isinstance(raw, list):
+        out = [{"name": str(p.get("Project Name") or ""),
+                "domains": [d.strip() for d in
+                            str(p.get("Project Domains") or "").split(",") if d.strip()],
+                "git": str(p.get("Git Provider") or "").strip().lower() == "yes",
+                "modified": str(p.get("Last Modified") or "")}
+               for p in raw if isinstance(p, dict) and p.get("Project Name")]
+    with _CF_LOCK:
+        _CF_CACHE["projects"] = (time.time(), out)
+    return out
+
+
+# The one shape wrangler's `Status` column takes when the build worked.
+#
+# That column is overloaded and there is no flag that says which way: a
+# deployment that succeeded prints a relative time there, and one that did not
+# prints a word - `Failure` is the one measured, on `docs`. So this matches the
+# SUCCESS shape and treats everything else as not-success, rather than listing
+# the failure words. Listing them is a bet that Cloudflare has no fourth word,
+# and losing that bet fails the safe way round only if the check is written this
+# way up: an unrecognised word must mean "I will not call this live".
+_CF_AGE = re.compile(r"^\d+\s+\w+\s+ago$", re.I)
+
+
+def _cf_deployment(d: dict) -> dict:
+    """One row of wrangler's deployment table, with the overloaded column split.
+
+    `age` and `state` are the same column read two ways, and only one of them is
+    ever set - which is the honest representation of a field that holds either a
+    time or an outcome and never says which.
+    """
+    when = str(d.get("Status") or "").strip()
+    good = bool(_CF_AGE.match(when))
+    return {"sha": str(d.get("Source") or "").strip() or None,
+            "branch": str(d.get("Branch") or "").strip() or None,
+            "url": str(d.get("Deployment") or "").strip() or None,
+            "ok": good,
+            "age": when if good else None,
+            "state": None if good else (when or "no outcome given"),
+            "id": str(d.get("Id") or "").strip() or None}
+
+
+def cf_live(project: str) -> dict | None:
+    """What this project is SERVING, and separately what it last tried to build.
+
+    Production only. A preview deployment is a branch someone pushed, it has a
+    url that works, and citing one as the state of the site would be a true
+    sentence about a deployment and a false one about what the world sees.
+
+    And not simply the newest row, which is what this did first and what got it
+    wrong within an hour of being switched on. `docs` had a production
+    deployment of `765d385` at the top of the list with `Failure` against it -
+    the build broke, so the site kept serving `cd092d0` underneath. Reading row
+    zero as the live commit reported a site as up to date at a commit it has
+    never served, and put the number four next to it. A deployment existing is
+    not a site serving it, and that is the whole distinction this file is for.
+
+    So `sha` is the newest deployment that SUCCEEDED, and a newer one that did
+    not is carried beside it under `failed` rather than in place of it. A broken
+    build is not missing information - it is the most actionable thing on the
+    tab - but it is a different fact from what the world is being served.
+    """
+    key = f"live:{project}"
+    with _CF_LOCK:
+        hit = _CF_CACHE.get(key)
+        if hit and time.time() - hit[0] < CF_TTL:
+            return hit[1]
+    raw = _cf(["wrangler", "pages", "deployment", "list",
+               "--project-name", project, "--environment", "production", "--json"])
+    out = None
+    if isinstance(raw, list) and raw:
+        rows = [_cf_deployment(d) for d in raw if isinstance(d, dict)]
+        live = next((r for r in rows if r["ok"]), None)
+        # Only a failure NEWER than what is live. An old broken build with a
+        # good one on top of it is a thing that happened, not a thing that is
+        # wrong, and reporting it would put a red flag on a healthy site.
+        newest = rows[0] if rows else None
+        failed = newest if (newest and not newest["ok"] and newest is not live) else None
+        if live or failed:
+            out = dict(live or {"sha": None, "branch": None, "url": None,
+                                "ok": False, "age": None, "state": None, "id": None},
+                       failed=({"sha": failed["sha"], "state": failed["state"],
+                                "url": failed["url"]} if failed else None))
+    with _CF_LOCK:
+        _CF_CACHE[key] = (time.time(), out)
+    return out
+
+
+def _cf_slug(s: str) -> str:
+    """One spelling for two naming conventions that have to meet.
+
+    Cloudflare project names cannot hold a dot, so `WebHost.Systems` is
+    `webhost-systems` there and `graphonomous.com` is `graphonomous-com`.
+    Folding both to the same shape is what lets a directory find its site.
+    """
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
+
+
+def _cf_dirs() -> dict[str, Path]:
+    """Every directory a Pages project could plausibly be built from, by slug.
+
+    Two levels, matching `deploy_targets`, and first one wins on a collision:
+    the shallower directory is the project and the deeper one is a part of it.
+    """
+    skip = {"node_modules", ".git", "_build", "deps", "old_scrap", "dist", ".amp"}
+    out: dict[str, Path] = {}
+    for p in sorted(ROOT.glob("*")) + sorted(ROOT.glob("*/*")):
+        if not p.is_dir() or skip & set(p.parts):
+            continue
+        out.setdefault(_cf_slug(p.name), p)
+    return out
+
+
+def _cf_match(proj: dict, dirs: dict[str, Path]) -> Path | None:
+    """Which directory in this workspace builds this site, if any is obvious.
+
+    Three spellings tried in order - the project name, each custom domain, and
+    each domain with its TLD dropped - and nothing else. Stripping SUBDOMAINS
+    would join `zapp.bendscript.com` to `bendscript.com/`, and then the commit
+    distance on that row would be a confident number about the wrong repository.
+    A miss is a fine answer here: a site nobody in this workspace builds is a
+    real thing to have found, and it is reported as one.
+    """
+    doms = [d for d in proj.get("domains") or [] if not d.endswith(".pages.dev")]
+    tried = [_cf_slug(proj.get("name") or "")]
+    tried += [_cf_slug(d) for d in doms]
+    tried += [_cf_slug(d.rsplit(".", 1)[0]) for d in doms if "." in d]
+    for s in tried:
+        if s and s in dirs:
+            return dirs[s]
+    return None
+
+
+def _cf_distance(d: Path, sha: str | None) -> dict:
+    """The live commit against the local one, or an honest refusal to say.
+
+    `ahead` is only ever set when git could resolve the deployed sha in THIS
+    repository. A short sha that this clone has never seen means the project is
+    built from somewhere else - a different repo, a fork, or a directory this
+    join guessed wrong - and answering "0 commits behind" to that would be the
+    worst available answer: it looks like agreement.
+    """
+    head = run(["git", "-C", str(d), "rev-parse", "--short", "HEAD"])
+    local = head.stdout.strip() if head.returncode == 0 else None
+    if not sha or not local:
+        return {"head": local, "ahead": None,
+                "why": None if local else "not a git repository here"}
+    known = run(["git", "-C", str(d), "cat-file", "-e", f"{sha}^{{commit}}"])
+    if known.returncode != 0:
+        return {"head": local, "ahead": None,
+                "why": f"this clone has no commit {sha} - the site is built from elsewhere"}
+    n = run(["git", "-C", str(d), "rev-list", "--count", f"{sha}..HEAD"])
+    if n.returncode != 0:
+        return {"head": local, "ahead": None, "why": last_line(redact(n.stderr))}
+    return {"head": local, "ahead": int(n.stdout.strip() or 0), "why": None}
+
+
+def cf_pages_view() -> dict:
+    """Every Pages site, what commit it is serving, and how far that is behind.
+
+    The one number worth putting at the top is `stale`: sites whose live commit
+    is not the commit in the tree. Each one is finished work that exists here
+    and that nobody outside this machine can see - the same sentence the npm
+    half of this tab already says about packages, asked of the web.
+    """
+    projects = cf_projects()
+    if projects is None:
+        return {"asked": False, "sites": [], "stale": 0, "orphans": 0,
+                "why": "Cloudflare would not say - see the cloudflare row above"}
+    dirs = _cf_dirs()
+    lanes = {}
+    for name, cfg in (config().get("lanes") or {}).items():
+        lanes.setdefault(str((ROOT / ((cfg or {}).get("path") or "")).resolve()), name)
+    sites = [{"name": p["name"], "domains": p["domains"], "git": p["git"],
+              "modified": p["modified"], "dir": _cf_match(p, dirs)} for p in projects]
+
+    # In parallel, one wrangler per site, each writing only into its own row.
+    def ask(s):
+        s["live"] = cf_live(s["name"])
+    threads = [threading.Thread(target=ask, args=(s,), daemon=True) for s in sites]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=90)
+
+    for s in sites:
+        d = s.pop("dir")
+        s.setdefault("live", None)
+        s["rel"] = str(d.relative_to(ROOT)) if d else None
+        s["lane"] = lanes.get(str(d.resolve())) if d else None
+        s["git_state"] = _cf_distance(d, (s["live"] or {}).get("sha")) if d else None
+        s["stale"] = bool(s["git_state"] and s["git_state"].get("ahead"))
+        # A site whose newest build FAILED is a different problem from a site
+        # that is merely behind, and it outranks it: pushing again is the fix
+        # for behind, and it is exactly what has already been tried here.
+        s["broken"] = bool((s["live"] or {}).get("failed"))
+    sites.sort(key=lambda s: (s["rel"] is None, not s["broken"], not s["stale"], s["name"]))
+    return {"asked": True, "why": None, "sites": sites,
+            "stale": sum(1 for s in sites if s["stale"]),
+            "broken": sum(1 for s in sites if s["broken"]),
+            "orphans": sum(1 for s in sites if not s["rel"]),
+            "lanes_stale": sorted({s["lane"] for s in sites if s["stale"] and s["lane"]}),
+            "lanes_broken": sorted({s["lane"] for s in sites if s["broken"] and s["lane"]})}
+
+
     return {"versions": v, "latest": v[-1] if v else None, "known": True}
 
 
