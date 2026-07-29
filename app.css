@@ -1076,8 +1076,31 @@ pre.diff, .ruling {
 /* The services. Dimmed when stranded, never hidden - a service that cannot be
    deployed is exactly the one worth being able to see. */
 .dep-list { padding-top: 14px; }
-.dep-row { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px;
-           padding: 5px 0; border-bottom: 1px solid var(--line); }
+.dep-row { display: grid; grid-template-columns: 2fr 0.7fr 0.9fr auto; gap: 12px;
+           padding: 7px 0; border-bottom: 1px solid var(--line); align-items: start; }
+/* The row's own history: what was last shipped from here, from which commit,
+   and what something outside the deploy tool said afterwards. Small, because on
+   a healthy row it is the least interesting line on the screen - and it is the
+   entire point of the tab on an unhealthy one. */
+.dep-last { font-size: 11px; margin-top: 3px; }
+.dep-act { display: flex; gap: 6px; }
+.dep-check, .dep-go {
+  padding: 3px 11px; border-radius: 10px; cursor: pointer; font-size: 11px;
+  background: #23303f; border: 1px solid #3a5570; color: #cfe2f5;
+}
+.dep-check:hover { background: #2c3d51; }
+/* Publish is the only button in this console that spends money and changes
+   something nobody can revert from here. It does not look like Check. */
+.dep-go { background: #3a2a1b; border-color: #6d4a25; color: #f0c98a; }
+.dep-go:hover { background: #4a3622; }
+/* Spans the row, so a provider's output is not squeezed into one column. */
+.dep-log { grid-column: 1 / -1; font-size: 11px; }
+.dep-log:empty { display: none; }
+.dep-tail { margin: 4px 0 0; padding: 6px 8px; background: #0e141b;
+            border-radius: 6px; max-height: 150px; overflow: auto;
+            white-space: pre-wrap; font-size: 10.5px; color: var(--muted); }
+.dep-tail:empty { display: none; }
+.dep-behind { color: var(--warn); font-size: 10.5px; }
 .dep-shut b { color: var(--muted); }
 /* Deployable, and no lane owns it: no worker will ever be pointed at it. */
 .dep-orphan { color: var(--warn); }

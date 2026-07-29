@@ -2790,12 +2790,28 @@ function renderDeploy(v) {
   }).join('');
 
   const rows = (v.targets || []).map((t) =>
-    `<div class="dep-row${t.signed_in ? '' : ' dep-shut'}">` +
-    `<div><b>${esc(t.rel)}</b> <span class="muted">${esc(t.marker)}</span></div>` +
+    `<div class="dep-row${t.signed_in ? '' : ' dep-shut'}" data-key="${esc(t.key)}">` +
+    `<div><b>${esc(t.rel)}</b> ` +
+    (t.package
+      // Both numbers, side by side, rather than a verdict. Which of them is
+      // ahead is a judgement about intent - a hotfix published from another
+      // machine looks identical to a version waiting to go out - and the two
+      // numbers are the fact.
+      ? `<span class="muted">${esc(t.package)}@${esc(t.version)}</span>` +
+        (t.unpublished
+          ? ` <span class="dep-behind">not on the registry; its latest is ` +
+            `${t.registry ? esc(t.registry) : 'nothing at all'}</span>`
+          : '')
+      : `<span class="muted">${esc(t.marker)}</span>`) +
+    `<div class="dep-last">${lastPublish(t.last)}</div></div>` +
     `<div class="muted">${esc(t.provider)}</div>` +
     // A deployable service no lane owns is the case worth surfacing: it can be
     // deployed and no worker is ever going to look at it.
     `<div>${t.lane ? esc(t.lane) : '<span class="dep-orphan">no lane owns this</span>'}</div>` +
+    `<div class="dep-act">` +
+    `<button class="dep-check" data-key="${esc(t.key)}">Check</button>` +
+    `<button class="dep-go" data-key="${esc(t.key)}">Publish</button></div>` +
+    `<div class="dep-log" data-log="${esc(t.key)}"></div>` +
     `</div>`).join('');
 
   const head = v.stranded
@@ -2809,12 +2825,109 @@ function renderDeploy(v) {
       `</div>`
     : `<div class="dep-toll">Every deployable service has a credential that works.</div>`;
 
-  $('dep-out').innerHTML = head + ids +
+  // The other half of the toll, and the one nothing else in the console can
+  // see: work that is finished, committed, and has never left this machine.
+  const waiting = (v.waiting || []).length
+    ? `<div class="dep-toll"><b>${v.waiting.length} package${v.waiting.length === 1 ? '' : 's'} ` +
+      `${v.waiting.length === 1 ? 'carries a version' : 'carry versions'} the registry does not ` +
+      `serve.</b> Nobody outside this machine can install that version. Some of these are a tree that is BEHIND the registry rather than ahead of it &mdash; the two numbers on the row say which.</div>`
+    : '';
+
+  $('dep-out').innerHTML = head + waiting + ids +
     (rows ? `<div class="dep-list">${rows}</div>`
           : '<span class="muted">nothing deployable found</span>');
   document.querySelectorAll('.dep-login').forEach((b) => {
     b.onclick = () => providerLogin(b.dataset.provider);
   });
+  document.querySelectorAll('.dep-check').forEach((b) => {
+    b.onclick = () => runDeploy(b.dataset.key, false);
+  });
+  document.querySelectorAll('.dep-go').forEach((b) => {
+    b.onclick = () => confirmPublish(b.dataset.key);
+  });
+}
+
+/** The last publish of one target, in one line, with both halves kept apart.
+ *
+ *  `exit 0` and `GET … → 200` are two different claims and this never merges
+ *  them into one word. A run that the tool called a success and that nothing
+ *  outside the tool confirmed reads as `unverified`, which is the state that
+ *  stops it being cited for `live_deployed`. */
+function lastPublish(r) {
+  if (!r) return '<span class="muted">never published from here</span>';
+  const cls = { done: 'ok', unverified: 'warn', failed: 'err' }[r.state] || 'muted';
+  const outside = r.verify
+    ? `${esc(r.verify.how)} &rarr; ${esc(String(r.verify.answer))}`
+    : 'nothing outside it was asked';
+  return `<span class="${cls}">${esc(r.state)}</span> ` +
+    `<span class="muted">${esc((r.at || '').slice(0, 16))} ` +
+    `at ${esc(r.sha || 'an unnamed commit')} &middot; exit ${esc(String(r.exit))} ` +
+    `&middot; ${outside}</span>`;
+}
+
+/** Ask what would stop this, show it, and make the operator say yes to THAT.
+ *
+ *  The confirm quotes the preflight rather than asking "are you sure?", because
+ *  the thing worth confirming is not the intent, it is the specific facts: this
+ *  commit, this directory, this provider, and - for npm - a version that the
+ *  registry does not have yet. A dialog that says "are you sure?" is a dialog
+ *  everybody clicks through. */
+async function confirmPublish(key) {
+  setDepLog(key, 'checking what would stop it…');
+  const p = await post('/api/deploy/preflight', { key });
+  if (!p.ok) { setDepLog(key, `<span class="err">${esc(p.error)}</span>`); return; }
+  const pre = p.preflight;
+  if (pre.blockers.length) {
+    setDepLog(key, `<span class="err">will not publish: ${esc(pre.blockers.join('; '))}</span>`);
+    return;
+  }
+  const lines = [`Publish ${key}`, `commit ${pre.sha || '(none)'}`]
+    .concat(pre.notes).join('\n');
+  if (!confirm(lines + '\n\nThis reaches production and costs money. Go?')) {
+    setDepLog(key, 'not published');
+    return;
+  }
+  runDeploy(key, true);
+}
+
+function setDepLog(key, html) {
+  const el = document.querySelector(`[data-log="${CSS.escape(key)}"]`);
+  if (el) el.innerHTML = html;
+}
+
+/** Start one run and follow it until it stops.
+ *
+ *  Polled rather than streamed because a Fly build takes minutes and a request
+ *  held open that long is a request that dies to a proxy somewhere. Every line
+ *  shown here is a line the provider printed - see `redact` on the way out. */
+async function runDeploy(key, publish) {
+  const r = await post('/api/deploy/run', { key, publish });
+  if (!r.ok) { setDepLog(key, `<span class="err">${esc(r.error)}</span>`); return; }
+  for (;;) {
+    const s = await post('/api/deploy/status', { key });
+    const run = s.run || {};
+    const tail = (run.output || '').split('\n').slice(-8).join('\n');
+    // A finished PUBLISH gets the full line, with the outside question on it. A
+    // finished CHECK gets its command and its exit and nothing more, because a
+    // dry run is not evidence that anything shipped and dressing it in the same
+    // words would make it look like it was.
+    const head = s.running
+      ? `<span class="muted">${esc(run.cmd)} — running…</span>`
+      : run.mode === 'publish'
+        ? lastPublish(run)
+        : `<span class="${run.exit === 0 ? 'ok' : 'err'}">${esc(run.cmd)} ` +
+          `&rarr; exit ${esc(String(run.exit))}</span> ` +
+          `<span class="muted">(a check, not a publish)</span>`;
+    setDepLog(key, `${head}<pre class="dep-tail">${esc(tail)}</pre>`);
+    if (!s.running) {
+      // The row's own summary line is now stale, and reloading is how it gets
+      // the new one - along with any npm version the registry has just started
+      // serving.
+      if (publish) loadDeploy();
+      return;
+    }
+    await new Promise((k) => setTimeout(k, 1500));
+  }
 }
 
 async function loadDeploy() {

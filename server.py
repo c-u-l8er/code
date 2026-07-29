@@ -1830,6 +1830,54 @@ def do_deploy() -> dict:
     return {"ok": True, **amp.deploy_view()}
 
 
+def do_deploy_preflight(body: dict) -> dict:
+    """Everything that would stop one publish. The same code that gates it.
+
+    Deliberately the same call `start_deploy` makes rather than a second
+    description of the rules, so the sentence the operator reads before pressing
+    Publish and the sentence that refuses the publish cannot disagree.
+    """
+    key = (body.get("key") or "").strip()
+    t = next((x for x in amp.deploy_targets() if amp.deploy_key(x) == key), None)
+    if not t:
+        return {"ok": False, "error": f"nothing here is called {key!r}"}
+    return {"ok": True, "target": t, "preflight": amp.deploy_preflight(t)}
+
+
+def do_deploy_run(body: dict) -> dict:
+    """Start one check, or one real publish.
+
+    `publish` has to arrive as exactly `true` and is false by default: the
+    difference between these two is money and production, and a default that
+    reached either because a field was omitted is the wrong default.
+    """
+    return amp.start_deploy((body.get("key") or "").strip(),
+                            publish=body.get("publish") is True)
+
+
+def do_deploy_status(body: dict) -> dict:
+    """How the running one is doing, or how the last one went."""
+    key = (body.get("key") or "").strip()
+    live = amp.deploy_status(key)
+    if live:
+        return {"ok": True, "run": live, "running": True}
+    past = [r for r in amp.deploy_runs() if r.get("key") == key]
+    return {"ok": True, "run": past[-1] if past else None, "running": False}
+
+
+def do_deploy_cancel(body: dict) -> dict:
+    return amp.cancel_deploy((body.get("key") or "").strip())
+
+
+def do_deploy_history(body: dict) -> dict:
+    """Every publish recorded, newest first - the evidence for the rung."""
+    rows = amp.deploy_runs()
+    lane = (body.get("lane") or "").strip()
+    if lane:
+        rows = [r for r in rows if r.get("lane") == lane]
+    return {"ok": True, "runs": list(reversed(rows))[:100]}
+
+
 def do_set_lane_mode(body: dict) -> dict:
     """Change what a lane may START. Never stops what it is already doing.
 
@@ -2684,6 +2732,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_provider_login(body))
             if u.path == "/api/deploy/poll":
                 return self._send(200, do_provider_poll())
+            if u.path == "/api/deploy/preflight":
+                return self._send(200, do_deploy_preflight(body))
+            if u.path == "/api/deploy/run":
+                return self._send(200, do_deploy_run(body))
+            if u.path == "/api/deploy/status":
+                return self._send(200, do_deploy_status(body))
+            if u.path == "/api/deploy/cancel":
+                return self._send(200, do_deploy_cancel(body))
+            if u.path == "/api/deploy/history":
+                return self._send(200, do_deploy_history(body))
             if u.path == "/api/auth/start":
                 return self._send(200, do_auth_start())
             if u.path == "/api/auth/code":

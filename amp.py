@@ -78,6 +78,7 @@ _STATE_LAYOUT = (
     ("IDEAS_PATH", ".ideas.json"),
     ("OBLIGATIONS_PATH", ".obligations.json"),
     ("DIRECTION_PATH", ".direction.json"),
+    ("DEPLOY_PATH", ".deploys.json"),
     ("SUPERVISOR_PATH", ".supervisor.json"),
     ("REPORT_PATH", ".reports.json"),
     ("REPORT_DIR", "reports"),
@@ -6462,7 +6463,30 @@ DEPLOY_MARKERS = (
     ("cloudflare", "wrangler.toml"),
     ("cloudflare", "wrangler.jsonc"),
     ("cloudflare", "wrangler.json"),
+    ("npm", "package.json"),
 )
+
+
+def _npm_package(path: Path) -> dict | None:
+    """What a `package.json` says about itself, or None if it is not publishable.
+
+    The odd one out among the markers, and the reason this exists: every other
+    marker file means "deployable" by being present at all, and `package.json`
+    does not. Most of them in this workspace are a build config for a site, or
+    an app nobody would put on a registry, and listing those as things that
+    could be published would bury the eight that can under thirty that cannot.
+
+    So the marker is the file AND what it says: a name, a version, and no
+    `private` flag - which is npm's own way of writing down "do not publish
+    this", already in the tree, honoured rather than second-guessed.
+    """
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("private") or not d.get("name") or not d.get("version"):
+        return None
+    return {"package": str(d["name"]), "version": str(d["version"])}
 
 # How to ask each provider who we are, and what its answer has to CONTAIN before
 # that counts as a yes.
@@ -6537,10 +6561,19 @@ def deploy_targets() -> list[dict]:
                 + list(ROOT.glob(f"*/*/{marker}")):
             if skip & set(path.parts):
                 continue
+            extra = _npm_package(path) if provider == "npm" else {}
+            if extra is None:
+                continue
             d = path.parent.resolve()
-            out.append({"provider": provider, "dir": str(d),
-                        "rel": str(d.relative_to(ROOT)) if d != ROOT else ".",
-                        "marker": marker, "lane": lanes_by_path.get(str(d))})
+            rel = str(d.relative_to(ROOT)) if d != ROOT else "."
+            # The key is set HERE and not by whoever happens to render these.
+            # It was added in `deploy_view` first, so a target fetched through
+            # any other path - the preflight endpoint, for one - came back
+            # without the field it is addressed by, which reads as a target that
+            # does not exist.
+            out.append({"provider": provider, "key": f"{provider}:{rel}",
+                        "dir": str(d), "rel": rel, "marker": marker,
+                        "lane": lanes_by_path.get(str(d)), **extra})
     # A directory can carry two markers - a Worker in front of a Fly backend is
     # an ordinary shape - so this is keyed on the pair, not on the directory.
     seen, uniq = set(), []
@@ -6624,12 +6657,400 @@ def deploy_view() -> dict:
     ident = {p: _whoami(p) for p in want}
     for t in targets:
         t["signed_in"] = bool(ident.get(t["provider"], {}).get("ok"))
+    # PUBLISHES only. This took the last run of any kind at first, and a
+    # `flyctl config validate` that exited 0 then appeared on the PULSE row as
+    # "done ... exit 0" - in the line whose entire job is to say what was last
+    # SHIPPED from here. A dry run dressed as a deploy is the confusion this
+    # tab exists to prevent, arriving through the tab itself.
+    last = {r["key"]: r for r in reversed(deploy_runs()) if r.get("mode") == "publish"}
+    for t in targets:
+        t["last"] = last.get(t["key"])
+    if ident.get("npm", {}).get("ok"):
+        _ask_registry(targets)
     return {"targets": targets,
             "identities": [{"provider": p, "signin": DEPLOY_SIGNIN.get(p), **ident[p]}
                            for p in want],
             "stranded": sum(1 for t in targets if not t["signed_in"]),
             "lanes_stranded": sorted({t["lane"] for t in targets
-                                      if t["lane"] and not t["signed_in"]})}
+                                      if t["lane"] and not t["signed_in"]}),
+            "waiting": [t["key"] for t in targets if t.get("unpublished")],
+            "running": deploy_running()}
+
+
+def _ask_registry(targets: list[dict]) -> None:
+    """Ask npm what it already has, for every package at once.
+
+    Worth the wall clock and worth doing here rather than on a button, because
+    it answers the question the tab is actually for. `stranded` says what CANNOT
+    be published; this says what HAS NOT been - a version sitting in the tree
+    that the registry has never seen is finished work that nobody outside this
+    machine can use, and it is invisible everywhere else in the console.
+
+    In parallel because it is eight sequential network round-trips otherwise,
+    and each one writes only into its own target - no shared accumulator, so
+    there is nothing here to lock.
+    """
+    pkgs = [t for t in targets if t["provider"] == "npm" and t.get("package")]
+
+    def ask(t):
+        try:
+            reg = _npm_registry(t["package"])
+        except Exception:
+            reg = {"versions": [], "latest": None}
+        t["registry"] = reg["latest"]
+        # Exactly one claim: this version is not on the registry. Not "the tree
+        # is ahead" - a tree can be behind, and `opensentience.org/box-and-box`
+        # at 0.9.0 against a registry serving 0.10.0 is - and which of those it
+        # is, is a judgement from two numbers that are both shown.
+        t["unpublished"] = t.get("version") not in reg["versions"]
+
+    threads = [threading.Thread(target=ask, args=(t,), daemon=True) for t in pkgs]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=30)
+
+
+# ------------------------------------------------------------------ publishing
+#
+# Everything above answers "could this be deployed". This is the part that does
+# it, and the whole of its design is one rule: NOTHING HERE RUNS ON ITS OWN.
+#
+# Every other loop in this console is autonomous by default - the ticker opens
+# goals, adopts proposals, reaps stranded plans, sharpens objectives - and that
+# is right, because the worst a wrong one costs is a worker's time in a worktree
+# that gets thrown away. This one reaches production and spends the operator's
+# money, and there is no worktree to throw away afterwards. So a publish happens
+# because a person pressed a button, it is never scheduled, never retried, and
+# never triggered by a goal closing.
+#
+# What it leaves behind is the point. A deploy that succeeds and is not written
+# down is exactly the `live_deployed` claim nobody can check - and that rung has
+# already been claimed once on this stack without evidence, which is why the
+# contradictions gate exists. So each run records what was run, in which
+# directory, at which commit, what the provider said back verbatim, and then -
+# separately - what an independent question about the world answered afterwards.
+# The two are kept apart because a deploy command exiting 0 is not a live
+# service, and the gap between those two sentences is where the false rung came
+# from.
+
+# What each provider is asked to do.
+#
+# Two commands each, and the first one is the same command the preflight runs -
+# so what the operator is shown before publishing and what they publish with are
+# one thing that cannot drift apart.
+#
+# The three checks are NOT equally strong and the tab says so rather than
+# levelling them. `wrangler --dry-run` and `npm --dry-run` do everything the
+# real command does except the upload. `flyctl config validate` only reads the
+# config file: it can pass on a service whose build is broken. A check that is
+# weaker than its neighbours is worth having; a check that claims to be as
+# strong as its neighbours is worse than none.
+DEPLOY_RUN = {
+    "fly": {"check": ["flyctl", "config", "validate"],
+            "publish": ["flyctl", "deploy", "--yes"],
+            "check_is": "the config file only - not the build"},
+    "cloudflare": {"check": ["wrangler", "deploy", "--dry-run"],
+                   "publish": ["wrangler", "deploy"],
+                   "check_is": "a full build, with nothing uploaded"},
+    "npm": {"check": ["npm", "publish", "--dry-run"],
+            "publish": ["npm", "publish", "--access", "public"],
+            "check_is": "a full pack, with nothing published"},
+}
+
+# A publish is allowed to take a long time - a cold Fly build reaches a remote
+# builder and a registry - but not forever, because it holds a thread and the
+# operator is watching a spinner. Half an hour, then the process GROUP is killed
+# the way `run_check` kills one, because a deploy that has started a builder
+# leaves it running otherwise.
+DEPLOY_TIMEOUT = 1800
+
+
+def deploy_key(t: dict) -> str:
+    """What names one deployable thing. Provider and place, because a directory
+    can carry two markers - a Worker in front of a Fly backend is ordinary."""
+    return t.get("key") or f"{t.get('provider')}:{t.get('rel')}"
+
+
+def _git_state(d: Path) -> dict:
+    """The commit a deploy from this directory would be shipping.
+
+    `-- .` on the status, not the bare repo: these are ~27 separate repos and a
+    deploy of `PULSE` has no business being blocked by an edit under `TRVM`.
+
+    `dirty` is the fact this exists for. Publishing a working tree with
+    uncommitted changes ships bytes that no commit names, and the record would
+    then carry a sha that does not describe what is running - which is a worse
+    outcome than no record, because it is a checkable-looking claim that is
+    false.
+    """
+    sha = run(["git", "-C", str(d), "rev-parse", "--short", "HEAD"])
+    st = run(["git", "-C", str(d), "status", "--porcelain", "--", "."])
+    if sha.returncode != 0:
+        return {"sha": None, "dirty": [], "why": last_line(redact(sha.stderr))}
+    return {"sha": sha.stdout.strip(),
+            "dirty": [l[3:] for l in st.stdout.splitlines() if l.strip()][:20],
+            "why": None}
+
+
+def _npm_registry(package: str) -> dict:
+    """Every version the registry serves, and which one it calls latest.
+
+    The whole list, not `npm view <pkg> version`, and the difference is not
+    cosmetic. That command answers "what is the latest version", and three
+    places here were reading its answer as "does this version exist" - which
+    are different questions whenever a tree is behind the registry rather than
+    ahead of it. Measured: `box-and-box` locally at 0.9.0 with 0.10.0 on the
+    registry was reported as "a version the registry does not have", which was
+    true, but the console had no way to know that - it would have said the same
+    thing about a 0.8.0 that IS published.
+
+    An empty list means the registry has nothing under this name, and is
+    reported as such rather than as an error: a package that has never been
+    published is the ordinary state of a package that has never been published.
+    """
+    r = run(["npm", "view", package, "versions", "--json"])
+    if r.returncode != 0:
+        return {"versions": [], "latest": None, "known": False}
+    try:
+        v = json.loads(r.stdout or "[]")
+    except ValueError:
+        return {"versions": [], "latest": None, "known": False}
+    v = [str(x) for x in (v if isinstance(v, list) else [v])]
+    return {"versions": v, "latest": v[-1] if v else None, "known": True}
+
+
+def deploy_preflight(t: dict) -> dict:
+    """Everything that would stop this publish, each one a fact rather than a
+    rule.
+
+    Returns blockers and notes apart. A blocker is something the harness will
+    refuse to publish over; a note is something worth reading that is not an
+    answer either way. The distinction matters because the one case that looked
+    like a blocker and is not is npm's: a package whose version is already on
+    the registry cannot be published again, and that is not a failure, it is
+    "there is nothing here to do".
+    """
+    ident = _whoami(t["provider"])
+    git = _git_state(Path(t["dir"]))
+    blockers, notes = [], []
+    if not ident["ok"]:
+        blockers.append(f"not signed in to {t['provider']}: {ident['why']}")
+    if git["why"]:
+        notes.append(f"no commit names these bytes: {git['why']}")
+    elif git["dirty"]:
+        blockers.append(
+            f"{len(git['dirty'])} uncommitted change(s) under {t['rel']} "
+            f"({', '.join(git['dirty'][:3])}{'…' if len(git['dirty']) > 3 else ''}) - "
+            f"publishing now ships bytes no commit names")
+    if t["provider"] == "npm":
+        reg = _npm_registry(t["package"]) if ident["ok"] else {"versions": [], "latest": None}
+        if reg["latest"]:
+            notes.append(f"the registry's latest is {t['package']}@{reg['latest']}")
+        elif ident["ok"]:
+            notes.append(f"the registry has never heard of {t['package']}")
+        if t.get("version") in reg["versions"]:
+            blockers.append(f"{t['package']}@{t['version']} is already published - "
+                            f"bump the version in package.json first")
+    return {"key": deploy_key(t), "blockers": blockers, "notes": notes,
+            "sha": git["sha"], "signed_in": ident["ok"],
+            "check_is": DEPLOY_RUN.get(t["provider"], {}).get("check_is")}
+
+
+# One entry per running publish, keyed the way targets are. Not a queue: two
+# publishes of DIFFERENT things at once is fine and normal, two of the SAME
+# thing is a mistake nobody meant to make, and the key is what makes the second
+# one refusable.
+_DEPLOYS: dict[str, dict] = {}
+_DEPLOY_LOCK = threading.Lock()
+
+
+def deploy_running() -> list[dict]:
+    with _DEPLOY_LOCK:
+        return [{k: v for k, v in d.items() if k != "proc"} for d in _DEPLOYS.values()]
+
+
+def deploy_status(key: str) -> dict | None:
+    with _DEPLOY_LOCK:
+        d = _DEPLOYS.get(key)
+        return {k: v for k, v in d.items() if k != "proc"} if d else None
+
+
+def deploy_runs(limit: int = 200) -> list[dict]:
+    return (load_json(DEPLOY_PATH, {"runs": []}).get("runs") or [])[-limit:]
+
+
+def _record_deploy(rec: dict) -> dict:
+    with _DEPLOY_LOCK:
+        store = load_json(DEPLOY_PATH, {"runs": []})
+        store.setdefault("runs", []).append(rec)
+        store["runs"] = store["runs"][-400:]
+        save_json(DEPLOY_PATH, store)
+    return rec
+
+
+def start_deploy(key: str, *, publish: bool = False) -> dict:
+    """Run one provider's own command against one target, on a thread.
+
+    Refuses rather than queues when the same target is already running, and
+    refuses a publish whose preflight found a blocker - checked HERE and not
+    only in the browser, because a gate that lives in the frontend is a gate
+    that a second tab walks around.
+
+    A `check` is allowed to run over blockers on purpose: finding out what the
+    provider says about a target you are not signed in to is exactly what a
+    check is for, and the answer will be the provider's refusal, which is more
+    use than ours.
+    """
+    t = next((x for x in deploy_targets() if deploy_key(x) == key), None)
+    if not t:
+        return {"ok": False, "error": f"nothing here is called {key!r}"}
+    spec = DEPLOY_RUN.get(t["provider"])
+    if not spec:
+        return {"ok": False, "error": f"nothing here knows how to deploy to {t['provider']}"}
+    pre = deploy_preflight(t)
+    if publish and pre["blockers"]:
+        return {"ok": False, "error": "; ".join(pre["blockers"]), "preflight": pre}
+    with _DEPLOY_LOCK:
+        if key in _DEPLOYS:
+            return {"ok": False, "error": f"{key} is already running"}
+        rec = {"id": "d" + uuid.uuid4().hex[:9], "key": key, "at": now(),
+               "provider": t["provider"], "rel": t["rel"], "lane": t.get("lane"),
+               "package": t.get("package"), "version": t.get("version"),
+               "mode": "publish" if publish else "check",
+               "cmd": " ".join(spec["publish" if publish else "check"]),
+               "sha": pre["sha"], "state": "running", "exit": None,
+               "output": "", "seconds": None, "verify": None}
+        _DEPLOYS[key] = rec
+    threading.Thread(target=_deploy_thread, args=(rec, t, spec, publish),
+                     daemon=True).start()
+    return {"ok": True, "run": {k: v for k, v in rec.items() if k != "proc"}}
+
+
+def _deploy_thread(rec: dict, t: dict, spec: dict, publish: bool):
+    cmd = spec["publish" if publish else "check"]
+    t0 = time.time()
+    try:
+        code, out = _run_deploy_cmd(cmd, Path(t["dir"]), rec)
+    except Exception as e:                    # a crash here must still record
+        code, out = None, f"the console failed to run it: {e}"
+    rec["exit"] = code
+    rec["output"] = redact(out)[-20000:]
+    rec["seconds"] = round(time.time() - t0, 1)
+    rec["state"] = "done" if code == 0 else "failed"
+    # Verification is a SEPARATE question, asked only of a publish that claimed
+    # to work - and asked of the world, not of the command that just ran. See
+    # `_verify_deploy`: if it disagrees, the run is recorded as having failed,
+    # because "the tool exited 0" is the sentence that produced a false rung.
+    if publish and code == 0:
+        rec["verify"] = _verify_deploy(t, rec)
+        if rec["verify"] and rec["verify"].get("ok") is False:
+            rec["state"] = "unverified"
+    with _DEPLOY_LOCK:
+        _DEPLOYS.pop(rec["key"], None)
+    _record_deploy({k: v for k, v in rec.items() if k != "proc"})
+
+
+def _run_deploy_cmd(cmd: list[str], cwd: Path, rec: dict) -> tuple[int | None, str]:
+    """Run it in its own process group and stream what it says into the record.
+
+    Streamed rather than captured at the end so the tab shows a long Fly build
+    happening instead of six silent minutes - and killed by GROUP on the
+    deadline, because a deploy that has started a remote builder or a docker
+    build leaves those behind when only the shell is killed. Same reasoning as
+    `run_check`, which measured it.
+    """
+    p = subprocess.Popen(cmd, cwd=str(cwd), text=True, start_new_session=True,
+                         stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    with _DEPLOY_LOCK:
+        rec["proc"] = p
+    lines: list[str] = []
+    deadline = time.time() + DEPLOY_TIMEOUT
+    for line in p.stdout:
+        lines.append(line.rstrip())
+        rec["output"] = redact("\n".join(lines))[-20000:]
+        if time.time() > deadline:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(p.pid, sig)
+                except OSError:
+                    pass
+                try:
+                    p.wait(timeout=5)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            lines.append(f"(killed after {DEPLOY_TIMEOUT}s)")
+            return None, "\n".join(lines)
+    p.wait()
+    return p.returncode, "\n".join(lines)
+
+
+def cancel_deploy(key: str) -> dict:
+    """Stop one. The group, not the process - see `_run_deploy_cmd`."""
+    with _DEPLOY_LOCK:
+        d = _DEPLOYS.get(key)
+        p = d.get("proc") if d else None
+    if not p:
+        return {"ok": False, "error": f"{key} is not running"}
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True}
+
+
+_URL_IN_OUTPUT = re.compile(r"https://[\w.-]+(?:/[\w./?%&=-]*)?")
+
+
+def _verify_deploy(t: dict, rec: dict) -> dict | None:
+    """Ask the world whether the thing is actually there.
+
+    Deliberately not a reading of the deploy's own output. The output is the
+    tool's account of what it did, and this whole tab exists because a tool's
+    account of what it did was once enough to move a lane to `live_deployed`.
+    So: the registry is asked what version it now serves, and a service is asked
+    for its own URL over HTTP. Both can say no after a command said yes.
+
+    Returns None when there is nothing this knows how to ask - stated as None
+    rather than as a pass, because an unasked question is not a confirmation.
+    """
+    if t["provider"] == "npm":
+        reg = _npm_registry(t["package"])
+        here = t.get("version") in reg["versions"]
+        return {"how": f"npm view {t['package']} versions",
+                "answer": (f"{t.get('version')} is there" if here
+                           else f"latest is {reg['latest'] or 'nothing'}"),
+                "ok": here}
+    url = None
+    if t["provider"] == "fly":
+        r = run(["flyctl", "status", "--json"], cwd=Path(t["dir"]))
+        try:
+            host = (json.loads(r.stdout) or {}).get("Hostname")
+            url = f"https://{host}" if host else None
+        except (ValueError, AttributeError):
+            url = None
+    if not url:
+        # Both providers print the URL they deployed to. Falling back to it is
+        # weaker than asking the platform, and it is still a real request to a
+        # real address - what it cannot catch is a deploy that printed the
+        # wrong URL.
+        found = _URL_IN_OUTPUT.findall(rec.get("output") or "")
+        url = next((u for u in found if "fly.dev" in u or "workers.dev" in u
+                    or ".pages.dev" in u), None) or (found[-1] if found else None)
+    if not url:
+        return None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "amp-publish"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    except Exception as e:
+        return {"how": f"GET {url}", "answer": redact(str(e))[:200], "ok": False}
+    return {"how": f"GET {url}", "answer": str(status), "ok": 200 <= status < 400,
+            "url": url}
 
 
 # ------------------------------------------------------------------ direction
@@ -7118,6 +7539,41 @@ def lane_record(lane_name: str, n: int = 8) -> dict:
     return out
 
 
+def _deploy_block(lane_name: str) -> str:
+    """What this lane has actually shipped, for the architect who judges rungs.
+
+    `live_deployed` is a rung a reviewer awards, and until this existed there
+    was nothing on disk for them to award it FROM - so it was awarded from a
+    worker's sentence about having deployed something, which is how this stack
+    came to hold a `live_deployed` claim that no deploy supports.
+
+    Every line here is a run that happened: its command, its exit, and - kept
+    separate on purpose - what an independent question about the world answered
+    afterwards. The separation is the whole value. A run that exited 0 and
+    whose URL then returned 502 reads as `exit 0 · GET ... 502`, and an
+    architect shown that will not write `live_deployed`.
+    """
+    runs = [r for r in deploy_runs() if r.get("lane") == lane_name
+            and r.get("mode") == "publish"][-6:]
+    if not runs:
+        return ("# What this lane has shipped\n\nNothing. No publish to any provider "
+                "has been recorded for this lane, so no claim about it being deployed "
+                "has evidence behind it here.")
+    lines = []
+    for r in reversed(runs):
+        v = r.get("verify") or {}
+        checked = (f"{v.get('how')} → {v.get('answer')}" if v
+                   else "nothing independent was asked")
+        lines.append(f"- {r.get('at', '')[:16]} `{r.get('cmd')}` in {r.get('rel')} "
+                     f"at {r.get('sha') or 'an unnamed commit'} → exit {r.get('exit')}; "
+                     f"then {checked}")
+    return ("# What this lane has shipped\n\n" + "\n".join(lines)
+            + "\n\nThe part after `then` is a separate question asked of the world "
+              "afterwards, not the deploy tool's own account of itself. A run that "
+              "exited 0 and was not independently confirmed does not settle "
+              "`live_deployed`.")
+
+
 def _record_block(lane_name: str) -> str:
     rec = lane_record(lane_name)
     if not rec["n"]:
@@ -7589,6 +8045,12 @@ def _direction_context(g: dict, sections: list[dict]) -> str:
     rec = _record_block(lane_name)
     if rec:
         parts.append(rec)
+    # The evidence for the one rung this stack has claimed without any. Always
+    # appended, including when it is empty - "nothing has been shipped" is the
+    # sentence that has to reach the reviewer, and a block that only appears
+    # when there is something to show is a block that is silent in exactly the
+    # case it was written for.
+    parts.append(_deploy_block(lane_name))
     stands = _need_block(lane_name)
     if stands:
         parts.append(stands)
