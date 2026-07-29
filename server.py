@@ -1418,6 +1418,16 @@ def _pipeline_ticker():
                 print(f"amp: restarted idle goal {gid}")
         except Exception:
             traceback.print_exc()
+        # The same halt one state earlier. `_restart_idle_goals` only ever looks
+        # at goals that say `running`, so a goal interrupted while it was still
+        # being PLANNED is invisible to it and to every gate - and it holds a
+        # lane's worktree for good. Measured: `wrl` lost a lane that way for an
+        # hour and twenty minutes, with four proposals waiting in it.
+        try:
+            for what in amp.reap_stranded_plans():
+                print(f"amp: abandoned a plan that never arrived — {what}")
+        except Exception:
+            traceback.print_exc()
         # The queue is otherwise drained only by a settling worker, which is
         # sound only while every enqueue has a live worker behind it - true
         # today, since you can only be queued for a busy lane or a full cap, but
@@ -2014,6 +2024,8 @@ def do_settings() -> dict:
         "adopt_confidence": amp.adopt_bar(),
         "adopt_need": amp.need_bar(),
         "calibration": amp.calibration(),
+        "spec_max_rounds": amp.spec_max_rounds(),
+        "spec_max_rounds_limit": amp.SPEC_MAX_ROUNDS_LIMIT,
     }
 
 
@@ -2038,6 +2050,10 @@ SETTINGS_CHOICES = {"architect_backend": amp.ARCHITECT_BACKENDS}
 # Neither: probabilities, and they live under `autonomy` rather than at the top
 # level because they are thresholds on how much runs without being watched.
 SETTINGS_BARS = ("adopt_confidence", "adopt_need")
+# Whole numbers with a stated range, refused here rather than clamped at read
+# time: a cap silently held at the ceiling would report a spend cap the operator
+# never set as the reason a document stopped being improved.
+SETTINGS_INTS = {"spec_max_rounds": (1, amp.SPEC_MAX_ROUNDS_LIMIT)}
 
 
 def do_settings_set(body: dict) -> dict:
@@ -2057,6 +2073,17 @@ def do_settings_set(body: dict) -> dict:
             return {"ok": False, "error": f"{k} must be between 0 and 1, not {v}"}
         cfg.setdefault("autonomy", {})[k] = round(v, 3)
         changed[k] = round(v, 3)
+    for k, (lo, hi) in SETTINGS_INTS.items():
+        if k not in body:
+            continue
+        try:
+            n = int(body[k])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"{k} must be a whole number between {lo} and {hi}"}
+        if not lo <= n <= hi:
+            return {"ok": False, "error": f"{k} must be between {lo} and {hi}, not {n}"}
+        cfg[k] = n
+        changed[k] = n
     for k in SETTINGS_FLAGS:
         if k in body:
             cfg[k] = bool(body[k])
@@ -2072,7 +2099,7 @@ def do_settings_set(body: dict) -> dict:
     if not changed:
         return {"ok": False, "error": f"nothing to set - expected any of "
                                       f"{', '.join(SETTINGS_FLAGS + tuple(SETTINGS_CHOICES)
-                                                   + SETTINGS_BARS)}"}
+                                                   + SETTINGS_BARS + tuple(SETTINGS_INTS))}"}
     amp.save_json(amp.CONFIG_PATH, cfg)
     return {**do_settings(), "changed": changed}
 

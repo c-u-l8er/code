@@ -5196,6 +5196,13 @@ def open_goal(lane_name: str, objective: str, *, model_key: str | None = None) -
         "model": model_key or cfg.get("consult_model", DEFAULT_CONSULT),
         "opened_at": now(),
         "state": "planning",
+        # Who is planning it, so that "the planner died" is a fact rather than a
+        # guess from a clock. `plan_goal` is one architect call and every one of
+        # its exits either starts the goal or stops it - so a record still
+        # saying `planning` with nobody on it is a plan that never arrived, and
+        # until this was written down there was no way to tell that apart from
+        # a plan still being written. See `stranded_plans`.
+        "planning_pid": os.getpid(),
         "done": [], "tasks": [], "questions": [],
         "rounds": 0, "cost_tokens": 0,
         "log": [], "stopped_on": None,
@@ -5249,6 +5256,7 @@ def plan_goal(gid: str) -> dict:
                       for t in (plan.get("tasks") or []) if (t.get("text") or "").strip()]
         g["questions"] = [q for q in (plan.get("questions") or []) if str(q).strip()]
         g["state"] = "running"
+        g["planning_pid"] = None      # the plan arrived; nobody is planning it now
         save_goal(g)
     goal_log(gid, f"planned: {len(g['done'])} done-conditions, {len(g['tasks'])} tasks")
     if g["questions"]:
@@ -5882,6 +5890,81 @@ def idle_goals() -> list[dict]:
         if g.get("hold_until") and g["hold_until"] > now():
             continue                      # waiting out a capacity limit
         out.append(g)
+    return out
+
+
+# How long a `planning` goal with no recorded planner is left alone before it is
+# read as abandoned. Only ever applies to records opened before `planning_pid`
+# was written down - for anything opened since, liveness answers it and no clock
+# is consulted at all. Generous because the cost of being wrong is asymmetric: a
+# reaped plan that was still coming is work thrown away, and one architect call
+# has never taken half an hour.
+PLAN_GRACE_MIN = 30.0
+
+
+def stranded_plans() -> list[dict]:
+    """Goals whose plan never arrived and whose planner is gone.
+
+    The same halt `idle_goals` catches, one state earlier, and it was invisible
+    for the same reason: everything that looks for stuck work looks at goals
+    that say `running`. `planning` is a state a goal passes through in about
+    twenty seconds, so nothing was written to handle a goal that stopped in it -
+    and `plan_goal` is a single architect call, so a console restart in the
+    middle of one leaves the record exactly as `open_goal` wrote it, for ever.
+
+    A `wrl` goal sat like that for an hour and twenty minutes while its lane
+    held four proposals nobody could adopt. Its twin, opened two minutes later
+    by the retry, planned fine - so the objective was never lost, only a lane
+    was, and no gate says a word about it because the board reads it as a goal
+    being planned right now.
+
+    Two facts have to hold, and the second is the one that makes this safe to
+    do without asking. The planner is not alive: a pid that is gone, checked the
+    way `idle_goals` checks its reviewer. And the record CONTAINS NOTHING - no
+    done-conditions, no tasks, no log, no tokens spent. That is not "it looks
+    stale", it is the record saying in its own fields that nothing ever
+    happened, and it is why abandoning one discards no work. A `planning` goal
+    that does hold something is left alone and shows up stuck, for a person.
+    """
+    out = []
+    for row in goals():
+        if row.get("state") != "planning":
+            continue
+        g = load_goal(row["id"])
+        if not g:
+            continue
+        pid = g.get("planning_pid")
+        if pid == os.getpid():
+            continue                      # this process is planning it right now
+        if pid and pid_alive(pid):
+            continue                      # some other live console has it
+        if not pid and (not g.get("opened_at")
+                        or _active_recently(g["opened_at"], PLAN_GRACE_MIN)):
+            continue                      # opened before pids were recorded, still young
+        if (g.get("done") or g.get("tasks") or g.get("log")
+                or g.get("questions") or g.get("cost_tokens")):
+            continue                      # it holds something; that is a person's call
+        out.append(g)
+    return out
+
+
+def reap_stranded_plans() -> list[str]:
+    """Free the lanes held by plans that never arrived.
+
+    Not a repair: it does not re-plan. Re-planning would put a second goal into
+    a lane that may since have got one - which is how the stranded record came
+    to exist in the first place, a retry landing beside its own corpse - and the
+    objective is not lost by leaving it alone, because a lane with no goal and
+    no proposal is exactly what `explore_idle_lanes` goes looking for.
+
+    What it does is stop an empty record from occupying a worktree.
+    """
+    out = []
+    for g in stranded_plans():
+        goal_log(g["id"], "the plan never arrived and the planner is gone - "
+                          "abandoned so the lane is not held by an empty record")
+        close_goal(g["id"], "abandoned")
+        out.append(f"{g['lane']} {g['id']}")
     return out
 
 
@@ -6933,24 +7016,32 @@ def proposal_hold(p: dict) -> str | None:
     # the odds would hold the objective for ever. Converged means the measured
     # gain died or the spend cap hit, and either way the next round buys
     # nothing, so the objective starts at whatever it reached.
-    if held_for_sharpening(p):
-        return (f"{p['headroom']:.0%} room left to improve it, over the "
-                f"{SHARPEN_FLOOR:.0%} worth another look — sharpening it first")
-    return None
+    return _sharpen_hold(p)
+
+
+def _sharpen_hold(p: dict) -> str | None:
+    """The sharpening hold on its own, whether or not it is the operative one."""
+    head = p.get("headroom")
+    if head is None or head < SHARPEN_FLOOR or sharpen_converged(p):
+        return None
+    return (f"{head:.0%} room left to improve it, over the {SHARPEN_FLOOR:.0%} "
+            f"worth another look — sharpening it first")
 
 
 def held_for_sharpening(p: dict) -> bool:
     """Whether the only thing between this objective and a worker is a rewrite.
 
-    Split out and named because two things need the answer and they must not
-    disagree: `proposal_hold`, which stops the adoption, and the panel, which
-    has to say whether the operator is being asked for something. Every other
-    hold waits on a person; this one waits on a call the harness makes itself,
-    and rendering them the same way tells the operator to go and do something
-    about a queue that is already draining.
+    Asked because the panel has to say whether the operator is being told to do
+    something. Every other hold waits on a person; this one waits on a call the
+    harness makes itself, and rendering them alike sends the operator to look at
+    a queue that is already draining.
+
+    Compared against `proposal_hold` rather than tested on its own, so that a
+    proposal held by a bar AND carrying headroom reports the bar - which is the
+    reason it is actually stopped, and the only one a person can act on.
     """
-    head = p.get("headroom")
-    return head is not None and head >= SHARPEN_FLOOR and not sharpen_converged(p)
+    why = _sharpen_hold(p)
+    return why is not None and proposal_hold(p) == why
 
 
 def lane_record(lane_name: str, n: int = 8) -> dict:
@@ -7648,7 +7739,25 @@ def _specs_block(lane: str | None, names: list[str], *, limit: int | None = None
 # The spend backstop, the same shape as `SHARPEN_HARD_CAP` and for the same
 # reason. Agreement is the stopping rule; this is only here so a pair that
 # cannot converge cannot bill forever.
-SPEC_MAX_ROUNDS = 6
+#
+# Settable in Settings, because the right number is a judgement about a
+# particular document and not a property of the loop: a thin spec that is being
+# rewritten wholesale genuinely needs more turns than a mature one being tidied,
+# and a cap set low enough to stop the second stops the first mid-argument and
+# reports it as a spend cap rather than as a document that was still improving.
+SPEC_MAX_ROUNDS = 25
+# The ceiling on that dial. Not a second stopping rule - it is the point past
+# which "a pair that cannot converge cannot bill forever" stops being true.
+SPEC_MAX_ROUNDS_LIMIT = 100
+
+
+def spec_max_rounds() -> int:
+    """How many review rounds one document gets before the run is capped."""
+    try:
+        n = int(config().get("spec_max_rounds", SPEC_MAX_ROUNDS))
+    except (TypeError, ValueError):
+        return SPEC_MAX_ROUNDS
+    return min(SPEC_MAX_ROUNDS_LIMIT, max(1, n))
 
 # The document as sent to the architect. Big enough for a real spec - unlike
 # `SPEC_FILE_CHARS`, which is an outline budget for a call that is reading
@@ -7963,9 +8072,10 @@ def spec_review_step(rid: str) -> dict:
         die(f"no spec run {rid!r}")
     if r.get("state") != "running":
         return r
-    if len(r.get("rounds") or []) >= SPEC_MAX_ROUNDS:
+    cap = spec_max_rounds()
+    if len(r.get("rounds") or []) >= cap:
         return _spec_stop(rid, "capped",
-                          f"stopped at the {SPEC_MAX_ROUNDS}-round spend cap without "
+                          f"stopped at the {cap}-round spend cap without "
                           f"the two of them agreeing")
     if not architect_available():
         return _spec_stop(rid, "stopped", architect_off_reason())
@@ -9104,7 +9214,7 @@ def spec_view(lane_name: str) -> dict:
         # file nobody can find is exactly the thing that would otherwise vanish
         # without anyone deciding it should.
         "orphans": [r for r in runs if r["rel"] not in have],
-        "max_rounds": SPEC_MAX_ROUNDS,
+        "max_rounds": spec_max_rounds(),
         # Named, because an empty list here and a lane that keeps its design
         # somewhere else look identical on screen and are not the same problem.
         "gap": None if files else
@@ -10058,7 +10168,15 @@ def direction_state(lane: str | None = None) -> dict:
     for p in props:
         why = proposal_hold(p)
         if why:
-            held[why] = held.get(why, 0) + 1
+            # Tallied under one phrase rather than under its own sentence. Every
+            # other hold reason quotes the objective's own numbers, so counting
+            # the sentences groups them usefully; a sharpening hold quotes its
+            # headroom, which is different for every proposal, so the same tally
+            # would print three all-but-identical sentences that add up to one
+            # fact - and the fact worth reporting is that the harness is dealing
+            # with them, not what each one's percentage happens to be.
+            key = "still being sharpened" if held_for_sharpening(p) else why
+            held[key] = held.get(key, 0) + 1
         else:
             ready += 1
 
@@ -10071,8 +10189,13 @@ def direction_state(lane: str | None = None) -> dict:
 
     if props and ready:
         verdict = "ready"
+        # Split, because "waiting on you" is an instruction and it is false for
+        # the ones the harness has queued for a sharpening round of its own.
+        sharpening = held.get("still being sharpened", 0)
+        waiting = len(props) - ready - sharpening
         headline = (f"{ready} objective(s) can start"
-                    + (f", {len(props) - ready} waiting on you" if len(props) - ready else ""))
+                    + (f", {waiting} waiting on you" if waiting else "")
+                    + (f", {sharpening} still being sharpened" if sharpening else ""))
     elif props:
         verdict = "held"
         headline = (f"{len(props)} objective(s) waiting, none of them able to start - "
