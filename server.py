@@ -1441,6 +1441,19 @@ def _pipeline_ticker():
                 print(f"amp: triaged blocked goal {gid}")
         except Exception:
             traceback.print_exc()
+        # Before adoption, because it is the thing most likely to be stopping
+        # it. The contradictions gate holds every lane at once and was cleared
+        # only by hand, so an unattended fleet does not converge on running - it
+        # converges on stopped, three contradictions deep, with a full worker
+        # cap and nothing using it.
+        try:
+            r = amp.settle_contradictions()
+            if r:
+                print(f"amp: settled {r['settled']} of {r['considered']} contradiction(s)"
+                      + (f", {r['kept']} left for you" if r.get("kept") else "")
+                      + ("" if r.get("ok") else f" — failed: {r.get('error')}"))
+        except Exception:
+            traceback.print_exc()
         # An escalation gate is meant to pause the pipeline, not to end a lane -
         # but auto-adopt is judged once, as a goal closes, so a gate that was up
         # at that moment left the lane's proposals waiting on a reader that was
@@ -1450,6 +1463,21 @@ def _pipeline_ticker():
             for r in amp.resume_adoption():
                 if r.get("ok"):
                     print(f"amp: adopted waiting proposal {r['proposal_id']}")
+        except Exception:
+            traceback.print_exc()
+        # Adoption above can only start what has already been proposed, and a
+        # lane with no goal has nothing left to close - so nothing will ever
+        # propose into it again. Measured: five of eleven lanes were in exactly
+        # that state and the fleet sat at three workers against a cap of ten,
+        # held by no gate, no bar and no budget. This is the only thing that
+        # goes looking for a lane nobody is going to mention again. Runs AFTER
+        # adoption so a tick that has real work to start spends itself starting
+        # it rather than inventing more.
+        try:
+            for r in amp.explore_idle_lanes():
+                print(f"amp: explored idle lane {r['lane']} -> "
+                      + (f"{r['proposed']} proposal(s)" if r.get("ok")
+                         else f"failed: {r.get('error')}"))
         except Exception:
             traceback.print_exc()
         # A lane runs one worker at a time, so "sharpen every document" cannot be

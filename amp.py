@@ -8942,8 +8942,18 @@ def _explore_context(lane: str | None, *, web: bool) -> str:
 def explore_direction(lane: str | None = None, *, web: bool = True) -> dict:
     """Go looking for direction instead of waiting for a goal to finish.
 
-    Costs one architect call. Manual only - there is no heartbeat path into
-    here, and there should not be one.
+    Costs one architect call, and searches the web unless told not to. This said
+    "manual only, and there should not be a heartbeat path into here" for as
+    long as the only caller was a button. There is one now - see
+    `explore_idle_lanes` - and the sentence was right about what it refused: an
+    unattended general explorer over every lane, every tick, with the web on. It
+    was wrong that no bounded version could exist, and the fleet paid for it by
+    losing lanes one at a time with nothing looking for them.
+
+    This function is unchanged by that and stays indiscriminate on purpose: it
+    explores whatever it is pointed at. Every restriction lives in the caller,
+    where it can be read in one place, rather than being spread through here as
+    conditions that each look reasonable alone.
     """
     if not architect_available():
         return {"ok": False, "error": architect_off_reason()}
@@ -9018,8 +9028,9 @@ def explore_direction(lane: str | None = None, *, web: bool = True) -> dict:
 
     ngoal = sum(1 for p in fresh if p["kind"] == "goal")
     nq = sum(1 for p in fresh if p["kind"] == "question")
-    add_note(f"explored{' the web and' if can_web else ''} every lane: "
-             + rev["assessment"][:400]
+    add_note(f"explored{' the web and' if can_web else ''} "
+             + (f"{lane}, which had no goal and nothing waiting" if lane else "every lane")
+             + ": " + rev["assessment"][:400]
              + (f" — {ngoal} goal(s) proposed" if ngoal else "")
              + (f", {nq} open question(s)" if nq else "")
              + (" — nothing worth proposing: " + rev["why_exhausted"][:200]
@@ -9031,8 +9042,14 @@ def explore_direction(lane: str | None = None, *, web: bool = True) -> dict:
     rev["proposals"] = fresh
     rev["misfiled"] = misfiled
     rev["ok"] = True
-    # Nothing is auto-adopted here, whatever the auto-adopt setting says. This
-    # ran because a person pressed a button; the same person can press adopt.
+    # Nothing is auto-adopted here, whatever the auto-adopt setting says. That
+    # used to be justified by "a person pressed the button, the same person can
+    # press adopt", which stopped being true when the heartbeat gained a path in
+    # - and the separation matters more now, not less. Exploring is the one call
+    # that invents work rather than reacting to it, and a proposal that started
+    # itself would be the only work in the harness never held against a bar.
+    # These land open like everything else; `resume_adoption` picks them up on
+    # the next tick if, and only if, they clear what everything else clears.
     return rev
 
 
@@ -9478,6 +9495,103 @@ def resume_adoption() -> list[dict]:
     # fixed order rather than on dict ordering.
     ready.sort(key=lambda p: (-(worth(p) or 0), p.get("at") or ""))
     return [adopt_proposal(ready[0]["id"])] if ready else []
+
+
+# How long a lane that was explored and yielded nothing is left alone. The
+# cooldown only ever covers that case: an explore that DOES propose something
+# leaves the lane holding a proposal, so it stops being idle and is not picked
+# again anyway. What this bounds is the lane the architect has already looked at
+# and had no answer for - without it that lane is an architect call every tick,
+# forever, for an answer that is not going to change in a minute.
+EXPLORE_COOLDOWN_H = 6.0
+
+
+def idle_lanes() -> list[str]:
+    """Lanes with no work, nothing waiting to become work, and no way back.
+
+    Not "lanes doing nothing right now" - lanes that have nothing queued to do
+    NEXT either, which is a different and much worse state. A lane with a
+    proposal is paused; a lane with neither a goal nor a proposal is retired,
+    because the only thing that proposes into a lane on its own is the review
+    that fires when one of its goals CLOSES, and a lane with no goal has none
+    left to close. Nothing in the harness reaches it again.
+
+    Ordered by how long each has been without direction, longest first. That is
+    an uninformed rule and it is chosen deliberately: there is nothing scored to
+    sort on here - the absence of anything scored is the situation being fixed -
+    and the failure is precisely a lane being passed over indefinitely, so time
+    ignored is the one measure that bears on it.
+    """
+    cfg = config().get("lanes") or {}
+    live = {g.get("lane") for g in goals()
+            if g.get("state") in ("running", "planning", "blocked")}
+    waiting = {p.get("lane") for p in open_proposals()}
+    d = direction_store()
+    last: dict[str, float] = {}
+    for rec in (d.get("proposals") or []) + (d.get("reviews") or []):
+        n = rec.get("lane")
+        if n:
+            last[n] = max(last.get(n, 0.0), _epoch(rec.get("at")))
+    for g in goals():
+        n = g.get("lane")
+        if n:
+            last[n] = max(last.get(n, 0.0), _epoch(g.get("opened_at")))
+    out = [n for n in cfg if n not in live and n not in waiting]
+    return sorted(out, key=lambda n: (last.get(n, 0.0), n))
+
+
+def explore_idle_lanes() -> list[dict]:
+    """Go looking for direction in ONE lane that has none, and would never get any.
+
+    `explore_direction` was manual only, and said so: it costs an architect call
+    and can search the web, so a heartbeat into a general explorer is a way to
+    spend money all night. That reasoning is still right about a general
+    explorer. It was wrong about the fleet, and the measurement is what changed
+    it: five of eleven lanes held no goal and no proposal, so nothing would ever
+    propose into them again, and the fleet sat at three workers against a cap of
+    ten - not held by the cap, the budget, or any gate, but by lanes quietly
+    dropping out of the loop one at a time and nothing looking for them.
+
+    So this is not that explorer. It is bounded on every side that made the
+    original answer no:
+
+      it only ever considers a lane with NOTHING - no goal, no proposal;
+      one lane per call, like adoption, because the call is not cheap;
+      no web search, which is the half that made exploring slow and dear;
+      a lane it has already looked at is left alone for `EXPLORE_COOLDOWN_H`;
+      a gate up in that lane skips it, unchanged;
+      and a lane whose mode does not admit development is never touched, which
+      is the whole of `archived` - nothing is proposed into it.
+
+    It proposes and nothing more. Whatever comes back is scored, held by the
+    same bars, and adopted by the same path as anything else, so this widens
+    what the fleet can see and moves none of the decisions about it.
+    """
+    if not direction_store().get("auto_adopt"):
+        return []
+    if not architect_available():
+        return []
+    stamps = (direction_store().get("explored") or {})
+    cut = time.time() - EXPLORE_COOLDOWN_H * 3600.0
+    for name in idle_lanes():
+        if lane_admits(name, "development") is not None:
+            continue
+        if escalations(name):
+            continue
+        if _epoch(stamps.get(name)) > cut:
+            continue
+        # Stamped BEFORE the call, for the reason triage is: a call that dies
+        # partway through has still been paid for, and a retry loop around a
+        # model call is how an idle lane becomes an expensive idle lane.
+        d = direction_store()
+        d.setdefault("explored", {})[name] = now()
+        _save_direction(d)
+        rev = explore_direction(name, web=False)
+        return [{"lane": name, "ok": bool(rev.get("ok")),
+                 "error": rev.get("error"),
+                 "proposed": len(rev.get("proposals") or []),
+                 "exhausted": bool(rev.get("exhausted"))}]
+    return []
 
 
 def sharpen_history(p: dict) -> list[dict]:
@@ -12733,6 +12847,59 @@ def settle_findings(lane: str | None = None, limit: int = 24) -> dict:
     rev["rungs_now"] = lane_rungs()
     rev["ok"] = True
     return rev
+
+
+def settle_contradictions() -> dict | None:
+    """Settle the contradictions that are holding the whole fleet, if any are.
+
+    The contradictions gate is workspace-wide: at the limit, no lane adopts, no
+    lane explores, nothing starts anywhere. That is right - building on a claim
+    that was just disproved is the one thing worth stopping everything for - but
+    it was only ever cleared by a person pressing a button, and findings arrive
+    from every worker that finishes. So the steady state of an unattended fleet
+    is not "running": it is three contradictions deep and stopped, and the
+    longer it runs the more certainly it gets there. Measured twice in one
+    hour, from a standing start both times.
+
+    Clearing the gate is NOT what this does, and the difference is the whole
+    justification. `settle_findings` settles a finding by performing a
+    consequence - retracting the rung that was not earned, superseding a
+    finding another one already covers, recording a false claim so every future
+    scoring call is told not to repeat it, filing the leftover as work - and it
+    refuses, keeping the finding open, whenever the consequence is one the
+    harness cannot actually perform. So the gate comes down exactly when the
+    thing it was demanding has been done, and stays up when it has not. Marking
+    findings read would also clear it, and would be a lie.
+
+    Runs only while the gate is UP, which is also what bounds it: there is no
+    schedule here, and nothing to tune. The one hazard left is a finding nobody
+    can settle - it holds the gate open forever, and a retry every tick would be
+    an architect call a minute for an answer that cannot change - so an
+    unchanged set is not asked about twice. A NEW contradiction is a new
+    question and does get asked.
+    """
+    if not direction_store().get("auto_adopt"):
+        return None
+    if not any(e.get("gate") == "contradictions" for e in escalations()):
+        return None
+    open_ids = sorted(f["id"] for f in findings(unread_only=True)
+                      if f.get("bearing") == "contradicted")
+    if not open_ids:
+        return None
+    d = direction_store()
+    if not set(open_ids) - set(d.get("settle_tried") or []):
+        return None
+    # Recorded BEFORE the call, and as the ids asked about rather than a
+    # timestamp: what makes a retry pointless is that the question is the same,
+    # not that it was asked recently. A call that dies partway through has still
+    # been paid for and may still have settled something.
+    d["settle_tried"] = open_ids
+    _save_direction(d)
+    out = settle_findings()
+    return {"settled": len(out.get("settled") or []),
+            "kept": len(out.get("kept") or []),
+            "considered": len(open_ids),
+            "ok": bool(out.get("ok")), "error": out.get("error")}
 
 
 def cmd_packet(args):
