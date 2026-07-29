@@ -6464,13 +6464,47 @@ DEPLOY_MARKERS = (
     ("cloudflare", "wrangler.json"),
 )
 
-# How to ask each provider who we are. A command, not a token check: a token
-# that exists is not a token that works, and the difference is a deploy that
-# fails after the operator has been told they are signed in.
+# How to ask each provider who we are, and what its answer has to CONTAIN before
+# that counts as a yes.
+#
+# A command, not a token check: a token that exists is not a token that works,
+# and the difference is a deploy that fails after the operator has been told they
+# are signed in. But the command's exit code is not the answer either -
+#
+#     $ wrangler whoami
+#      wrangler 4.115.0
+#     Getting User settings...
+#     You are not authenticated. Please run `wrangler login`.
+#     $ echo $?
+#     0
+#
+# - measured on wrangler 4.115.0. Read off the return code, that transcript is a
+# signed-in Cloudflare account, and the `who` column gets filled from the first
+# line of output, which is a version banner. So the console would report a
+# version number as a person, count every Worker as deployable, and lead the
+# Publish tab with `0 stranded` while nobody was signed in to anything.
+#
+# What decides is whether the provider NAMED somebody. Each `who` below is the
+# patterns that capture that name out of the provider's own words, tried in
+# order; no capture is a no, whatever the tool returned.
+#
+# In order, because a provider can be signed in more than one way and they are
+# not equally informative. Cloudflare says who we are when there is a who, and
+# only what kind of credential it is when there is not - an API token belongs to
+# no email. Taking the address first and falling back to the credential means
+# the row says "travis@..." where it can and "an API Token" where that is
+# genuinely all there is, instead of one of them always.
 DEPLOY_WHOAMI = {
-    "fly": ["flyctl", "auth", "whoami"],
-    "cloudflare": ["wrangler", "whoami"],
-    "npm": ["npm", "whoami"],
+    # One address on one line, and nothing else in the buffer.
+    "fly": {"cmd": ["flyctl", "auth", "whoami"],
+            "who": (r"^\s*(\S+@\S+\.\S+?)\s*$",)},
+    # "You are logged in with an OAuth Token, associated with the email x@y."
+    "cloudflare": {"cmd": ["wrangler", "whoami"],
+                   "who": (r"associated with the email (\S+?)\.?\s*$",
+                           r"You are logged in with (.+?)\.?\s*$"),
+                   "no": r"^.*not authenticated.*$"},
+    # A bare username, alone on the line.
+    "npm": {"cmd": ["npm", "whoami"], "who": (r"^\s*([\w.@/-]+)\s*$",)},
 }
 
 DEPLOY_SIGNIN = {
@@ -6521,16 +6555,21 @@ def deploy_targets() -> list[dict]:
 def _whoami(provider: str) -> dict:
     """Ask one provider who we are, and report what it said rather than a guess.
 
+    Signed in means two things together: the command succeeded AND it named
+    somebody. Either alone is a claim rather than a fact - see DEPLOY_WHOAMI for
+    the transcript where one of them is true and nobody is signed in.
+
     A timeout is a `no`, not an exception: every one of these reaches the
     network, and this is called from a request thread. An install that is
     missing and a login that is absent are reported apart, because they are
     different problems with different fixes and the operator would otherwise be
     told to sign in to something that is not installed.
     """
-    cmd = DEPLOY_WHOAMI.get(provider)
-    if not cmd:
+    spec = DEPLOY_WHOAMI.get(provider)
+    if not spec:
         return {"ok": False, "installed": False, "who": None,
                 "why": f"nothing here knows how to check {provider!r}"}
+    cmd = spec["cmd"]
     if not shutil.which(cmd[0]):
         return {"ok": False, "installed": False, "who": None,
                 "why": f"{cmd[0]} is not installed"}
@@ -6540,14 +6579,30 @@ def _whoami(provider: str) -> dict:
         return {"ok": False, "installed": True, "who": None,
                 "why": f"{cmd[0]} did not answer: {e}"}
     text = redact((r.stdout + r.stderr).strip())
-    if r.returncode != 0:
-        return {"ok": False, "installed": True, "who": None,
-                "why": last_line(text) or f"{cmd[0]} says we are not signed in"}
-    # The first non-empty line. `wrangler whoami` prints a table and `flyctl`
-    # prints one address; taking the whole buffer would put a box-drawing
-    # diagram through the middle of a status row.
-    return {"ok": True, "installed": True, "who": last_line(text, first=True),
-            "why": None}
+    for pattern in (spec["who"] if r.returncode == 0 else ()):
+        named = re.search(pattern, text, re.M)
+        if named:
+            return {"ok": True, "installed": True,
+                    "who": " ".join(named.group(1).split()), "why": None}
+    return {"ok": False, "installed": True, "who": None,
+            "why": _refusal(text, spec.get("no"))
+                   or f"{cmd[0]} answered but named nobody"}
+
+
+def _refusal(text: str, pattern: str | None = None) -> str:
+    """The one line worth showing when a provider will not name us.
+
+    The last line by default, which is where a CLI that failed puts its error.
+    Where a provider is known to keep talking afterwards - wrangler follows
+    `You are not authenticated` with a suggestion about temporary previews - the
+    line that carries the refusal is named instead, so the operator is not sent
+    to read a workaround in place of the reason.
+    """
+    if pattern:
+        m = re.search(pattern, text, re.M)
+        if m:
+            return " ".join(m.group(0).split())
+    return last_line(text)
 
 
 def last_line(text: str, first: bool = False) -> str:
