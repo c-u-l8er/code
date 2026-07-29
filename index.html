@@ -28,6 +28,7 @@
     <span class="ws-why" id="ws-why"></span>
     <span class="align" id="align"></span>
     <button id="btn-mission" title="what this workspace is for, and whether the work still is">Mission</button>
+    <button id="btn-report" title="the whole workspace as one page: what happened, what is happening, where it is headed">Report</button>
     <button id="btn-settings" title="what spends, and what to switch off">Settings</button>
     <button id="btn-poll" class="primary">Poll</button>
   </div>
@@ -65,8 +66,10 @@
       <button class="tab active" data-tab="dispatch">Dispatch</button>
       <button class="tab" data-tab="goals">Goals</button>
       <button class="tab" data-tab="direction">Direction</button>
+      <button class="tab" data-tab="specs">Specs</button>
       <button class="tab" data-tab="log">Log</button>
       <button class="tab" data-tab="diff">Diff</button>
+      <button class="tab" data-tab="preview">Preview</button>
       <button class="tab" data-tab="ask">Ask GPT-5.6</button>
       <button class="tab" data-tab="history">History</button>
       <button class="tab" data-tab="rulings">Rulings</button>
@@ -129,6 +132,22 @@
       <div id="dir-out" class="direction">loading…</div>
     </div>
 
+    <!-- The selected lane's design documents, and the one thing you can do to
+         them: hand one to the reviewer and the writer and let them argue until
+         they agree it is solid. `docs/spec/` only - a lane that keeps its
+         design in a README is a lane with no spec, and offering to sharpen the
+         README would be agreeing that it does not need one. -->
+    <div class="pane" id="pane-specs">
+      <div class="pane-head">
+        <h3>Specs in <span class="lane-chip" id="sp-lane">&mdash;</span></h3>
+        <div class="row">
+          <button id="btn-specs">Reload</button>
+          <span class="muted" id="sp-status"></span>
+        </div>
+      </div>
+      <div id="sp-out" class="specs">loading…</div>
+    </div>
+
     <div class="pane" id="pane-log">
       <div class="pane-head">
         <h3>Transcript for <span class="lane-chip" id="l-lane">&mdash;</span>
@@ -152,6 +171,51 @@
         </div>
       </div>
       <pre id="f-out" class="diff">Poll a lane, then Load.</pre>
+    </div>
+
+    <!-- The preview runs on its OWN port and is framed from there, not served
+         under a path here: a page only resolves its own absolute paths, and a
+         dev server only reaches its live-reload socket, at the root of an
+         origin. -->
+    <div class="pane" id="pane-preview">
+      <div class="pane-head">
+        <h3>Preview of <span class="lane-chip" id="p-lane">&mdash;</span></h3>
+        <div class="row">
+          <label>from <select id="p-source">
+            <option value="worktree">worker's worktree</option>
+            <option value="repo">your checkout</option>
+          </select></label>
+          <label>dir <input id="p-dir" type="text" placeholder="(root)" size="10"></label>
+          <label>serve <select id="p-mode">
+            <option value="static">static files</option>
+            <option value="command">run a dev server</option>
+          </select></label>
+          <label class="p-cmd-only">cmd <input id="p-cmd" type="text" placeholder="npm run dev" size="18"></label>
+          <button id="btn-p-start" class="primary">Start</button>
+          <button id="btn-p-stop">Stop</button>
+        </div>
+      </div>
+      <div class="preview-bar">
+        <span class="dot" id="p-dot"></span>
+        <a id="p-url" class="p-url" target="_blank" rel="noreferrer">not running</a>
+        <button id="btn-p-reload" title="Reload the frame">&#x21bb;</button>
+        <label title="Reload whenever a file in the tree changes">
+          <input id="p-auto" type="checkbox" checked> auto</label>
+        <select id="p-width" title="Frame width">
+          <option value="0">full</option>
+          <option value="1024">1024 · laptop</option>
+          <option value="768">768 · tablet</option>
+          <option value="390">390 · phone</option>
+        </select>
+        <button id="btn-p-log" title="Show the server's output">log</button>
+        <span class="muted" id="p-status"></span>
+      </div>
+      <div class="preview-stage" id="p-stage">
+        <div class="empty" id="p-empty">Pick a lane and press Start.</div>
+        <iframe id="p-frame" class="hidden" title="preview"
+                sandbox="allow-scripts allow-forms allow-modals allow-popups allow-same-origin"></iframe>
+      </div>
+      <pre id="p-out" class="preview-log hidden"></pre>
     </div>
 
     <div class="pane" id="pane-ask">
@@ -272,6 +336,38 @@ If the architect asks for a file by name it is fetched and sent without another 
   </div>
 </div>
 
+<!-- A report is the whole workspace at one moment, written to a file that
+     outlives the console. The window it covers is "since the last one", which
+     is why taking one is recorded rather than just rendered. -->
+<div id="report" class="modal hidden">
+  <div class="sheet wide">
+    <h3>Report</h3>
+    <p class="muted">One page for the whole workspace: what has happened since the last
+    report, what is running right now, and where this is headed &mdash; with the lanes,
+    the standing problems, and everything the work has reported back. It is a file, not
+    a view: it keeps, it opens without this console, and the next report is measured
+    against it.</p>
+    <div id="rp-since" class="rp-since"></div>
+    <div class="row">
+      <button id="btn-rp-take" class="primary">Take a report</button>
+      <label class="switch" id="rp-web-row">
+        <input id="rp-web" type="checkbox">
+        <span>also search the web for reading</span>
+      </label>
+      <span class="muted" id="rp-status"></span>
+    </div>
+    <p class="muted" id="rp-web-why"></p>
+    <h4>Taken so far</h4>
+    <p class="muted">Solving a report reads its numbers back &mdash; the ones on disk, not
+    today's &mdash; and writes what it makes of them into the proposal queue, scored on the
+    same four axes and held by the same bars and gates as anything else. It adopts nothing
+    and moves no goal: everything it says still has to be taken up by hand.</p>
+    <div id="rp-list" class="rp-list"></div>
+    <div id="rp-solved" class="rp-solved"></div>
+    <div class="row"><button id="btn-rp-close">Close</button></div>
+  </div>
+</div>
+
 <div id="settings" class="modal hidden">
   <div class="sheet wide">
     <h3>Settings</h3>
@@ -322,6 +418,46 @@ If the architect asks for a file by name it is fetched and sent without another 
     looks likelier to finish than a deploy. What it costs is deliberately <em>not</em> a bar:
     it ranks proposals against each other, and the ceiling on spending is the daily one.</p>
     <div id="set-cal" class="setcal"></div>
+
+    <h4>Where your work is kept</h4>
+    <p class="muted">Nothing here has ever lived in the browser &mdash; the board,
+    this chat, every finding, goal and ruling are files on your disk. Alongside
+    them is a <b>SQLite database</b> holding a second copy of every one, plus the
+    previous versions, so a bad write is something you can look back past and a
+    backup is one file rather than a directory.</p>
+    <div id="db-box" class="dbbox">reading&hellip;</div>
+    <label class="switch">
+      <input id="set-db-mirror" type="checkbox">
+      <span>Keep a copy of every save in the database</span>
+    </label>
+    <p class="muted">Off leaves only the JSON files. The files are the ones that
+    are read, always &mdash; the database is the copy, so switching this off
+    cannot lose anything you have now, only the history from here on.</p>
+    <div class="row barrow">
+      <label for="set-db-keep">versions kept per file</label>
+      <input id="set-db-keep" type="number" min="1" max="10000" step="1" class="num">
+      <label for="set-db-sweep">minutes between sweeps</label>
+      <input id="set-db-sweep" type="number" min="0" max="1440" step="1" class="num">
+    </div>
+    <p class="muted">A save copies itself as it happens. The sweep is for the
+    files nothing saves through &mdash; packets, rulings, reports, consult
+    transcripts. 0 turns it off and leaves the button below.</p>
+    <div class="row">
+      <button id="btn-db-backup">Back up now</button>
+      <button id="btn-db-verify">Check the copy</button>
+      <button id="btn-db-export">Download the database</button>
+      <button id="btn-db-prune">Trim old versions</button>
+    </div>
+    <div id="db-report" class="dbreport hidden"></div>
+
+    <h4>Cloud backup</h4>
+    <p class="muted">Not connected to anything yet, and nothing leaves this
+    machine. What is already built for it is the part that is hard to add later:
+    every change is numbered, so a sync only ever has to ask <em>what has
+    happened since number N</em>. Your credentials are the one thing deliberately
+    kept out of this database, so what would be uploaded contains no key.</p>
+    <div id="db-sync" class="dbsync"></div>
+
     <div class="row">
       <button id="btn-set-close">Close</button>
     </div>

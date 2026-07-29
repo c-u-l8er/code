@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import html
 import io
 import json
 import os
@@ -39,6 +40,8 @@ import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import store
 
 HERE = Path(__file__).resolve().parent                   # the program (this repo)
 ROOT = Path(os.environ.get("AMP_ROOT") or HERE.parent)   # workspace holding the lanes
@@ -72,14 +75,21 @@ _STATE_LAYOUT = (
     ("QUEUE_PATH", ".queue.json"),
     ("DOCTRINE_PIN_PATH", ".doctrine.json"),
     ("FINDINGS_PATH", ".findings.json"),
+    ("IDEAS_PATH", ".ideas.json"),
     ("OBLIGATIONS_PATH", ".obligations.json"),
     ("DIRECTION_PATH", ".direction.json"),
     ("SUPERVISOR_PATH", ".supervisor.json"),
+    ("REPORT_PATH", ".reports.json"),
+    ("REPORT_DIR", "reports"),
     ("PACKET_DIR", "packets"),
     ("RULING_DIR", "rulings"),
     ("WORKTREE_DIR", "worktrees"),
     ("CONSULT_DIR", "consults"),
     ("GOAL_DIR", "goals"),
+    ("SPECRUN_DIR", "specruns"),
+    ("SPECRATE_PATH", ".specrates.json"),
+    ("SPECPLAN_PATH", ".specplans.json"),
+    ("SPECAUTO_PATH", ".specauto.json"),
 )
 
 
@@ -92,6 +102,12 @@ def _bind_state(base: Path) -> None:
 
 
 _bind_state(STATE_ROOT)
+
+# The SQLite mirror sits under the state ROOT, not under a workspace: one file
+# holds every workspace, so "back this up" and "sync this" name one thing.
+# Binding here rather than per-workspace is why a workspace switch needs to
+# tell it nothing.
+store.bind(STATE_ROOT)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -236,9 +252,15 @@ def load_json(path: Path, default):
 
 def save_json(path: Path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(data, indent=2, sort_keys=True) + "\n"
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    tmp.write_text(text)
     tmp.replace(path)
+    # The second copy, taken from the bytes we just wrote rather than by
+    # reading the file back - so the mirror holds this write even if the next
+    # one lands a millisecond later. It cannot raise and the file above is
+    # already durable, so a broken mirror costs history, never state.
+    store.record(path, text)
 
 
 def config() -> dict:
@@ -561,13 +583,17 @@ def update_task(lane_name: str, task_id: str, patch: dict):
 _CHAT_LOCK = threading.Lock()
 
 
-def add_note(text: str, lane: str | None = None) -> dict:
+def add_note(text: str, lane: str | None = None, kind: str | None = None) -> dict:
     """A line the operator typed into the orchestrator thread.
 
     Only notes are stored. Everything else in the thread is derived from the
     board, so the feed can never drift from what the workers actually did.
+
+    `kind` is how the thread tells an ordinary line from one it should show
+    differently - an `idea` is a passing remark, not a report.
     """
-    note = {"id": uuid.uuid4().hex[:12], "at": now(), "text": text, "lane": lane}
+    note = {"id": uuid.uuid4().hex[:12], "at": now(), "text": text, "lane": lane,
+            "kind": kind}
     with _CHAT_LOCK:
         chat = load_json(CHAT_PATH, {"notes": []})
         chat.setdefault("notes", []).append(note)
@@ -811,6 +837,27 @@ def findings(*, lane: str | None = None, unread_only: bool = False) -> list[dict
                                       f.get("at") or ""), reverse=True)
 
 
+def settle_finding(fid: str, settlement: dict) -> bool:
+    """Close a finding because something was DONE about it.
+
+    Not the same act as `ack_findings`, and the difference is the whole point.
+    An ack says the operator has seen it, which only the operator can make true.
+    A settlement says the harness performed a specific, recorded consequence -
+    a rung retracted, a later finding that supersedes this one, a proposal
+    filed - and carries the id of that consequence. If the consequence could not
+    be performed there is no settlement, and the finding stays unread.
+    """
+    with _FINDINGS_LOCK:
+        store = load_json(FINDINGS_PATH, {"findings": []})
+        for f in store.get("findings", []):
+            if f.get("id") == fid and not f.get("read_at"):
+                f["read_at"] = now()
+                f["settled"] = settlement
+                save_json(FINDINGS_PATH, store)
+                return True
+    return False
+
+
 def ack_findings(ids: list[str]) -> int:
     """Mark findings as told to the operator. Only they can make this true."""
     want = set(ids or ())
@@ -831,6 +878,124 @@ def findings_summary() -> dict:
     return {"unread": len(unread),
             "contradicted": sum(1 for f in unread if f["bearing"] == "contradicted"),
             "top": unread[0] if unread else None}
+
+
+# ------------------------------------------------------------------- ideas
+#
+# The other thing a worker learns and nobody keeps.
+#
+# A finding is about the doctrine: something we believed turned out to be false,
+# or a claim moved up the ladder. That channel is narrow on purpose, and it has
+# a cost - it feeds the contradictions gate, so filing into it stops the fleet.
+# But most of what a worker notices is neither: it is "while I was in here I saw
+# that X would obviously be worth doing", and there has been nowhere to put it.
+# It goes into a transcript, the worktree is thrown away, and the idea is gone.
+#
+# So: a second, cheap channel. It is deliberately NOT a finding.
+#   - it gates nothing and interrupts nothing;
+#   - it says one line in the chat when it arrives, which is all the operator
+#     asked for at the moment it arrives;
+#   - and it accumulates, so the report and the solver can read a season of them
+#     at once and turn the ones that are still good into actual proposals.
+#
+# An idea is a lead, not a claim. Nothing here is scored, adopted or acted on
+# until something that CAN be held to the bars picks it up.
+
+# IDEAS_PATH is bound by _bind_state; see _STATE_LAYOUT.
+_IDEAS_LOCK = threading.Lock()
+
+# `IDEA:`, `## IDEA:`, `**IDEA:**`, `- IDEA:`. Every one of them, not the last:
+# a worker that noticed three things should not have two of them dropped.
+_IDEA_HEAD = re.compile(r"^[\s>#*_-]*IDEAS?[\s*_]*:[\s*_]*(.+)$", re.I | re.M)
+
+IDEA_MAX = 400
+
+
+def parse_ideas(text: str) -> list[str]:
+    """Every `IDEA:` line in a report, one line each, in the order written."""
+    out = []
+    for m in _IDEA_HEAD.finditer(text or ""):
+        line = m.group(1).strip().strip("*_ \t")
+        # "none" is the ordinary answer here too, and storing it would bury the
+        # real ones exactly as it would in findings.
+        if line and line.lower() not in ("none", "none.", "n/a", "-"):
+            out.append(line[:600])
+    return out
+
+
+def record_ideas(texts: list[str], *, lane: str | None = None,
+                 source: str = "worker", **where) -> list[dict]:
+    """File leads. Repeats of something already filed are dropped, not stacked.
+
+    Workers on the same lane notice the same obvious thing repeatedly, and a
+    list with the same line on it eleven times reads as noise rather than as
+    eleven agreements - so a repeat bumps `seen` on the one already there.
+    """
+    fresh = []
+    with _IDEAS_LOCK:
+        store = load_json(IDEAS_PATH, {"ideas": []})
+        rows = store.setdefault("ideas", [])
+        by_text = {_norm_prompt(i["text"]): i for i in rows}
+        for t in texts:
+            t = (t or "").strip()
+            if not t:
+                continue
+            old = by_text.get(_norm_prompt(t))
+            if old:
+                old["seen"] = int(old.get("seen") or 1) + 1
+                old["last_at"] = now()
+                continue
+            row = {"id": "i" + uuid.uuid4().hex[:9], "at": now(), "text": t[:600],
+                   "lane": lane, "source": source, "seen": 1, "state": "open",
+                   **{k: v for k, v in where.items() if v}}
+            rows.append(row)
+            by_text[_norm_prompt(t)] = row
+            fresh.append(row)
+        store["ideas"] = rows[-IDEA_MAX:]
+        save_json(IDEAS_PATH, store)
+    return fresh
+
+
+def record_worker_ideas(lane_name: str, rec: dict) -> list[dict]:
+    """Whatever a finished worker noticed in passing, and said one line about.
+
+    Read from `result`, the worker's own last message, for the same reason the
+    finding is: the report the architect gets carries a diff, and a diff can
+    contain the word.
+    """
+    fresh = record_ideas(parse_ideas(rec.get("result") or ""), lane=lane_name,
+                         source="worker", task_id=rec.get("task_id"),
+                         goal_id=rec.get("goal_id"))
+    for i in fresh:
+        # Briefly, in the chat, as it arrives. That is the whole point: it is
+        # said once, cheaply, and then it waits.
+        add_note(f"idea from {lane_name}: {i['text']}", lane=lane_name, kind="idea")
+    return fresh
+
+
+def ideas(*, lane: str | None = None, open_only: bool = True) -> list[dict]:
+    """Newest first, and the ones several workers hit on ahead of the rest."""
+    out = load_json(IDEAS_PATH, {"ideas": []}).get("ideas", [])
+    if lane:
+        out = [i for i in out if i.get("lane") == lane]
+    if open_only:
+        out = [i for i in out if i.get("state", "open") == "open"]
+    return sorted(out, key=lambda i: (int(i.get("seen") or 1), i.get("at") or ""),
+                  reverse=True)
+
+
+def close_ideas(ids: list[str], state: str = "picked") -> int:
+    """Take ideas off the list - picked up, or not worth it. Both are answers."""
+    want = set(ids or ())
+    n = 0
+    with _IDEAS_LOCK:
+        store = load_json(IDEAS_PATH, {"ideas": []})
+        for i in store.get("ideas", []):
+            if i.get("id") in want and i.get("state", "open") == "open":
+                i["state"], i["closed_at"] = state, now()
+                n += 1
+        save_json(IDEAS_PATH, store)
+    return n
 
 
 # ------------------------------------------------------------------ obligations
@@ -990,6 +1155,12 @@ Findings come back to you through the harness, not by you going to look:
   curl -s -X POST {base}/api/findings/ack \\
        -H 'content-type: application/json' -d '{{"ids":["ID","ID"]}}'
       mark findings as told to the operator, once you have actually told them
+  curl -s '{base}/api/ideas'
+      the other channel: things workers noticed in passing while doing something
+      else, one line each, never judged. Not findings - they gate nothing and
+      mean nothing until something picks them up. Do not read this list out
+      unprompted; mention one only when the operator is asking what is worth
+      doing next, and say that nobody has assessed it.
 
 You may propose an amendment to the doctrine and you must not make one. If work
 here shows a rule is wrong, or there is a value worth adding, say so to the
@@ -1145,6 +1316,14 @@ saying which of `advanced` / `contradicted` / `proposed` / `none` its work bears
 on, and why. A goal's workers are already asked this. `none` is the ordinary
 answer and is fine; an invented finding is worse than no finding.
 
+Ask them for `IDEA:` lines too, verbatim:
+
+{ideas}
+
+Those land on a list nobody has to read today. They gate nothing and start
+nothing. A report can pick them up later, which is the only reason they are
+worth writing down at all - so do not act on one because you saw it here.
+
 What you cannot do, and must not promise:
 - **You stop existing the moment you reply.** There is no background you. Never
   say you will watch for something, check back, follow up, or do anything
@@ -1191,7 +1370,7 @@ git, specifically:
 
 def orchestrator_brief(base_url: str) -> str:
     return ORCH_BRIEF.format(
-        root=ROOT, base=base_url, landing=landing_rule(),
+        root=ROOT, base=base_url, landing=landing_rule(), ideas=idea_rule(),
         doctrine=mission_block() + doctrine_block("What we are held to"))
 
 
@@ -4760,6 +4939,246 @@ def plan_goal(gid: str) -> dict:
     return goal_dispatch(gid)
 
 
+# ------------------------------------------------------- reopening a live goal
+#
+# Two things an operator can do to a goal that is already open, and they are
+# different operations however similar they look on a page:
+#
+#   RECALCULATE keeps the objective and rebuilds the plan against the repository
+#   as it is NOW. A plan is written once, against a tree that then changes for
+#   hours - by this goal's own workers, and by every other lane's. Its later
+#   tasks were written for a repository that no longer exists, and its
+#   done-conditions can be checking a path somebody has since moved.
+#
+#   IMPROVE changes the objective itself, because the plan is fine and the thing
+#   being asked for is what cannot land.
+#
+# Neither runs on the heartbeat. Each is an architect call, and each rewrites
+# work in flight - that is an operator's decision both times.
+
+GOAL_REPLAN_SYSTEM = (
+    "You are the consulting architect. You planned this objective earlier, work has "
+    "happened since, and the repository is not what it was when you planned it. Write the "
+    "plan you would write for this same objective TODAY.\n\n"
+    "Reply with one JSON object and nothing else, in exactly the shape you used before:\n"
+    "{\n"
+    '  "done": [{"text": "a single checkable condition", "check": "shell command or null"}],\n'
+    '  "tasks": [{"text": "one instruction to one worker, in order"}],\n'
+    '  "questions": ["a decision only the operator can make"]\n'
+    "}\n\n"
+    "Rules:\n"
+    "- The objective does not change. You are re-deriving how to reach it, not what it is.\n"
+    "- A done-condition already met is settled. Restate it in the SAME WORDS if it still "
+    "belongs to this objective - matching text is how its evidence is kept - and leave it "
+    "out only if the objective genuinely no longer needs it. You may not reword a met "
+    "condition; that silently discards the evidence that met it.\n"
+    "- Drop tasks that the work since has made pointless, and say nothing about them. "
+    "Keep the wording of a task that is still right, so its state carries over.\n"
+    "- Ground every item in the repository state you were given, which is current. This is "
+    "the whole point of the call: a check that names a file nobody has, or a task written "
+    "for a layout that has since moved, is what you are here to correct.\n"
+    "- If the work since has revealed something only the operator can decide, ask it. "
+    "Asking stops the goal, so ask only for what a worker could not go and find out."
+)
+
+GOAL_IMPROVE_SYSTEM = (
+    "You are the consulting architect. An objective is open and is not landing. Say whether "
+    "it can be made to land, and if so what it should say instead.\n\n"
+    "Reply with one JSON object and nothing else:\n"
+    "{\n"
+    '  "objective": "the revised objective, or null to leave it alone",\n'
+    '  "what_changed": "what you narrowed or split off, and which unknown that kills",\n'
+    '  "why": "why this version can land where the current one cannot",\n'
+    '  "keeps_the_point": "what the mission wanted from the original, and where it is in '
+    'this one",\n'
+    '  "assessment": "what is actually stopping it, in two or three sentences"\n'
+    "}\n\n"
+    "Rules:\n"
+    "- Work already met against the current objective stays met. A revision that invalidates "
+    "a satisfied done-condition is not an improvement, it is a restart wearing the same "
+    "goal id - return null and say so.\n"
+    "- Narrowing until the mission no longer wants it is the failure this call exists to "
+    "avoid. `keeps_the_point` is where you show it did not happen; if you cannot fill that "
+    "field honestly, return null.\n"
+    "- You may not raise the odds by deciding something that is the operator's. If what is "
+    "stopping it is money, a credential, an account, a deploy target, or what counts as good "
+    "enough, the honest revision is one that DOES NOT NEED that - never one that assumes it, "
+    "and never one that redefines done so the missing thing stops mattering. If no such "
+    "revision exists, return null and name the thing.\n"
+    "- Returning null is a real answer and often the right one. The goal stays exactly as "
+    "it is, and the operator learns what it is waiting on."
+)
+
+
+def _reopen_doc(g: dict) -> str:
+    """A live goal, its evidence, and the repository underneath it right now."""
+    done = "\n".join(
+        f"- [{'met' if d.get('met') else 'not met'}] {d['text']}"
+        + (f"\n    check: `{d['check']}`" if d.get("check") else "")
+        + (f" (exit {d['check_exit']})" if d.get("check_exit") is not None else "")
+        + (f"\n    evidence: {str(d.get('evidence'))[:300]}" if d.get("evidence") else "")
+        for d in g.get("done") or []) or "(none)"
+    tasks = "\n".join(f"- ({t.get('state')}) {t.get('text')}"
+                      for t in g.get("tasks") or []) or "(none)"
+    log = "\n".join(f"- {e.get('at')}: {str(e.get('text'))[:300]}"
+                    for e in (g.get("log") or [])[-14:]) or "(nothing yet)"
+    return (f"# Objective\n\n{g['objective']}\n\n"
+            f"# The definition of done, as it stands\n\n{done}\n\n"
+            f"# The task list, as it stands\n\n{tasks}\n\n"
+            f"# What has happened on this goal\n\n{log}\n\n"
+            f"- rounds used: {g.get('rounds', 0)} of {GOAL_MAX_ROUNDS}\n"
+            f"- stopped on: {g.get('stopped_on') or 'nothing, it is live'}\n"
+            + mission_block()
+            + doctrine_block("What this work is held to")
+            + f"\n\n# The repository right now\n\n{goal_brief(g['lane'])}")
+
+
+def _reopenable(gid: str) -> tuple[dict | None, str]:
+    """The goal, or why it may not be reopened. Shared by both operations."""
+    g = load_goal(gid)
+    if not g:
+        return None, f"no goal {gid!r}"
+    if g.get("state") == "done":
+        return None, "a finished goal is not replanned - propose the next one instead"
+    if any(t.get("state") == "running" for t in g.get("tasks") or []):
+        # The worker is out against the task list it was handed. Rewriting that
+        # list underneath it means its result comes back matching nothing, and
+        # the session is spent for a report nobody can file.
+        return None, "a worker is out on this goal - wait for it to report, then try again"
+    if not architect_available():
+        return None, architect_off_reason()
+    return g, ""
+
+
+def recalculate_goal(gid: str) -> dict:
+    """Rebuild a live goal's plan against the repository as it is now.
+
+    Met conditions keep their evidence, matched on text - which is why the
+    system prompt forbids rewording one. Task state carries over the same way.
+    """
+    g, why = _reopenable(gid)
+    if not g:
+        return {"ok": False, "error": why}
+
+    checks = run_goal_checks(gid)          # so the architect judges live results
+    g = load_goal(gid)
+    plan, raw = _goal_chat(g, GOAL_REPLAN_SYSTEM, _reopen_doc(g))
+    if not plan:
+        goal_log(gid, "the architect's replan could not be read as JSON", raw=raw[:2000])
+        return {"ok": False, "error": "the architect's answer could not be read as JSON"}
+
+    with _GOAL_LOCK:
+        g = load_goal(gid)
+        was_done = {d["text"]: d for d in g.get("done") or []}
+        was_tasks = {t["text"]: t for t in g.get("tasks") or []}
+        kept_done = kept_tasks = 0
+        fresh_done = []
+        for d in (plan.get("done") or []):
+            text = str(d.get("text") or "").strip()
+            if not text:
+                continue
+            old = was_done.get(text)
+            if old and old.get("met"):
+                kept_done += 1
+                old["check"] = d.get("check") or None
+                fresh_done.append(old)
+            else:
+                fresh_done.append({"text": text, "check": d.get("check") or None,
+                                   "met": False, "evidence": ""})
+        fresh_tasks = []
+        for t in (plan.get("tasks") or []):
+            text = str(t.get("text") or "").strip()
+            if not text:
+                continue
+            old = was_tasks.get(text)
+            if old:
+                kept_tasks += 1
+                fresh_tasks.append(old)
+            else:
+                fresh_tasks.append({"id": "t" + uuid.uuid4().hex[:6], "text": text,
+                                    "state": "todo"})
+        dropped = [t["text"] for t in was_tasks.values() if t["text"] not in
+                   {x["text"] for x in fresh_tasks}]
+        lost = [t for t in was_done if t not in {d["text"] for d in fresh_done}
+                and was_done[t].get("met")]
+        g["done"], g["tasks"] = fresh_done, fresh_tasks
+        g["questions"] = [q for q in (plan.get("questions") or []) if str(q).strip()]
+        g["replanned_at"] = now()
+        # Whatever it was stopped on, it was stopped under the OLD plan. Holding
+        # the stop across a replan would make the button do nothing visible.
+        g["state"], g["stopped_on"] = "running", None
+        save_goal(g)
+
+    note = (f"recalculated: {len(g['done'])} done-condition(s) ({kept_done} already met kept), "
+            f"{len(g['tasks'])} task(s) ({kept_tasks} carried over, {len(dropped)} dropped)")
+    goal_log(gid, note, checks=len(checks or []))
+    if lost:
+        # Named, because it is the one thing this operation can quietly destroy.
+        goal_log(gid, "these met conditions are no longer in the definition of done: "
+                      + "; ".join(lost)[:400])
+    add_note(f"goal {gid} ({g['lane']}) {note}", lane=g.get("lane"))
+    if g["questions"]:
+        return {"ok": True, "goal": _goal_stop(gid, "operator",
+                                               "It asks: " + "; ".join(g["questions"])[:400]),
+                "kept_done": kept_done, "dropped_tasks": dropped, "lost_met": lost}
+    if not g["tasks"]:
+        # Every task gone and nothing new. That is the architect saying the plan
+        # is finished, not that it is empty - let the review settle it.
+        return {"ok": True, "goal": goal_review(gid, "the plan was recalculated and came back "
+                                                     "with no remaining tasks"),
+                "kept_done": kept_done, "dropped_tasks": dropped, "lost_met": lost}
+    return {"ok": True, "goal": goal_dispatch(gid), "kept_done": kept_done,
+            "dropped_tasks": dropped, "lost_met": lost}
+
+
+def improve_goal(gid: str, *, apply: bool = False) -> dict:
+    """Ask whether a live goal's objective can be made to land, and optionally do it.
+
+    Two steps on purpose. Changing the objective of work already in flight is
+    not a thing to do on one click and a hope - the first call answers, the
+    operator reads it, and a second call with `apply` commits to it.
+    """
+    g, why = _reopenable(gid)
+    if not g:
+        return {"ok": False, "error": why}
+
+    out, raw = _goal_chat(g, GOAL_IMPROVE_SYSTEM, _reopen_doc(g))
+    if not out:
+        goal_log(gid, "the architect's improvement could not be read as JSON", raw=raw[:2000])
+        return {"ok": False, "error": "the architect's answer could not be read as JSON"}
+
+    revised = str(out.get("objective") or "").strip()
+    ans = {"ok": True, "goal_id": gid, "objective": revised or None,
+           "was": g["objective"],
+           "what_changed": str(out.get("what_changed") or "")[:600],
+           "why": str(out.get("why") or "")[:600],
+           "keeps_the_point": str(out.get("keeps_the_point") or "")[:600],
+           "assessment": str(out.get("assessment") or "")[:1000],
+           "applied": False}
+    if not revised or _norm_prompt(revised) == _norm_prompt(g["objective"]):
+        ans["objective"] = None
+        goal_log(gid, "improvement: left alone - " + (ans["assessment"] or "no reason given"))
+        return ans
+    if not apply:
+        goal_log(gid, f"improvement offered: {revised[:300]}", what_changed=ans["what_changed"])
+        return ans
+
+    with _GOAL_LOCK:
+        cur = load_goal(gid)
+        cur.setdefault("objective_history", []).append(
+            {"at": now(), "was": cur["objective"], "what_changed": ans["what_changed"]})
+        cur["objective"] = revised[:2000]
+        save_goal(cur)
+    goal_log(gid, f"objective replaced: {revised[:300]}", what_changed=ans["what_changed"])
+    add_note(f"goal {gid} ({g['lane']}) objective improved: {ans['what_changed'][:200]}",
+             lane=g.get("lane"))
+    # A new objective and an old plan is the one state this must not leave
+    # behind: the tasks would be working toward something nobody asked for.
+    ans["applied"] = True
+    ans["recalculated"] = recalculate_goal(gid)
+    return ans
+
+
 # What to tell a worker about the clock, learned the hard way.
 #
 # A worker stopped by a limit keeps everything it wrote to disk and loses
@@ -4815,7 +5234,27 @@ def goal_worker_prompt(g: dict, task: dict) -> str:
         f"End your report with a section headed `DOCTRINE:` on its own line, whose first "
         f"word is one of `advanced`, `contradicted`, `proposed` or `none`, followed by a "
         f"sentence or two. `none` means this was ordinary work, and is the right answer most "
-        f"of the time - do not invent a finding to fill the section."
+        f"of the time - do not invent a finding to fill the section.\n\n"
+        f"{idea_rule()}"
+    )
+
+
+def idea_rule() -> str:
+    """What to do with something worth building that is not this task.
+
+    A worker is the only thing that ever reads this code with its hands in it,
+    and what it notices there is thrown away with the worktree. One line costs
+    nothing and gates nothing - it is a lead, filed and left alone until a report
+    or the operator decides it is worth anything.
+    """
+    return (
+        "If, while doing this, you notice something worth building or fixing that is NOT "
+        "part of this task - a feature nobody has asked for yet, a goal that obviously "
+        "wants opening, a piece of this that is quietly wrong - write one line for each, "
+        "each beginning `IDEA:` on its own line. One sentence, concrete, and say where you "
+        "saw it. Do not act on any of them and do not widen your task by even one file: "
+        "they are noted for later and nothing more. This is optional and most reports will "
+        "have none - an invented idea costs more than a missing one."
     )
 
 
@@ -5886,7 +6325,16 @@ def open_proposals() -> list[dict]:
 
 DEFAULT_ADOPT_CONFIDENCE = 0.6
 DEFAULT_ADOPT_NEED = 0.5
-SHARPEN_MAX_ROUNDS = 2
+
+# A round that moved the odds by less than this moved nothing worth paying for.
+# Sharpening stops when the sharpening stops working, not after a set number of
+# tries - see `sharpen_converged`.
+SHARPEN_GAIN_FLOOR = 0.02
+
+# The spend backstop, and nothing more. Convergence is the real stopping rule;
+# this exists only so an objective that improves by a hair every time cannot
+# bill for ever.
+SHARPEN_HARD_CAP = 6
 
 # Below this much headroom the harness stops spending calls on a proposal by
 # itself. Not a bar the operator sets, because it is not a decision about how
@@ -6031,6 +6479,57 @@ def _record_block(lane_name: str) -> str:
 LADDER_RUNGS = ("spec", "in_tree", "live_local", "live_deployed", "external")
 
 
+def _rung_key(lane_name: str | None, claim: str, to: str) -> str:
+    """What makes two mentions of a ladder entry the same entry.
+
+    A ladder entry has no id - it is prose written by a reviewer - so the claim
+    text is all there is to match on. Normalised, because the finding that
+    retracts an entry quotes it rather than copying it.
+    """
+    return f"{lane_name or ''}\u0000{_norm_prompt(claim or '')}\u0000{to or ''}"
+
+
+def retractions() -> dict[str, dict]:
+    """Ladder entries a later judgement has taken back, by `_rung_key`."""
+    return {_rung_key(r.get("lane"), r.get("claim"), r.get("to")): r
+            for r in direction_store().get("retractions", [])}
+
+
+def retract_rung(lane_name: str, claim: str, to: str, why: str, *,
+                 finding_id: str | None = None, source: str = "settle") -> dict | None:
+    """Take back a rung a review recorded, because the evidence did not hold.
+
+    The review itself is left exactly as written - it is the record of what was
+    said at the time, and editing it would destroy the only account of how the
+    mistake was made. The retraction sits beside it and `lane_rungs` stops
+    counting the entry, which is the only thing that has to change.
+
+    Returns None if no such entry was ever recorded. That matters: it is the
+    check that stops a retraction inventing the claim it walks back.
+    """
+    key = _rung_key(lane_name, claim, to)
+    hit = None
+    for r in direction_store().get("reviews", []):
+        for e in (r.get("ladder") or []):
+            if _rung_key(r.get("lane"), e.get("claim"), e.get("to")) == key:
+                hit = {"review_id": r.get("id"), "at_review": r.get("at"),
+                       "from": e.get("from"), "evidence": e.get("evidence")}
+                break
+    if not hit:
+        return None
+    if key in retractions():
+        return retractions()[key]
+    rec = {"id": "x" + uuid.uuid4().hex[:9], "at": now(), "lane": lane_name,
+           "claim": (claim or "")[:1000], "to": to, "from": hit["from"],
+           "why": (why or "")[:1000], "finding_id": finding_id, "source": source,
+           "review_id": hit["review_id"]}
+    with _DIRECTION_LOCK:
+        store = direction_store()
+        store.setdefault("retractions", []).append(rec)
+        _save_direction(store)
+    return rec
+
+
 def lane_rungs() -> dict[str, str]:
     """The highest rung each lane has actually been judged to reach.
 
@@ -6039,13 +6538,21 @@ def lane_rungs() -> dict[str, str]:
     that list is the furthest the lane's evidence has ever got. This is the
     single most useful fact for judging how much the mission wants a proposal,
     and it is exactly what an architect reading one objective cannot see.
+
+    Retracted entries do not count. Without that this reading is monotonic by
+    construction - the highest rung ever claimed can never fall, even after a
+    later review judges that it was never earned - and a lane that overstated
+    itself once would go on being scored as if it had not.
     """
+    gone = retractions()
     top: dict[str, str] = {}
     for r in direction_store().get("reviews", []):
         lane_name = r.get("lane")
         for e in (r.get("ladder") or []):
             rung = e.get("to")
             if not lane_name or rung not in LADDER_RUNGS:
+                continue
+            if _rung_key(lane_name, e.get("claim"), rung) in gone:
                 continue
             if lane_name not in top or LADDER_RUNGS.index(rung) > LADDER_RUNGS.index(top[lane_name]):
                 top[lane_name] = rung
@@ -6335,6 +6842,14 @@ def _direction_context(g: dict, sections: list[dict]) -> str:
     stands = _need_block(lane_name)
     if stands:
         parts.append(stands)
+    # What this lane is FOR. Explore has been given this since it was written and
+    # a review never was, which is backwards: explore proposes into a lane it has
+    # no goal in, and a review proposes into the lane it just watched work in -
+    # so the review is where `need` is scored most often, and it was the one
+    # scoring it against nothing on disk.
+    spec = _specs_block(lane_name, [])
+    if spec:
+        parts.append(spec)
     parts.append(f"# The repository right now\n\n{goal_brief(lane_name)}")
     return "\n\n".join(parts)
 
@@ -6418,6 +6933,1628 @@ EXPLORE_SYSTEM = (
 )
 
 
+# Where a lane keeps the documents that say what it is FOR. Ordered, because the
+# budget runs out and the first match should be the most load-bearing one.
+_SPEC_GLOBS = ("docs/spec/README.md", "docs/spec/*.md", "docs/spec/*/*.md",
+               "prompts/*.md", "docs/*.md",
+               "SPEC.md", "DESIGN.md", "ARCHITECTURE.md", "ROADMAP.md", "README.md")
+
+# Historical spec versions. A superseded design read as current is worse than no
+# design at all: it proposes work that was already decided against.
+_SPEC_SKIP = re.compile(r"(^|/)(old_scrap|node_modules|_build|deps|archive|\.git)(/|$)")
+
+# Budgets. Every one of these is a bill: eleven lanes at four documents each is a
+# hundred thousand characters of context on a button nobody watches. Reading one
+# lane deeply is worth paying for; reading all of them deeply is paying to be told
+# what the top of each README already said.
+SPEC_FILE_LINES = 40      # opening lines, per file
+SPEC_FILE_CHARS = 3000    # hard cap, per file
+SPEC_LANE_FILES = 2       # per lane when the whole stack is being read
+SPEC_FOCUS_FILES = 8      # per lane when that one lane is the subject
+
+
+def _spec_outline(path: Path, lines: int = SPEC_FILE_LINES) -> str:
+    """A design document reduced to what it claims, not what it says.
+
+    The headings plus the opening prose. A spec is mostly detail that only
+    matters once you are implementing against it, and the part that says what
+    the thing is FOR is the title, the section names and the first paragraph.
+    Sending the whole file would spend the context window proving that.
+    """
+    try:
+        raw = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    body = raw.splitlines()
+    opening = [ln for ln in body[:lines] if ln.strip()][:lines]
+    heads = [ln.strip() for ln in body if re.match(r"^#{1,3}\s+\S", ln)]
+    out = "\n".join(opening)
+    # Only when there is more structure than the opening already showed. A
+    # heading list that repeats the lines above it is noise wearing a label.
+    rest = [h for h in heads if h not in opening]
+    if len(rest) > 2:
+        out += "\n\n<!-- remaining sections -->\n" + "\n".join(rest[:25])
+    return out[:SPEC_FILE_CHARS]
+
+
+def _lane_specs(lane_name: str, *, limit: int) -> list[tuple[str, Path]]:
+    """The design documents in one lane's repo, best first, deduplicated."""
+    lane = (config().get("lanes") or {}).get(lane_name) or {}
+    root = (ROOT / lane.get("path", ".")).resolve()
+    if not root.is_dir():
+        return []
+    out, seen = [], set()
+    for pattern in _SPEC_GLOBS:
+        for f in sorted(root.glob(pattern)):
+            rel = str(f.relative_to(root))
+            if f in seen or not f.is_file() or _SPEC_SKIP.search(rel):
+                continue
+            seen.add(f)
+            out.append((rel, f))
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _specs_block(lane: str | None, names: list[str], *, limit: int | None = None) -> str:
+    """What each lane's own documents say it is for.
+
+    Explore used to be given lane NAMES and a repo path and nothing else - so
+    "where should this lane go next" was answered from the lane's findings and
+    its commit log, which record what has been done and say nothing about what
+    it was ever meant to do. The specs are the only place the intent is written
+    down, and they were the one thing the call could not see.
+
+    Read at the time of the call rather than cached. A spec that changed this
+    morning is exactly the case where exploring is worth paying for.
+    """
+    want = [lane] if lane else names
+    per = limit if limit is not None else (SPEC_FOCUS_FILES if lane else SPEC_LANE_FILES)
+    blocks = []
+    for name in want:
+        docs = _lane_specs(name, limit=per)
+        if not docs:
+            continue
+        body = []
+        for rel, f in docs:
+            text = _spec_outline(f)
+            if text.strip():
+                body.append(f"### `{name}/{rel}`\n```markdown\n{text}\n```")
+        if body:
+            blocks.append(f"## {name}\n\n" + "\n\n".join(body))
+    if not blocks:
+        return ""
+    return ("# What these lanes' own design documents say they are for\n\n"
+            "Headings and opening prose, read off disk just now. A proposal that "
+            "contradicts a lane's own spec is either wrong or is an argument that "
+            "the spec has been overtaken - say which, in `why`.\n\n"
+            + "\n\n".join(blocks))
+
+
+# ------------------------------------------------------------------ spec review
+#
+# A lane's spec is the one document every `need` score in that lane is judged
+# against, and until now nothing in the harness could improve one - the console
+# could only report that a spec was thin. This is the loop that fixes that: the
+# architect reads the document and says what is wrong with it, a worker rewrites
+# it in the lane's worktree, and the architect reads the rewrite. It ends when
+# both of them say it is solid, not when a counter runs out.
+
+
+# The spend backstop, the same shape as `SHARPEN_HARD_CAP` and for the same
+# reason. Agreement is the stopping rule; this is only here so a pair that
+# cannot converge cannot bill forever.
+SPEC_MAX_ROUNDS = 6
+
+# The document as sent to the architect. Big enough for a real spec - unlike
+# `SPEC_FILE_CHARS`, which is an outline budget for a call that is reading
+# eleven lanes at once. This call is reading one file and is supposed to have
+# all of it, because a reviewer shown two thirds of a document will report the
+# missing third as a defect.
+SPEC_REVIEW_CHARS = 90_000
+
+_SPECRUN_LOCK = threading.Lock()
+
+# Set by the server: how a spec run sends its worker out. Same arrangement as
+# `ON_GOAL_DISPATCH` - the library knows what to ask for, the server owns the
+# lane locks and the worker cap that decide whether it can be asked for now.
+ON_SPEC_DISPATCH = None
+
+# Set by the server for the same reason, but a plain dispatch body rather than
+# a spec run: the unattended loop asks for the FIRST document, and there is no
+# run to attach it to yet.
+ON_DRAFT_DISPATCH = None
+
+
+def lane_spec_files(lane_name: str) -> list[dict]:
+    """Every markdown document in this lane's `docs/spec/`.
+
+    Not the reader's fallback ladder and not a budget - the actual list, so the
+    operator can pick the one to work on. `docs/spec/` only, because that is
+    where a lane's design is supposed to live and a tab that offers to sharpen
+    `README.md` would be quietly agreeing that it does not have to.
+    """
+    lane = (config().get("lanes") or {}).get(lane_name) or {}
+    root = (ROOT / lane.get("path", ".")).resolve()
+    # Both trees. A document a worker has written but you have not merged yet
+    # exists only in `amp/<lane>`, and leaving it off this list would mean the
+    # one button that creates a spec produces nothing visible on the tab that
+    # offered it - so the first thing anyone would do is press it again.
+    seen: dict[str, dict] = {}
+    for base, only_in_worktree in ((root, False), (WORKTREE_DIR / lane_name, True)):
+        spec_root = base / "docs" / "spec"
+        if not spec_root.is_dir():
+            continue
+        for f in sorted(spec_root.rglob("*.md")):
+            rel = str(f.relative_to(base))
+            if not f.is_file() or _SPEC_SKIP.search(rel) or rel in seen:
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            seen[rel] = {
+                "rel": rel, "bytes": st.st_size,
+                "at": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+                "lines": sum(1 for _ in f.open(errors="replace")),
+                # Named, because "this document exists" and "this document
+                # exists in a worktree you have not read yet" are different
+                # claims and only one of them is true of your repository.
+                "unmerged": only_in_worktree,
+            }
+    return [seen[k] for k in sorted(seen)]
+
+
+def specrun_path(rid: str) -> Path:
+    return SPECRUN_DIR / f"{Path(rid).name}.json"
+
+
+def load_specrun(rid: str) -> dict | None:
+    p = specrun_path(rid)
+    return json.loads(p.read_text()) if p.is_file() else None
+
+
+def save_specrun(r: dict):
+    SPECRUN_DIR.mkdir(parents=True, exist_ok=True)
+    save_json(specrun_path(r["id"]), r)
+
+
+def specruns(lane: str | None = None, rel: str | None = None) -> list[dict]:
+    """Summaries, newest first."""
+    if not SPECRUN_DIR.exists():
+        return []
+    out = []
+    for p in SPECRUN_DIR.glob("*.json"):
+        try:
+            r = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if (lane and r.get("lane") != lane) or (rel and r.get("rel") != rel):
+            continue
+        rounds = r.get("rounds") or []
+        out.append({
+            "id": r["id"], "lane": r.get("lane"), "rel": r.get("rel"),
+            "opened_at": r.get("opened_at"), "state": r.get("state"),
+            "verdict": r.get("verdict"), "why": r.get("why"),
+            "rounds": len(rounds),
+            "waiting_on": r.get("waiting_on"),
+            "cost_tokens": r.get("cost_tokens", 0),
+            "last_at": (rounds[-1] or {}).get("at") if rounds else r.get("opened_at"),
+            "defects": (rounds[-1] or {}).get("defects") if rounds else None,
+        })
+    out.sort(key=lambda r: r.get("opened_at") or "", reverse=True)
+    return out
+
+
+def _spec_paths(lane_name: str, rel: str) -> tuple[Path, Path]:
+    """Where this document lives in your tree, and where the worker edits it.
+
+    Two paths on purpose. The worker never touches the checkout you are working
+    in - it gets `amp/<lane>`, the same isolated worktree every other worker in
+    this harness gets, and you merge it from the Diff tab when you have read it.
+    """
+    lane = (config().get("lanes") or {}).get(lane_name) or {}
+    live = (ROOT / lane.get("path", ".")).resolve() / rel
+    # Computed, not created. `claude_worktree` makes the tree if it is missing,
+    # and this is called from read paths - a tab being opened must not run
+    # `git worktree add` as a side effect of drawing a list.
+    return live, WORKTREE_DIR / lane_name / rel
+
+
+def _spec_read(lane_name: str, rel: str) -> tuple[str, str]:
+    """The document under review, and where it was read from.
+
+    The worktree copy once one exists, because that is the one the last round
+    rewrote - reviewing your checkout instead would hand the architect the text
+    it already asked to have changed and it would ask again.
+    """
+    live, wt = _spec_paths(lane_name, rel)
+    for path, where in ((wt, "worktree"), (live, "repo")):
+        try:
+            if path.is_file():
+                return path.read_text(errors="replace"), where
+        except OSError:
+            continue
+    return "", "missing"
+
+
+SPEC_REVIEW_SYSTEM = (
+    "You are reviewing one design document for a working software stack. Your job is "
+    "to decide whether it is solid enough to build against, and to say exactly what is "
+    "missing when it is not.\n\n"
+    "A solid spec answers, for the thing it describes: what it is for, what it must do, "
+    "what it must never do, how anyone can tell whether an implementation is correct, and "
+    "what has been decided against and why. A spec that is a feature list, a status "
+    "report, or a description of what already exists is not solid, however long it is.\n\n"
+    "Reply in this shape and nothing else:\n\n"
+    "VERDICT: SOLID | NEEDS WORK\n"
+    "WHY: one sentence.\n"
+    "Then, only if NEEDS WORK, a numbered list. Each item is one concrete defect and "
+    "the edit that fixes it - the section to add, the ambiguity to resolve, the claim to "
+    "cut. Name the section. Do not ask for a rewrite of the whole document.\n\n"
+    "Rules you are held to:\n"
+    "- At most 6 items. If you can only name vague ones, the document is SOLID and you "
+    "are padding.\n"
+    "- Do not ask for anything the document already says. It is quoted in full below; "
+    "check before you ask.\n"
+    "- Do not ask for code, tests, benchmarks or a schedule. This is a spec, and work "
+    "that belongs in the repo does not belong in it.\n"
+    "- If a previous round asked for something and the writer explained why it does not "
+    "apply, either accept that or say why the explanation is wrong. Do not silently ask "
+    "again."
+)
+
+
+def _spec_round_history(r: dict) -> str:
+    """What the earlier rounds asked for and what came back.
+
+    Both halves, because half of the reason a review loop runs forever is that
+    the reviewer cannot see that it already asked for this and was answered.
+    """
+    rounds = r.get("rounds") or []
+    if not rounds:
+        return ""
+    parts = []
+    for rd in rounds[-3:]:
+        parts.append(f"### Round {rd.get('n')} — you said\n\n{rd.get('verdict')}: "
+                     f"{rd.get('why') or ''}\n"
+                     + "\n".join(f"{i + 1}. {d}" for i, d in enumerate(rd.get("defects") or [])))
+        w = rd.get("worker") or {}
+        if w.get("text"):
+            parts.append(f"### Round {rd.get('n')} — the writer replied\n\n"
+                         + w["text"].strip()[:4000]
+                         + (f"\n\n(the file {'changed' if rd.get('changed') else 'did NOT change'})"))
+    return ("\n\n## What has already been asked and answered\n\n"
+            + "\n\n".join(parts))
+
+
+def _spec_review_context(r: dict) -> str:
+    text, where = _spec_read(r["lane"], r["rel"])
+    body, clipped = _clip(text, SPEC_REVIEW_CHARS)
+    parts = [
+        mission_block().strip(),
+        f"# The document\n\n`{r['lane']}/{r['rel']}` — read from the "
+        + ("worker's worktree, so this is the current draft" if where == "worktree"
+           else "repository"),
+        f"```markdown\n{body}\n```"
+        + ("\n\n(clipped — the document is longer than this)" if clipped else ""),
+        f"# The lane it belongs to\n\n{_record_block(r['lane'])}",
+    ]
+    hist = _spec_round_history(r)
+    if hist:
+        parts.append(hist.strip())
+    return "\n\n".join(p for p in parts if p)
+
+
+_SPEC_VERDICT_RE = re.compile(r"^\s*VERDICT\s*:\s*(SOLID|NEEDS\s*WORK)", re.I | re.M)
+_SPEC_WHY_RE = re.compile(r"^\s*WHY\s*:\s*(.+)$", re.I | re.M)
+_SPEC_ITEM_RE = re.compile(r"^\s*(\d+)[.)]\s+(.+)$")
+
+
+def _parse_spec_review(text: str) -> dict:
+    """The architect's verdict, its reason, and the defects it named.
+
+    A missing verdict line is read as NEEDS WORK rather than guessed at. The
+    expensive mistake is calling a thin document solid because a model forgot a
+    header; the cheap one is one more round.
+    """
+    m = _SPEC_VERDICT_RE.search(text or "")
+    verdict = "SOLID" if (m and m.group(1).upper().replace(" ", "") == "SOLID") else "NEEDS WORK"
+    mw = _SPEC_WHY_RE.search(text or "")
+    why = mw.group(1).strip() if mw else ""
+    defects, cur = [], None
+    for line in (text or "").splitlines():
+        m2 = _SPEC_ITEM_RE.match(line)
+        if m2:
+            cur = m2.group(2).strip()
+            defects.append(cur)
+        elif cur is not None and line.strip():
+            defects[-1] += " " + line.strip()
+        elif cur is not None:
+            cur = None
+    # A verdict of NEEDS WORK with nothing named is not a review. Treated as
+    # solid-but-unexplained rather than sent to a worker with no instructions,
+    # because a worker given an empty defect list rewrites whatever it likes.
+    if verdict == "NEEDS WORK" and not defects:
+        return {"verdict": "SOLID", "why": why or
+                "the reviewer said it needed work but named nothing to change",
+                "defects": [], "unexplained": True}
+    return {"verdict": verdict, "why": why, "defects": defects[:6], "unexplained": False}
+
+
+def spec_worker_prompt(r: dict, defects: list[str]) -> str:
+    """What the worker is told. One document, one job, no side quests."""
+    lane = (config().get("lanes") or {}).get(r["lane"]) or {}
+    return (
+        f"{mission_block().strip()}\n\n"
+        f"# Your job\n\n"
+        f"Improve the design document `{r['rel']}` in this worktree. That file, and "
+        f"nothing else. Do not write code, do not run builds, do not touch any other "
+        f"file, do not commit.\n\n"
+        f"A reviewer read it and named these defects:\n\n"
+        + "\n".join(f"{i + 1}. {d}" for i, d in enumerate(defects))
+        + "\n\n# How to answer\n\n"
+        f"Edit the file to fix what is genuinely wrong. If one of the numbered items is "
+        f"already satisfied by the document, or is asking for something that does not "
+        f"belong in a spec, do NOT invent a section to satisfy it - say so instead, and "
+        f"quote the part of the document that already covers it.\n\n"
+        f"End your reply with exactly one of these lines:\n\n"
+        f"SPEC: REVISED — followed by one sentence per item saying what you changed.\n"
+        f"SPEC: SOLID — followed by why the remaining items do not apply.\n\n"
+        f"Say SOLID only if you changed nothing. Do not pad the document to look busy: "
+        f"a spec that grew and did not get clearer is a worse spec.\n\n"
+        f"The lane is `{r['lane']}` at `{lane.get('path', '.')}` in the main tree; you are "
+        f"in an isolated worktree of it."
+    )
+
+
+_SPEC_WORKER_RE = re.compile(r"^\s*SPEC\s*:\s*(REVISED|SOLID)\b", re.I | re.M)
+
+
+def spec_review_open(lane_name: str, rel: str) -> dict:
+    """Start a spec run. One per document at a time, by construction."""
+    if lane_name not in (config().get("lanes") or {}):
+        die(f"unknown lane {lane_name!r}")
+    # Either tree. A document that so far exists only in the worktree is the
+    # normal state of one a worker has just drafted, and it is exactly the one
+    # most worth sharpening.
+    if _spec_read(lane_name, rel)[1] == "missing":
+        die(f"no such document: {lane_name}/{rel}")
+    for row in specruns(lane_name, rel):
+        if row["state"] == "running":
+            die(f"a run is already open on {rel} ({row['id']})")
+    r = {
+        "id": "s" + uuid.uuid4().hex[:10],
+        "lane": lane_name,
+        "rel": rel,
+        "opened_at": now(),
+        "state": "running",
+        "waiting_on": "architect",
+        "model": config().get("consult_model", DEFAULT_CONSULT),
+        "cost_tokens": 0,
+        "rounds": [],
+    }
+    save_specrun(r)
+    return spec_review_step(r["id"])
+
+
+def _spec_stop(rid: str, state: str, why: str) -> dict:
+    with _SPECRUN_LOCK:
+        r = load_specrun(rid)
+        r.update({"state": state, "why": why, "waiting_on": None,
+                  "closed_at": now()})
+        save_specrun(r)
+    return r
+
+
+def spec_review_step(rid: str) -> dict:
+    """One architect turn, and whatever it implies.
+
+    Either both sides now agree and the run is done, or there are named defects
+    and a worker is sent to fix them. The worker's reply comes back through
+    `spec_worker_done`, which calls this again.
+    """
+    r = load_specrun(rid)
+    if not r:
+        die(f"no spec run {rid!r}")
+    if r.get("state") != "running":
+        return r
+    if len(r.get("rounds") or []) >= SPEC_MAX_ROUNDS:
+        return _spec_stop(rid, "capped",
+                          f"stopped at the {SPEC_MAX_ROUNDS}-round spend cap without "
+                          f"the two of them agreeing")
+    if not architect_available():
+        return _spec_stop(rid, "stopped", architect_off_reason())
+
+    resp = architect_chat([{"role": "system", "content": SPEC_REVIEW_SYSTEM},
+                           {"role": "user", "content": _spec_review_context(r)}],
+                          r["model"])
+    text = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    got = _parse_spec_review(text)
+
+    with _SPECRUN_LOCK:
+        r = load_specrun(rid)
+        n = len(r["rounds"]) + 1
+        r["rounds"].append({"n": n, "at": now(), "verdict": got["verdict"],
+                            "why": got["why"], "defects": got["defects"],
+                            "review": text, "worker": None, "changed": None})
+        r["cost_tokens"] = r.get("cost_tokens", 0) + ((resp.get("usage") or {}).get("total_tokens") or 0)
+        save_specrun(r)
+
+    if got["verdict"] == "SOLID":
+        # Both of them. The writer's half of the agreement is not a separate
+        # question that needs a separate call: it either revised the document
+        # until the reviewer was satisfied, or it said the remaining items did
+        # not apply and the reviewer has now agreed. Sending a worker out to be
+        # asked "do you also think it is solid?" would be paying for a yes.
+        return _spec_stop(rid, "solid", got["why"] or "the reviewer and the writer both "
+                                                      "say this document is solid")
+    # The genuine deadlock: the writer says the items do not apply, the reviewer
+    # keeps asking, and nothing on disk has moved for two rounds. That is not
+    # something a third round settles - it is a disagreement, and it is yours.
+    done = load_specrun(rid)["rounds"]
+    if all((rd.get("changed") is False) for rd in done[-3:-1]) and len(done) > 2:
+        return _spec_stop(rid, "stalled",
+                          "the writer says these do not apply and the reviewer keeps "
+                          "asking - two rounds left the document byte-identical")
+    if not ON_SPEC_DISPATCH:
+        return _spec_stop(rid, "stopped", "no worker dispatch is wired up")
+
+    with _SPECRUN_LOCK:
+        r = load_specrun(rid)
+        r["waiting_on"] = "worker"
+        # Before the writer exists, not after. The whole stop rule turns on
+        # whether this round moved the document, and a baseline read once the
+        # worker is already running is a baseline that may already include the
+        # worker's edit - which reads as "nothing changed" and stalls a run that
+        # is working, or as "something changed" and runs a stalled one to the
+        # cap. A fast worker makes the second one the common case.
+        r["rounds"][-1]["before"] = _spec_read(r["lane"], r["rel"])[0]
+        i = len(r["rounds"]) - 1
+        save_specrun(r)
+    out = ON_SPEC_DISPATCH(r, got["defects"])
+    if not out.get("ok"):
+        return _spec_stop(rid, "stopped",
+                          f"could not send a worker: {str(out.get('error'))[:200]}")
+    # By index, not `[-1]`. The task id only exists once dispatch returns, and by
+    # then the writer may already have finished, settled, and started the next
+    # round - so `[-1]` is a different round than the one that sent this worker.
+    # That mis-files the id onto a round that dispatched nothing, which is how a
+    # stopped run ends up saying a writer is still out on it.
+    with _SPECRUN_LOCK:
+        r = load_specrun(rid)
+        if i < len(r["rounds"]):
+            r["rounds"][i]["task_id"] = out.get("task_id")
+            save_specrun(r)
+    return load_specrun(rid)
+
+
+def spec_worker_done(rid: str, lane_name: str, rec: dict) -> dict:
+    """The writer has finished. Record what it said, and whether the file moved."""
+    r = load_specrun(rid)
+    if not r or r.get("state") != "running":
+        return r or {}
+    reply = (rec.get("result") or rec.get("error") or "").strip()
+    m = _SPEC_WORKER_RE.search(reply)
+    # `agreed is False` means the writer pushed back on the instructions. An
+    # unparseable reply is neither agreement nor a dispute, so it is None and
+    # the run carries on rather than being stopped by a formatting slip.
+    agreed = None if not m else (m.group(1).upper() == "SOLID")
+    after = _spec_read(r["lane"], r["rel"])[0]
+
+    with _SPECRUN_LOCK:
+        r = load_specrun(rid)
+        # The round this writer was sent on: the last one still waiting for a
+        # reply. Not `[-1]`, which is only the same round while nothing else has
+        # moved, and not a match on `task_id`, which is written after dispatch
+        # and so may not be there yet when a fast writer settles.
+        rd = next((x for x in reversed(r["rounds"]) if not x.get("worker")), None)
+        if rd is None:
+            return r
+        rd["worker"] = {"task_id": rec.get("task_id"), "session_id": rec.get("session_id"),
+                        "at": now(), "agreed": agreed, "text": reply[:8000],
+                        "status": rec.get("status")}
+        rd["changed"] = after != (rd.get("before") or "")
+        # The document itself is not kept on the round - it is on disk in the
+        # worktree, and a copy here would be a second answer to "what does the
+        # spec say" that can disagree with the first.
+        rd.pop("before", None)
+        r["waiting_on"] = "architect"
+        save_specrun(r)
+
+    # A worker that hit its budget or was killed may still have improved the
+    # document before it stopped, and throwing that away to honour a status
+    # field would be discarding work that is already on disk and already paid
+    # for. What settles it is whether the file moved - the reviewer judges the
+    # text either way, and it cannot judge a text that does not exist.
+    if rec.get("status") != "completed" and not rd["changed"]:
+        return _spec_stop(rid, "stopped",
+                          f"the writer stopped without changing anything "
+                          f"({rec.get('status') or 'no status'})")
+    return spec_review_step(rid)
+
+
+def close_specrun(rid: str, why: str = "closed by the operator") -> dict:
+    r = load_specrun(rid)
+    if not r:
+        die(f"no spec run {rid!r}")
+    return _spec_stop(rid, "closed", why) if r.get("state") == "running" else r
+
+
+# ----------------------------------------------------------------- spec ratings
+#
+# The sharpen loop will improve any document you point it at. What it cannot do
+# is tell you which one to point it at, and a stack of eleven lanes holds more
+# design documents than anyone reads before deciding. These are the numbers that
+# decide.
+#
+# They are deliberately the same three shapes the direction board already uses on
+# a proposal, because the question is the same one: of the things I could pay for
+# next, which one moves the mission most per dollar. Reusing the shape also means
+# there is one thing to learn rather than two, and one place where a number that
+# turns out to be useless can be deleted.
+#
+# What is NOT here: a "quality" score, which would be `solidity` under another
+# name, and a "staleness" score, which is not a judgement at all - whether a
+# rating was made against the current bytes is a FACT, checked against the sha
+# below, and a model asked to guess at it would be guessing at something already
+# known.
+
+# The document as sent to the rater. Much smaller than `SPEC_REVIEW_CHARS`, on
+# purpose. A review must see all of a document because it names defects, and an
+# item asking for something already written is the failure that wastes a whole
+# round. A rating is a judgement about shape and reaches the same answer from a
+# large sample - and paying full price to rate every document, in order to decide
+# which one to pay full price on, would defeat the point of rating them.
+SPEC_RATE_CHARS = 30_000
+
+# Below this `worth`, the harness will not spend a run on a document by itself.
+# Not a gate on you: the button on a single document ignores it. Only on what
+# a campaign starts unattended.
+DEFAULT_SPEC_WORTH_BAR = 0.15
+
+_SPECRATE_LOCK = threading.Lock()
+
+
+def spec_worth_bar() -> float:
+    return _bar("spec_worth", DEFAULT_SPEC_WORTH_BAR)
+
+
+def _spec_sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def spec_rates(lane_name: str | None = None) -> dict:
+    """Every rating, or one lane's. Keyed by `rel`."""
+    everything = load_json(SPECRATE_PATH, {})
+    if lane_name is None:
+        return everything
+    return everything.get(lane_name) or {}
+
+
+def save_spec_rate(lane_name: str, rel: str, rating: dict) -> None:
+    with _SPECRATE_LOCK:
+        everything = load_json(SPECRATE_PATH, {})
+        everything.setdefault(lane_name, {})[rel] = rating
+        save_json(SPECRATE_PATH, everything)
+
+
+def spec_worth(rating: dict | None):
+    """What one sharpen run on this document is expected to be worth.
+
+    `need x headroom`: how much the mission wants this document to be right,
+    times how much a round would actually move it. `None` unless both are
+    known, for the same reason `worth()` is - a document ranked on whichever
+    field happened to be present would sort top or bottom for a reason nobody
+    stated.
+
+    Solidity is deliberately not a factor. A solid document has no headroom, so
+    including both would count the same fact twice and push already-finished
+    documents down a ranking they are already at the bottom of.
+    """
+    if not rating:
+        return None
+    need, head = rating.get("need"), rating.get("headroom")
+    if need is None or head is None:
+        return None
+    return round(need * head, 3)
+
+
+SPEC_RATE_SYSTEM = (
+    "You are rating one design document in a working software stack so that a harness "
+    "can decide which document to spend a review-and-rewrite cycle on next. You are not "
+    "reviewing it, and you are not rewriting it.\n\n"
+    "A solid spec answers, for the thing it describes: what it is for, what it must do, "
+    "what it must never do, how anyone can tell a correct implementation from a wrong "
+    "one, and what has been decided against and why. A feature list, a status report or "
+    "a description of what already exists is not a spec, however long it is.\n\n"
+    "Reply with one JSON object and nothing else:\n\n"
+    "{\n"
+    '  "solidity": 0.0,\n'
+    '  "why_solidity": "one sentence",\n'
+    '  "need": 0.0,\n'
+    '  "why_need": "one sentence",\n'
+    '  "headroom": 0.0,\n'
+    '  "why_headroom": "one sentence",\n'
+    '  "gaps": ["one concrete missing thing", "another"]\n'
+    "}\n\n"
+    "What each number means:\n"
+    "- solidity: how much of what an implementer needs is actually written down. 1.0 "
+    "means somebody could build against this and know when they were done. 0.0 means it "
+    "says almost nothing an implementer could use.\n"
+    "- need: how much the mission above needs THIS document to be right. A document "
+    "describing something the mission does not depend on scores low however thin it is.\n"
+    "- headroom: how much one round of review-and-rewrite would actually move it. A "
+    "document that is already solid has none. So does one whose gaps are missing FACTS "
+    "that no writer could invent - decisions nobody has taken, numbers nobody has "
+    "measured. Say which case it is in why_headroom.\n"
+    "- gaps: at most 6, each one concrete and named. Empty when there are none.\n\n"
+    "Rules you are held to:\n"
+    "- Judge the document in front of you, not the one you would have written.\n"
+    "- Length is not solidity. A short document that answers the five questions scores "
+    "higher than a long one that does not.\n"
+    "- Do not ask for code, tests, benchmarks or a schedule. Work that belongs in the "
+    "repo does not belong in a spec.\n"
+    "- Give a number for all three. A missing one is read as unrated, which keeps this "
+    "document out of the ranking entirely rather than guessing on your behalf."
+)
+
+
+def _spec_rate_context(lane_name: str, rel: str, text: str, clipped: bool) -> str:
+    return "\n\n".join(p for p in [
+        mission_block().strip(),
+        f"# The document\n\n`{lane_name}/{rel}`",
+        f"```markdown\n{text}\n```"
+        + ("\n\n(clipped - the document is longer than this. Rate what a document of "
+           "this shape is worth; do not report the clip as a defect.)" if clipped else ""),
+        f"# The lane it belongs to\n\n{_record_block(lane_name)}",
+    ] if p)
+
+
+def spec_rate(lane_name: str, rel: str) -> dict:
+    """One architect call: how solid this document is, and whether sharpening it pays.
+
+    Stores the sha of the exact text it read. A rating carried forward onto bytes
+    it never saw is the one failure this cannot recover from by itself - it would
+    rank a document on a judgement of a version that no longer exists, and it
+    would look identical on screen to a rating that was made this minute.
+    """
+    if lane_name not in (config().get("lanes") or {}):
+        die(f"unknown lane {lane_name!r}")
+    text, where = _spec_read(lane_name, rel)
+    if where == "missing":
+        die(f"no such document: {lane_name}/{rel}")
+    if not architect_available():
+        die(architect_off_reason())
+    body, clipped = _clip(text, SPEC_RATE_CHARS)
+    model = config().get("consult_model", DEFAULT_CONSULT)
+    resp = architect_chat([{"role": "system", "content": SPEC_RATE_SYSTEM},
+                           {"role": "user",
+                            "content": _spec_rate_context(lane_name, rel, body, clipped)}],
+                          model, max_tokens=2000)
+    reply = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    got = _json_reply(reply) or {}
+    rating = {
+        "rel": rel,
+        "at": now(),
+        # What was rated, not what is there now. `spec_view` compares the two.
+        "sha": _spec_sha(text),
+        "read_from": where,
+        "clipped": clipped,
+        "solidity": _num(got.get("solidity"), 0.0, 1.0),
+        "why_solidity": str(got.get("why_solidity") or "")[:400],
+        "need": _num(got.get("need"), 0.0, 1.0),
+        "why_need": str(got.get("why_need") or "")[:400],
+        "headroom": _num(got.get("headroom"), 0.0, 1.0),
+        "why_headroom": str(got.get("why_headroom") or "")[:400],
+        "gaps": [str(g)[:300] for g in (got.get("gaps") or []) if str(g).strip()][:6],
+        "cost_tokens": (resp.get("usage") or {}).get("total_tokens") or 0,
+        "model": model,
+    }
+    # Said out loud rather than left as three nulls. An unparseable reply and a
+    # rater that genuinely could not judge the document look the same in the
+    # data, and only one of them is worth retrying.
+    if rating["solidity"] is None and rating["need"] is None and rating["headroom"] is None:
+        rating["error"] = "the rater's reply had no numbers in it: " + reply.strip()[:200]
+    save_spec_rate(lane_name, rel, rating)
+    return rating
+
+
+def spec_audit(lane_name: str) -> dict:
+    """Rate every document in the lane that does not already have a current rating.
+
+    Skips what is already rated against the bytes on disk. Re-rating an unchanged
+    document buys a second opinion on text nothing has touched, and the whole
+    point of the sha is so that this can tell the difference.
+    """
+    files = lane_spec_files(lane_name)
+    have = spec_rates(lane_name)
+    rated, skipped, failed = [], [], []
+    for f in files:
+        text, _ = _spec_read(lane_name, f["rel"])
+        prior = have.get(f["rel"])
+        if prior and not prior.get("error") and prior.get("sha") == _spec_sha(text):
+            skipped.append(f["rel"])
+            continue
+        try:
+            rated.append(spec_rate(lane_name, f["rel"]))
+        except SystemExit as e:
+            failed.append({"rel": f["rel"], "error": str(e)})
+            # An architect that has gone away will not come back mid-loop, and
+            # eleven identical failures is eleven identical messages.
+            break
+    return {"lane": lane_name, "rated": rated, "skipped": skipped, "failed": failed}
+
+
+# --------------------------------------------------------------- spec campaigns
+#
+# "Sharpen this document" is a button. "Sharpen all of them" cannot be, because a
+# lane runs one worker at a time by construction - `do_dispatch` refuses a second
+# one - so firing eleven runs at once would start one and fail ten. A campaign is
+# the queue that makes the difference: it holds the list, and the ticker starts
+# the next document when the lane is free.
+#
+# It is a plan, not a schedule. It carries no timing and makes no promises about
+# when a document is reached; what it guarantees is only that the lane does not
+# go idle with work still on the list.
+
+_SPECPLAN_LOCK = threading.Lock()
+
+
+def spec_plans() -> dict:
+    return load_json(SPECPLAN_PATH, {})
+
+
+def spec_plan(lane_name: str) -> dict | None:
+    return spec_plans().get(lane_name)
+
+
+def _save_spec_plan(plan: dict) -> dict:
+    with _SPECPLAN_LOCK:
+        plans = load_json(SPECPLAN_PATH, {})
+        plans[plan["lane"]] = plan
+        save_json(SPECPLAN_PATH, plans)
+    return plan
+
+
+def spec_plan_order(lane_name: str) -> list[dict]:
+    """The lane's documents, best-first, with the reason each one is where it is.
+
+    Rated documents sort by `worth` descending. Unrated ones sort AFTER every
+    rated one rather than before: an unrated document is not known to be worth
+    nothing, but starting a paid run on a document nobody has judged - ahead of
+    one that has been judged and scored well - would be spending the ranking's
+    budget on the thing the ranking has the least to say about.
+    """
+    rates = spec_rates(lane_name)
+    rows = []
+    for f in lane_spec_files(lane_name):
+        r = rates.get(f["rel"])
+        rows.append({"rel": f["rel"], "worth": spec_worth(r),
+                     "solidity": (r or {}).get("solidity"),
+                     "rated": bool(r) and not (r or {}).get("error")})
+    rows.sort(key=lambda x: (x["worth"] is None, -(x["worth"] or 0.0), x["rel"]))
+    return rows
+
+
+def spec_campaign_open(lane_name: str, *, rels: list[str] | None = None) -> dict:
+    """Queue every document in the lane, best first."""
+    if lane_name not in (config().get("lanes") or {}):
+        die(f"unknown lane {lane_name!r}")
+    order = spec_plan_order(lane_name)
+    if rels is not None:
+        want = set(rels)
+        order = [o for o in order if o["rel"] in want]
+    if not order:
+        die(f"{lane_name} has no documents under docs/spec/ to sharpen")
+    bar = spec_worth_bar()
+    queue, skipped = [], []
+    for o in order:
+        # An unrated document is queued. A rated one below the bar is not, and
+        # the reason is recorded - "it was skipped" and "it was never in the
+        # list" are different facts and the tab should not have to guess.
+        if o["worth"] is not None and o["worth"] < bar:
+            skipped.append({"rel": o["rel"], "worth": o["worth"],
+                            "why": f"worth {o['worth']} is under the {bar} bar"})
+            continue
+        queue.append(o["rel"])
+    plan = {
+        "lane": lane_name,
+        "opened_at": now(),
+        "state": "running" if queue else "done",
+        "bar": bar,
+        "queue": queue,
+        "skipped": skipped,
+        "done": [],
+        "current": None,
+        "why": None if queue else "every document is either already solid or under the bar",
+    }
+    return _save_spec_plan(plan)
+
+
+def spec_campaign_close(lane_name: str, why: str = "stopped by the operator") -> dict | None:
+    with _SPECPLAN_LOCK:
+        plans = load_json(SPECPLAN_PATH, {})
+        plan = plans.get(lane_name)
+        if not plan or plan.get("state") != "running":
+            return plan
+        plan.update({"state": "stopped", "why": why, "closed_at": now(), "current": None})
+        save_json(SPECPLAN_PATH, plans)
+    return plan
+
+
+def spec_campaign_step(lane_name: str) -> dict | None:
+    """Move one campaign forward by at most one document.
+
+    Called on a tick rather than from the settling worker. A run ends inside
+    `spec_worker_done`, which is already several frames deep in a worker thread
+    holding the run lock, and starting the next document from there would open a
+    second run from inside the first one's stack. On a tick it is a plain start
+    with nothing else in flight.
+    """
+    plan = spec_plan(lane_name)
+    if not plan or plan.get("state") != "running":
+        return None
+
+    # Whatever was started last, judged from the run itself rather than from
+    # anything remembered here - a campaign that trusted its own note of what it
+    # started would keep waiting on a run somebody closed by hand.
+    cur = plan.get("current")
+    if cur:
+        rows = specruns(lane_name, cur.get("rel"))
+        row = next((r for r in rows if r["id"] == cur.get("run_id")), None)
+        if row and row.get("state") == "running":
+            return plan
+        with _SPECPLAN_LOCK:
+            plans = load_json(SPECPLAN_PATH, {})
+            p = plans.get(lane_name) or plan
+            p["done"] = (p.get("done") or []) + [{
+                "rel": cur.get("rel"), "run_id": cur.get("run_id"),
+                "state": (row or {}).get("state") or "gone",
+                "why": (row or {}).get("why"), "at": now()}]
+            p["current"] = None
+            plans[lane_name] = p
+            save_json(SPECPLAN_PATH, plans)
+        plan = spec_plan(lane_name)
+
+    if not plan.get("queue"):
+        with _SPECPLAN_LOCK:
+            plans = load_json(SPECPLAN_PATH, {})
+            p = plans.get(lane_name) or plan
+            p.update({"state": "done", "closed_at": now(), "current": None,
+                      "why": f"{len(p.get('done') or [])} document(s) sharpened"})
+            plans[lane_name] = p
+            save_json(SPECPLAN_PATH, plans)
+        return spec_plan(lane_name)
+
+    if not architect_available():
+        return spec_campaign_close(lane_name, architect_off_reason())
+    # Somebody else's worker holds the lane. Not an error and not the campaign's
+    # business - it waits for the next tick.
+    if any(r.get("state") == "running" for r in specruns(lane_name)):
+        return plan
+
+    rel = plan["queue"][0]
+    try:
+        run = spec_review_open(lane_name, rel)
+    except SystemExit as e:
+        with _SPECPLAN_LOCK:
+            plans = load_json(SPECPLAN_PATH, {})
+            p = plans.get(lane_name) or plan
+            p["queue"] = [q for q in (p.get("queue") or []) if q != rel]
+            p["done"] = (p.get("done") or []) + [
+                {"rel": rel, "run_id": None, "state": "stopped",
+                 "why": str(e)[:200], "at": now()}]
+            plans[lane_name] = p
+            save_json(SPECPLAN_PATH, plans)
+        return spec_plan(lane_name)
+
+    with _SPECPLAN_LOCK:
+        plans = load_json(SPECPLAN_PATH, {})
+        p = plans.get(lane_name) or plan
+        p["queue"] = [q for q in (p.get("queue") or []) if q != rel]
+        # `spec_review_open` runs the first architect turn inline, so a document
+        # the reviewer calls solid on sight is already finished by the time we
+        # get here. Filed as done rather than left as `current`, which would
+        # make the campaign wait a whole tick to notice.
+        if run.get("state") == "running":
+            p["current"] = {"rel": rel, "run_id": run["id"], "at": now()}
+        else:
+            p["done"] = (p.get("done") or []) + [
+                {"rel": rel, "run_id": run["id"], "state": run.get("state"),
+                 "why": run.get("why"), "at": now()}]
+        plans[lane_name] = p
+        save_json(SPECPLAN_PATH, plans)
+    return spec_plan(lane_name)
+
+
+def spec_campaigns_step() -> list[str]:
+    """Every running campaign, moved on by one. The ticker's whole job here."""
+    moved = []
+    for lane_name in list(spec_plans()):
+        try:
+            before = spec_plan(lane_name) or {}
+            after = spec_campaign_step(lane_name) or {}
+            if (before.get("current") or {}).get("run_id") != \
+               (after.get("current") or {}).get("run_id") or \
+               before.get("state") != after.get("state"):
+                moved.append(lane_name)
+        except Exception as e:
+            # Stopped and named, rather than re-raised. One lane that cannot be
+            # stepped must not stop the others, and a campaign that throws every
+            # tick forever is a loop nobody sees paying for nothing.
+            spec_campaign_close(lane_name, f"{type(e).__name__}: {e}"[:200])
+            moved.append(lane_name)
+    return moved
+
+
+# ------------------------------------------------------------- spec recovery
+#
+# A lane with nothing under `docs/spec/` has one of two problems, and they need
+# opposite answers. Either the design was never written down - in which case
+# somebody has to write it, and the only honest source is the code. Or it was
+# written down and is sitting somewhere else, which happens constantly in a
+# stack this size: a document about one product filed under another product's
+# repo because that is where the person was working that day.
+#
+# Guessing between them is what a search is for. The second is cheap to check
+# and costs nothing to be wrong about, so it is checked first and by reading the
+# disk, not by asking a model where a file might be.
+
+# How much of a document has to be about a lane before it is worth showing. One
+# passing mention of a name is a citation, not a misfiled spec.
+SPEC_FIND_MIN_HITS = 3
+
+
+def _spec_lane_terms(lane_name: str, spec: dict) -> set[str]:
+    """What a document would call this lane: its key, its path, and the last
+    segment of that path - which is usually the product's actual name."""
+    path = spec.get("path", ".")
+    return {t for t in (lane_name.lower(), Path(path).name.lower(), path.lower())
+            if len(t) > 2}
+
+
+def spec_candidates(lane_name: str) -> list[dict]:
+    """Design documents elsewhere in the stack that are mostly about THIS lane.
+
+    Reads every `<dir>/docs/spec/**.md` in the repository that is not already
+    inside this lane's tree and counts how often it names the lane - its key,
+    its path, and the last segment of its path, which is what a document
+    usually calls a product.
+
+    Every top-level directory is searched, not only the ones that happen to be
+    configured as lanes. Most of this repository is not a lane, and a document
+    that has drifted is most likely to have drifted somewhere nobody is
+    watching - searching only the lanes would look everywhere except where the
+    answer is.
+
+    The count is the evidence and it is reported, not hidden behind a verdict.
+    A file that mentions the lane forty times and lives in another repo is
+    almost certainly misfiled; one that mentions it three times may just be
+    describing an integration, and that is a judgement for you.
+    """
+    cfg = config().get("lanes") or {}
+    lane = cfg.get(lane_name) or {}
+    if not lane:
+        return []
+    mine = (ROOT / lane.get("path", ".")).resolve()
+    terms = _spec_lane_terms(lane_name, lane)
+    if not terms:
+        return []
+    # Which lane, if any, owns each directory - so a found document can be
+    # named by the lane you would go to in this console to act on it.
+    owner = {(ROOT / s.get("path", ".")).resolve(): n for n, s in cfg.items()}
+
+    out = []
+    for root in sorted(p for p in ROOT.iterdir() if p.is_dir()):
+        # `.amp` holds our own worktrees, which are copies of these same
+        # documents; offering one back as a discovery would be a loop.
+        if root.name.startswith("."):
+            continue
+        root = root.resolve()
+        spec_root = root / "docs" / "spec"
+        if root == mine or not spec_root.is_dir():
+            continue
+        other = owner.get(root)
+        # The same names the subject lane is searched by, for the lane the
+        # document actually sits under. Asking only about the lane's key would
+        # call a document that says `AmpersandBoxDesign` on every page but never
+        # `abd` misfiled, which is the opposite of true. A directory that is no
+        # lane is still named by its own directory name.
+        host_terms = (_spec_lane_terms(other, cfg[other]) if other
+                      else {root.name.lower()})
+        for f in sorted(spec_root.rglob("*.md")):
+            rel = str(f.relative_to(root))
+            if not f.is_file() or _SPEC_SKIP.search(rel):
+                continue
+            try:
+                if f.resolve().is_relative_to(mine):
+                    continue
+                text = f.read_text(errors="replace")
+            except OSError:
+                continue
+            low = text.lower()
+            hits = sum(low.count(t) for t in terms)
+            if hits < SPEC_FIND_MIN_HITS:
+                continue
+            head = next((ln.strip("# ").strip() for ln in text.splitlines()
+                         if ln.startswith("#")), "")
+            out.append({
+                # `None` when the document sits somewhere this console has no
+                # lane for. That is not a gap in the search, it is the finding:
+                # nothing here is watching that directory.
+                "lane": other, "rel": rel, "path": f"{root.name}/{rel}",
+                "title": head[:120], "hits": hits,
+                "lines": text.count("\n") + 1, "bytes": len(text.encode()),
+                # Whether the lane it currently sits under is also named in it.
+                # A document about both is an integration note; one that never
+                # names its own host is the misfiled case.
+                "names_host": any(t in low for t in host_terms),
+            })
+    # The count leads. Naming the host was tried as the first key and the real
+    # repository refuted it: a document titled `OS-010-PULSE-SPECIFICATION` that
+    # says `pulse` seventy-five times also says the name of the directory it
+    # sits in, so it sorted below a file that mentions the lane four times in
+    # passing. Whether a document is a lane's design is carried by how much of
+    # it is about that lane; naming the host only breaks ties.
+    out.sort(key=lambda r: (-r["hits"], r["names_host"], r["path"]))
+    return out
+
+
+def spec_draft_prompt(lane_name: str, candidates: list[dict] | None = None) -> str:
+    """What the worker is told when a lane has no spec at all.
+
+    It is asked to write down what the code already commits to, and explicitly
+    NOT to design. A worker asked to write a spec for a codebase writes the spec
+    it would like the codebase to have, and the result reads like a plan while
+    describing nothing that exists - which is worse than no document, because the
+    next reader believes it.
+    """
+    lane = (config().get("lanes") or {}).get(lane_name) or {}
+    found = ""
+    if candidates:
+        found = ("\n\n# Documents elsewhere in the stack that are mostly about this lane\n\n"
+                 + "\n".join(f"- `{c['path']}` ({c['hits']} mentions) — {c['title']}"
+                             for c in candidates[:8])
+                 + "\n\nThey are NOT in this worktree and you cannot edit them. Read them if "
+                   "you can reach them and say in your reply whether the design is already "
+                   "written down somewhere else - that is worth more than a second copy.")
+    return (
+        f"{mission_block().strip()}\n\n"
+        f"# Your job\n\n"
+        f"This lane has no design document. Write `docs/spec/SPEC.md` in this worktree. "
+        f"That file, and nothing else. Do not write code, do not run builds, do not "
+        f"change any other file, do not commit.\n\n"
+        f"# What to write\n\n"
+        f"Read the code and write down what it already commits to. A spec answers, for "
+        f"the thing it describes: what it is for, what it must do, what it must never do, "
+        f"how anyone can tell a correct implementation from a wrong one, and what has "
+        f"been decided against and why.\n\n"
+        f"You are describing, not designing. Do not invent requirements the code does "
+        f"not have, do not write a roadmap, and do not write a status report. Where the "
+        f"code makes a decision whose reason you cannot find, say that the reason is not "
+        f"recorded rather than inventing one - an unanswered question written down is "
+        f"worth more here than a confident guess, because the next round can ask it.\n\n"
+        f"Keep it short enough that somebody reads it.{found}\n\n"
+        f"# How to answer\n\n"
+        f"End your reply with exactly one of these lines:\n\n"
+        f"SPEC: DRAFTED — followed by one sentence per section saying where you got it.\n"
+        f"SPEC: BLOCKED — followed by why you could not, in one sentence.\n\n"
+        f"The lane is `{lane_name}` at `{lane.get('path', '.')}` in the main tree; you are "
+        f"in an isolated worktree of it."
+    )
+
+
+def spec_draft_status(lane_name: str) -> dict | None:
+    """The draft worker that is out for this lane right now, if there is one.
+
+    Dispatch returns the moment the worker is spawned, so a button that reports
+    only its own request goes back to idle about a second in and stays there for
+    the several minutes the work actually takes. That reads as a button that did
+    nothing, and the honest next move is to press it again - which is a second
+    paid worker, or a queue entry behind the first.
+
+    So this is derived from the recorded task rather than from whatever the page
+    remembers asking for. It survives a reload, it is true in a second tab, and
+    it is still true if the console restarted while the worker ran.
+    """
+    for rec in board().get("tasks", {}).get(lane_name, []):
+        if rec.get("spec_draft") and rec.get("status") == "running":
+            return {
+                "state": "running",
+                "task_id": rec.get("task_id"),
+                "at": rec.get("dispatched_at") or rec.get("started_at"),
+            }
+    # Queued counts as in flight. A lane runs one worker at a time, so a draft
+    # asked for while something else is running is real, pending, paid-for work
+    # that has not started - and showing nothing there is the same defect one
+    # step earlier.
+    for i, body in enumerate(load_json(QUEUE_PATH, {}).get("queued") or []):
+        if body.get("spec_draft") and body.get("lane") == lane_name:
+            return {"state": "queued", "position": i + 1, "at": body.get("queued_at")}
+    return None
+
+
+# ----- the spec loop, run unattended
+#
+# Draft what is missing, rate what exists, sharpen what is under the bar, stop
+# when it is over the bar. Four steps, one per tick, cheapest first.
+#
+# Everything here is capped by a RECORDED attempt count rather than by a
+# stopping rule the loop judges for itself. A document the pair cannot converge
+# on is not rare, and the failure mode is not that it stays thin - it is that
+# the harness pays a worker and an architect to rewrite it every hour, forever,
+# and the only evidence is the bill.
+
+# The threshold the user asked for: sharpen until the architect calls it solid.
+# Deliberately below 1.0 - a reviewer that has just rewritten a document is not
+# going to score its own work perfect, and a bar it cannot reach is a loop that
+# only ever stops on the attempt cap.
+DEFAULT_SPEC_SOLID_BAR = 0.75
+
+# How many times the loop may send a worker to write a lane's FIRST document.
+# More than one because a draft can fail on a bad tree or a dead credential;
+# not many more because a lane where drafting keeps producing nothing is a lane
+# with something wrong that another worker will not fix.
+SPEC_AUTO_DRAFTS = 2
+
+# How many campaigns one lane may be given. Each campaign is already capped at
+# SPEC_MAX_ROUNDS per document, so this bounds the outer loop: rate, sharpen,
+# re-rate, sharpen again. Three passes that do not clear the bar is a document
+# that needs a person, and saying so is more useful than a fourth pass.
+SPEC_AUTO_CAMPAIGNS = 3
+
+_SPECAUTO_LOCK = threading.Lock()
+
+
+def spec_solid_bar() -> float:
+    return _bar("spec_solid", DEFAULT_SPEC_SOLID_BAR)
+
+
+def spec_auto_on(lane_name: str) -> bool:
+    """Whether the harness may run the spec loop on THIS lane, unattended.
+
+    Per lane, not per stack. It was stack-wide first, and drawn inside a lane's
+    own tab, so switching one lane on appeared to switch on every lane - which
+    it did. A control that sits under a lane's name and silently governs eleven
+    of them is not a mislabelled control, it is the wrong control: lanes are not
+    equally ready for this, and the one thing an operator needs is to exclude
+    the ones that are not.
+
+    Its own switch rather than riding on `auto_adopt`. Auto-adopt buys one
+    architect call on a proposal that already exists; this drafts documents and
+    sends workers into worktrees, which is a different order of spending and a
+    different blast radius. Somebody who wants the first does not automatically
+    want the second, and a single switch would make that choice for them.
+    """
+    return bool(spec_auto(lane_name).get("on"))
+
+
+def set_auto_spec(lane_name: str, on: bool) -> bool:
+    _spec_auto_note(lane_name, "switch",
+                    "on, by the operator" if on else "off, by the operator", on=bool(on))
+    return bool(on)
+
+
+def spec_auto(lane_name: str | None = None) -> dict:
+    everything = load_json(SPECAUTO_PATH, {})
+    if lane_name is None:
+        return everything
+    return everything.get(lane_name) or {"drafts": 0, "campaigns": 0, "log": []}
+
+
+def _spec_auto_note(lane_name: str, what: str, why: str, **fields) -> dict:
+    """Record that the loop did something, and what it was.
+
+    The log is the only account of unattended spending on this lane. A step that
+    happened and left nothing behind is indistinguishable from a step that was
+    skipped, which is exactly the confusion that makes an automated loop
+    impossible to trust or to debug.
+    """
+    with _SPECAUTO_LOCK:
+        everything = load_json(SPECAUTO_PATH, {})
+        rec = everything.get(lane_name) or {"drafts": 0, "campaigns": 0, "log": []}
+        for k, v in fields.items():
+            rec[k] = v
+        entry = {"at": now(), "what": what, "why": why}
+        rec["log"] = ([entry] + (rec.get("log") or []))[:40]
+        rec["last_at"] = entry["at"]
+        everything[lane_name] = rec
+        save_json(SPECAUTO_PATH, everything)
+        return rec
+
+
+def _spec_auto_busy(lane_name: str, what: str | None) -> None:
+    """Mark that a step is under way, or that it has finished.
+
+    An architect call takes tens of seconds and runs on the heartbeat thread, so
+    from the tab's point of view nothing at all is happening until it lands and
+    the verdict jumps. The whole loop looked like it had gone from thinking
+    about it to done with nothing in between, which is what makes an unattended
+    loop impossible to watch.
+
+    Written to the same file as everything else so it is a recorded fact rather
+    than a guess the page maintains: it is still true in a second tab, and a
+    step interrupted by a console restart leaves the marker behind rather than
+    quietly clearing it.
+    """
+    with _SPECAUTO_LOCK:
+        everything = load_json(SPECAUTO_PATH, {})
+        rec = everything.get(lane_name) or {"drafts": 0, "campaigns": 0, "log": []}
+        rec["busy"] = {"what": what, "at": now()} if what else None
+        everything[lane_name] = rec
+        save_json(SPECAUTO_PATH, everything)
+
+
+def spec_fingerprint(lane_name: str) -> str:
+    """What this lane's documents are, right now, as one value.
+
+    Used to decide whether Direction has already been asked about THESE
+    documents. A timestamp would not do: the question is not when the lane was
+    last explored, it is whether it was explored against the text that is there
+    now, and a spec that has since been rewritten is a different question.
+    """
+    rows = [f"{f['rel']}:{_spec_sha(_spec_read(lane_name, f['rel'])[0])}"
+            for f in lane_spec_files(lane_name)]
+    return hashlib.sha256("|".join(rows).encode()).hexdigest()[:16]
+
+
+def spec_lane_state(lane_name: str) -> dict:
+    """Where this lane's documents stand against the threshold. Derived.
+
+    `verdict` is what the loop acts on and what the tab reports, so both of them
+    are answering the same question from the same numbers rather than each
+    deciding for itself what "done" means.
+    """
+    bar = spec_solid_bar()
+    files = lane_spec_files(lane_name)
+    rates = spec_rates(lane_name)
+    rated, unrated, thin = [], [], []
+    for f in files:
+        r = rates.get(f["rel"])
+        fresh = bool(r) and r.get("sha") == _spec_sha(_spec_read(lane_name, f["rel"])[0])
+        if not fresh or r.get("solidity") is None:
+            unrated.append(f["rel"])
+        elif r["solidity"] < bar:
+            thin.append(f["rel"])
+            rated.append(r["solidity"])
+        else:
+            rated.append(r["solidity"])
+    if not files:
+        verdict = "missing"
+    elif unrated:
+        verdict = "unrated"
+    elif thin:
+        verdict = "thin"
+    else:
+        verdict = "solid"
+    return {
+        "lane": lane_name, "bar": bar, "verdict": verdict,
+        "files": len(files), "unrated": unrated, "thin": thin,
+        # None rather than 0.0 when nothing is rated, for the reason every other
+        # score here is: an unmeasured document and a document measured at zero
+        # are different claims.
+        "solidity": round(min(rated), 3) if rated else None,
+    }
+
+
+def spec_auto_step(lane_name: str) -> dict | None:
+    """At most one step of the loop for one lane. Cheapest first.
+
+    Ordered by cost on purpose: rating is one architect call, drafting and
+    sharpening are workers. Doing the cheap measurement first means the
+    expensive step is aimed at a document somebody has actually judged, rather
+    than at whichever one is alphabetically first.
+    """
+    st = spec_lane_state(lane_name)
+    rec = spec_auto(lane_name)
+
+    if st["verdict"] == "solid":
+        # Solid is not the end of the loop, it is the point of it. A document
+        # nothing ever reads is a document that changed nothing, so the last
+        # step is to put it in front of the thing that decides what to build.
+        # Once per version of the documents, keyed on their contents rather
+        # than on a flag, so a spec that gets rewritten is asked about again and
+        # one that has not is not paid for twice.
+        fp = spec_fingerprint(lane_name)
+        if rec.get("explored_for") == fp or not architect_available():
+            return None
+        _spec_auto_busy(lane_name, "asking direction what to build from it")
+        try:
+            out = explore_direction(lane_name, web=False)
+        finally:
+            _spec_auto_busy(lane_name, None)
+        if not out.get("ok"):
+            return {"lane": lane_name, "did": "explore", "ok": False,
+                    "error": out.get("error")}
+        n = sum(1 for p in (out.get("proposals") or []) if p.get("kind") == "goal")
+        _spec_auto_note(lane_name, "explore",
+                        f"{lane_name} cleared the bar; asked what to build from it",
+                        explored_for=fp, explored_at=now(), proposed=n)
+        return {"lane": lane_name, "did": "explore", "ok": True, "proposed": n}
+
+    # A worker or a campaign already out for this lane. Nothing to start, and
+    # nothing to report - the loop is mid-step, not stuck.
+    if spec_draft_status(lane_name):
+        return None
+    plan = spec_plan(lane_name)
+    if plan and plan.get("state") == "running":
+        return None
+
+    if st["verdict"] == "missing":
+        if not role_on("worker"):
+            return None
+        if rec.get("drafts", 0) >= SPEC_AUTO_DRAFTS:
+            return None
+        out = ON_DRAFT_DISPATCH and ON_DRAFT_DISPATCH({
+            "lane": lane_name,
+            "prompt": spec_draft_prompt(lane_name, spec_candidates(lane_name)),
+            "backend": "claude",
+            "report_back": False,
+            "spec_draft": True,
+        })
+        if not out or not out.get("ok"):
+            # Not counted as an attempt. A dispatch the harness refused - workers
+            # switched off, the board at its cap - is not a draft that failed,
+            # and burning the budget on it would retire the lane over a queue.
+            return {"lane": lane_name, "did": "draft", "ok": False,
+                    "error": (out or {}).get("error") or "could not dispatch"}
+        _spec_auto_note(lane_name, "draft",
+                        f"{lane_name} has no document under docs/spec/",
+                        drafts=rec.get("drafts", 0) + 1)
+        return {"lane": lane_name, "did": "draft", "ok": True,
+                "attempt": rec.get("drafts", 0) + 1}
+
+    if st["verdict"] == "unrated":
+        if not architect_available():
+            return None
+        rel = st["unrated"][0]
+        _spec_auto_busy(lane_name, f"rating {rel}")
+        try:
+            rating = spec_rate(lane_name, rel)
+        finally:
+            _spec_auto_busy(lane_name, None)
+        return {"lane": lane_name, "did": "rate", "ok": not rating.get("error"),
+                "rel": rel, "solidity": rating.get("solidity"),
+                "error": rating.get("error")}
+
+    # thin
+    if not role_on("worker"):
+        return None
+    fp = spec_fingerprint(lane_name)
+    if rec.get("settled_for") == fp:
+        # Asked once, refused, and the documents have not changed since. The
+        # next tick would get the same refusal for the same reason.
+        return None
+    if rec.get("campaigns", 0) >= SPEC_AUTO_CAMPAIGNS:
+        return None
+    plan = spec_campaign_open(lane_name, rels=st["thin"])
+    queued = len(plan.get("queue") or [])
+    if not queued:
+        # The campaign refused every document, and it refused them on a
+        # different question than the one that selected them: this loop picks by
+        # SOLIDITY - is the document good enough - and a campaign spends by
+        # WORTH, which is how much the mission needs the document times how far
+        # a round would actually move it. So a lane can be genuinely thin and
+        # still have nothing worth paying to sharpen, and that is a real answer
+        # rather than a failure.
+        #
+        # It therefore costs no attempt, and it is recorded against the text it
+        # was decided about so the loop stops asking. The first version counted
+        # it, and burned a lane's entire campaign budget on three identical
+        # no-ops in three minutes - three log lines that read like three
+        # campaigns and left the lane retired over work nobody did.
+        _spec_auto_note(lane_name, "settled",
+                        f"{len(st['thin'])} document(s) under {st['bar']}, none of them "
+                        f"worth a sharpen round at the {plan['bar']} worth bar",
+                        settled_for=fp)
+        return {"lane": lane_name, "did": "settled", "ok": True,
+                "thin": len(st["thin"])}
+    _spec_auto_note(lane_name, "campaign",
+                    f"{len(st['thin'])} document(s) under {st['bar']}",
+                    campaigns=rec.get("campaigns", 0) + 1)
+    return {"lane": lane_name, "did": "campaign", "ok": True,
+            "queued": queued,
+            "attempt": rec.get("campaigns", 0) + 1}
+
+
+def spec_explore(lane_name: str) -> dict:
+    """Ask Direction what to build from this lane's documents, on demand.
+
+    The same call the loop makes when a lane clears the bar, reachable without
+    waiting for it and without the loop switched on at all. It also RE-asks: the
+    loop deliberately will not pay twice for the same text, which is right for
+    something running on a heartbeat and wrong as the only way to get an answer,
+    because the first answer can simply be a bad one.
+    """
+    if lane_name not in (config().get("lanes") or {}):
+        die(f"unknown lane {lane_name!r}")
+    _spec_auto_busy(lane_name, "asking direction what to build from it")
+    try:
+        out = explore_direction(lane_name, web=False)
+    finally:
+        _spec_auto_busy(lane_name, None)
+    if not out.get("ok"):
+        return out
+    n = sum(1 for p in (out.get("proposals") or []) if p.get("kind") == "goal")
+    _spec_auto_note(lane_name, "explore", "asked by the operator",
+                    explored_for=spec_fingerprint(lane_name),
+                    explored_at=now(), proposed=n)
+    return {**out, "proposed": n}
+
+
+def spec_auto_run() -> list[dict]:
+    """One step, across the whole stack, per call.
+
+    One rather than one-per-lane for the same reason `auto_sharpen` takes one
+    proposal: this runs on the heartbeat, every step is a paid call or a worker,
+    and eleven lanes stepping together would empty the worker cap in a single
+    tick and hold the heartbeat while it did.
+
+    Lanes are taken in a fixed order and the loop remembers nothing about where
+    it stopped, so the lane that is worst off is not necessarily the one served
+    - but every lane is served within a few ticks, and a rotation that can starve
+    is worse than one that is merely unhurried.
+    """
+    for lane_name in sorted(config().get("lanes") or {}):
+        if not spec_auto_on(lane_name):
+            continue
+        try:
+            out = spec_auto_step(lane_name)
+        except SystemExit as e:
+            # An architect that has gone away will not come back for the next
+            # lane either, and eleven identical failures is eleven identical
+            # log lines saying nothing new.
+            return [{"lane": lane_name, "did": "stop", "ok": False, "error": str(e)}]
+        except Exception as e:
+            _spec_auto_note(lane_name, "error", f"{type(e).__name__}: {e}"[:200])
+            return [{"lane": lane_name, "did": "error", "ok": False,
+                     "error": f"{type(e).__name__}: {e}"[:200]}]
+        if out:
+            return [out]
+    return []
+
+
+def spec_view(lane_name: str) -> dict:
+    """One lane's spec documents and every run against them.
+
+    The newest run per document carries its rounds; the older ones are summaries.
+    That split is the whole cost control here - a document with a dozen runs
+    behind it holds a dozen full reviews and every worker reply, and sending all
+    of that on a four-second poll to draw a row that says `closed` is paying to
+    move text nobody has opened. The older ones are fetched by id when clicked.
+    """
+    files = lane_spec_files(lane_name)
+    runs = specruns(lane_name)
+    by_rel: dict[str, list] = {}
+    for row in runs:
+        by_rel.setdefault(row["rel"], []).append(row)
+    for rows in by_rel.values():
+        full = load_specrun(rows[0]["id"])
+        if full:
+            rows[0] = {**rows[0], "rounds": full.get("rounds") or []}
+    lane = (config().get("lanes") or {}).get(lane_name) or {}
+    have = {f["rel"] for f in files}
+    rates = spec_rates(lane_name)
+    rank = {row["rel"]: i + 1 for i, row in enumerate(spec_plan_order(lane_name))}
+
+    rows_out = []
+    for f in files:
+        r = rates.get(f["rel"])
+        if r:
+            # Whether the rating is about the bytes that are there now. A rating
+            # is a judgement of a specific text, and the whole reason the sha is
+            # stored is so that a judgement of a version that has since been
+            # rewritten can be shown as what it is instead of quietly ranking
+            # a document on a reading of a file that no longer exists.
+            r = {**r, "stale": r.get("sha") != _spec_sha(_spec_read(lane_name, f["rel"])[0]),
+                 "worth": spec_worth(r)}
+        rows_out.append({**f, "runs": by_rel.get(f["rel"]) or [],
+                         "rating": r, "rank": rank.get(f["rel"])})
+
+    # Read once. Both of these walk the lane's documents off disk, and asking
+    # three times in one response can answer differently each time if a worker
+    # writes a file in between - which would draw a verdict about one version of
+    # the lane next to a staleness flag about another.
+    _auto, _fp, _state = spec_auto(lane_name), spec_fingerprint(lane_name), spec_lane_state(lane_name)
+
+    return {
+        "lane": lane_name,
+        "path": lane.get("path", "."),
+        "files": rows_out,
+        "plan": spec_plan(lane_name),
+        "worth_bar": spec_worth_bar(),
+        # Only asked for when there is nothing to show. It reads every other
+        # lane's spec directory off disk, which is cheap but not free, and a
+        # lane that has its own documents does not need to be told where someone
+        # else's are.
+        "candidates": [] if files else spec_candidates(lane_name),
+        # Always asked, not only when the lane is empty: a draft worker that has
+        # already written the document is exactly the case where `files` is no
+        # longer empty while the worker is still running, and dropping the
+        # indicator at that moment would say "done" before it is.
+        "drafting": spec_draft_status(lane_name),
+        # Where this lane stands against the threshold, and what the unattended
+        # loop has already spent getting it there. Shown whether or not the loop
+        # is switched on: the verdict is the same fact either way, and a bar you
+        # can only see while automation is running is a bar you cannot check.
+        "state": _state,
+        "auto": {**_auto, "max_drafts": SPEC_AUTO_DRAFTS,
+                 "max_campaigns": SPEC_AUTO_CAMPAIGNS,
+                 # Whether the documents have changed since Direction was last
+                 # asked about them. The button says "again" rather than
+                 # pretending the previous answer is still about this text.
+                 "explored_stale": bool(_auto.get("explored_for"))
+                 and _auto.get("explored_for") != _fp,
+                 # The loop has stopped on this lane on purpose, and it stopped
+                 # on THIS text. Distinct from a spent budget: nothing was spent.
+                 "settled": _auto.get("settled_for") == _fp},
+        # Runs against a document that is no longer there - renamed, moved, or
+        # deleted since. Listed separately rather than dropped: a review of a
+        # file nobody can find is exactly the thing that would otherwise vanish
+        # without anyone deciding it should.
+        "orphans": [r for r in runs if r["rel"] not in have],
+        "max_rounds": SPEC_MAX_ROUNDS,
+        # Named, because an empty list here and a lane that keeps its design
+        # somewhere else look identical on screen and are not the same problem.
+        "gap": None if files else
+               f"`{lane.get('path', '.')}/docs/spec/` does not exist or holds no markdown",
+        "architect": architect_available(),
+        "architect_why": None if architect_available() else architect_off_reason(),
+    }
+
+
+def _spec_health_block(names: list[str]) -> str:
+    """What has been JUDGED about each lane's documents, not what they say.
+
+    `_specs_block` sends the explorer the headings and opening prose, which is
+    what the lane is for. This is the other half: whether anyone has read it and
+    what they found wrong with it. The difference matters because the two
+    strongest proposals a spec can produce are invisible in the prose - a lane
+    with NO design document at all has no prose to send, so it simply does not
+    appear, and a named gap in an existing one reads as an absence, which is the
+    single hardest thing to notice by reading.
+
+    Gaps are quoted rather than summarised. They were written by a reader who
+    had the whole document in front of it, and re-describing them here would put
+    a second opinion in front of the first one.
+    """
+    rows = []
+    for name in names:
+        if not name:
+            continue
+        st = spec_lane_state(name)
+        rates = spec_rates(name)
+        if st["verdict"] == "missing":
+            found = spec_candidates(name)
+            where = ("" if not found else
+                     " Documents elsewhere in the repository that name it: "
+                     + ", ".join(f"`{c['path']}` ({c['hits']} mentions)" for c in found[:4])
+                     + " - which may mean its design is filed under the wrong lane.")
+            rows.append(f"- **{name}**: has NO design document at all.{where}")
+            continue
+        gaps = []
+        for rel, r in sorted(rates.items()):
+            for g in (r.get("gaps") or [])[:4]:
+                gaps.append(f"    - `{rel}`: {g}")
+        scored = (f"lowest solidity {st['solidity']}" if st["solidity"] is not None
+                  else "nothing scored yet")
+        rows.append(f"- **{name}**: {st['files']} document(s), {scored} "
+                    f"(the bar is {st['bar']})."
+                    + (f" Under the bar: {', '.join('`' + t + '`' for t in st['thin'])}."
+                       if st["thin"] else "")
+                    + ("\n" + "\n".join(gaps) if gaps else ""))
+    if not rows:
+        return ""
+    return ("# What has been judged about those documents\n\n"
+            "Scores and gaps from a reader that had each document in full. A lane "
+            "with no design document, or with a gap named here, is a real thing to "
+            "propose against - but propose the WORK, not the writing of the "
+            "document: the harness already drafts and sharpens specs on its own, "
+            "so \"write a spec for X\" duplicates a loop that is already running.\n\n"
+            + "\n".join(rows))
+
+
 def _explore_context(lane: str | None, *, web: bool) -> str:
     """The whole stack at once, which is the thing a per-goal review never sees."""
     sections = doctrine_sections()
@@ -6444,6 +8581,14 @@ def _explore_context(lane: str | None, *, web: bool) -> str:
                     + (f"{rec['done']}/{rec['n']} of its last settled goals finished"
                        if rec["n"] else "nothing settled yet"))
     parts.append("# The lanes\n\n" + "\n".join(rows))
+
+    specs = _specs_block(lane, names)
+    if specs:
+        parts.append(specs)
+
+    health = _spec_health_block([lane] if lane else names)
+    if health:
+        parts.append(health)
 
     # Every lane's findings together, which is the raw material for the only
     # question this call is uniquely able to answer. A finding reported in one
@@ -6621,6 +8766,40 @@ SHARPEN_SYSTEM = (
 )
 
 
+def _sharpen_record(p: dict) -> str:
+    """What the previous attempts on this objective actually achieved.
+
+    The line this replaces said "you have already tried once", which was true
+    when two attempts was the whole allowance and is a plain falsehood now that
+    a proposal keeps being sharpened while sharpening keeps working. Telling a
+    model it is on round two when it is on round five is the harness narrating
+    instead of reporting.
+
+    The numbers matter more than the count. Twelve of the fourteen rounds on
+    record moved the odds DOWN - the sharpener was being asked to improve
+    something without ever being told whether improving it had worked before,
+    and it could not see that its own last answer had made things worse.
+    """
+    log = sharpen_history(p)
+    if not log:
+        return ""
+    lines = []
+    for a in log[-4:]:
+        b, af = a.get("before"), a.get("after")
+        moved = "unmeasured" if b is None or af is None else f"{pct(b)} → {pct(af)}"
+        lines.append(f"- round {a.get('round')}: {moved}"
+                     + (" (a revision was taken)" if a.get("took_revision") else ""))
+    return ("\n\n## What the previous attempts to improve this did\n\n"
+            + "\n".join(lines)
+            # From `sharpen_rounds`, not from the length of the log. Rounds that
+            # ran before the log existed left a count and no measurement, so
+            # counting entries reports attempt 2 on a proposal at round 3.
+            + f"\n\nThis is attempt {int(p.get('sharpen_rounds') or 0) + 1}. "
+              "If the earlier ones did not move it, "
+              "say what is actually holding it rather than restating them, and return null "
+              "for the revision if nothing you can do moves it.")
+
+
 def _sharpen_context(p: dict) -> str:
     """What the architect needs to judge one proposed objective."""
     lane_name = p.get("lane") or ""
@@ -6636,8 +8815,7 @@ def _sharpen_context(p: dict) -> str:
                      + (f"\nwhy it was needed: {p['why_need']}" if p.get("why_need") else "")
                      + ("\nunknowns then: " + "; ".join(p.get("unknowns") or [])
                         if p.get("unknowns") else "")
-                     + "\n\nYou have already tried once to improve this. Say so and stop if "
-                       "there is nothing further to take out of it.")
+                     + _sharpen_record(p))
     others = [x for x in goals(lane_name) if x["state"] in ("planning", "running", "blocked")]
     if others:
         parts.append("# Already open in this lane, do not propose these\n\n"
@@ -6648,6 +8826,13 @@ def _sharpen_context(p: dict) -> str:
     stands = _need_block(lane_name)
     if stands:
         parts.append(stands)
+    # Two documents rather than the focused eight. This call is judging one
+    # objective against what the lane is for, not surveying the lane, and it
+    # runs once per tick - the deep read belongs to the review that proposed
+    # the objective in the first place.
+    spec = _specs_block(lane_name, [], limit=SPEC_LANE_FILES)
+    if spec:
+        parts.append(spec)
     parts.append(f"# The repository right now\n\n{goal_brief(lane_name)}")
     return "\n\n".join(parts)
 
@@ -6971,6 +9156,81 @@ def resume_adoption() -> list[dict]:
     return [adopt_proposal(ready[0]["id"])] if ready else []
 
 
+def sharpen_history(p: dict) -> list[dict]:
+    """Every sharpening round this objective has been through, oldest first.
+
+    A round that produces a revision retires the record it improved and carries
+    the objective forward under a new id, so what the earlier rounds measured
+    stays on the retired record. The log is deliberately not copied onto the
+    successor - `headroom_calibration` counts every entry it can find, and a
+    copy would count each round twice - so the successor is walked back through
+    `sharpened_from` instead.
+    """
+    by_id = {x.get("id"): x for x in direction_store().get("proposals", [])}
+    seen: set = set()
+    out: list[dict] = []
+    cur: dict | None = p
+    while cur is not None and cur.get("id") not in seen:
+        seen.add(cur.get("id"))
+        out = list(cur.get("sharpen_log") or []) + out
+        cur = by_id.get(cur.get("sharpened_from")) if cur.get("sharpened_from") else None
+    return out
+
+
+def sharpen_gain(p: dict) -> float | None:
+    """How much the last round actually moved this objective's odds.
+
+    Read off the log every round already writes. The measurement was being
+    recorded and nothing was reading it, which is why the stopping rule could
+    only count attempts.
+
+    None when no round has been run, and that is not zero: an objective nobody
+    has sharpened has not failed to improve, it has not been tried.
+    """
+    log = sharpen_history(p)
+    if not log:
+        return None
+    before, after = log[-1].get("before"), log[-1].get("after")
+    return None if before is None or after is None else after - before
+
+
+def sharpen_converged(p: dict) -> str | None:
+    """Why this proposal is done being sharpened, or None if it is not.
+
+    The rule this replaces was a flat count - two tries and stop, whatever
+    happened in them - which gets both cases wrong. It cuts off an objective
+    still climbing, and it goes on paying for one that has not moved in rounds.
+    The record already says which is which, so the stopping rule reads the
+    measurement instead of the attempt count: keep going while going is
+    working, stop when it stops.
+
+    A negative gain stops it too. A round that made the odds worse is not a
+    round to run again.
+
+    `SHARPEN_HARD_CAP` is a spend backstop and nothing more. It exists so an
+    objective that improves by a hair every single time cannot bill for ever,
+    and it is reported differently on purpose: "stopped improving" means this
+    is as good as it gets, "hit the cap" means it was cut off mid-climb and
+    the operator may want to look.
+
+    Returns the sentence rather than a bool because that difference is the
+    thing worth showing.
+    """
+    # Scoring is not sharpening. A proposal missing a score has no odds to
+    # improve, so there is no gain to measure and nothing to have converged -
+    # the same reason the old cap did not apply to it either.
+    if p.get("confidence") is None or p.get("need") is None:
+        return None
+    gain = sharpen_gain(p)
+    if gain is not None and gain < SHARPEN_GAIN_FLOOR:
+        return (f"last round moved the odds {gain:+.0%}, under the "
+                f"{SHARPEN_GAIN_FLOOR:.0%} that makes another one worth paying for")
+    if int(p.get("sharpen_rounds") or 0) >= SHARPEN_HARD_CAP:
+        return (f"stopped at the {SHARPEN_HARD_CAP}-round spend cap while it was "
+                f"still gaining — not because it ran out of room")
+    return None
+
+
 def sharpenable() -> list[dict]:
     """Open proposals that are being held back and are worth another look.
 
@@ -6994,10 +9254,18 @@ def sharpenable() -> list[dict]:
     this - so the next call would spend real money to be told that again. It
     stays open and stays visible, and the operator can still sharpen it by hand,
     because "the architect can't move this" is not "this is dead".
+
+    Stopping is `sharpen_converged`, which asks what the last round measured
+    rather than how many have been run. It does not apply to a proposal missing
+    a score outright, because scoring is not sharpening. Three sat open for
+    hours at 72%, 79% and 80% odds with no `need` on them at all, written by a
+    build that had no such field - every one of them over the bar it was being
+    held against, and every one already at the old flat cap, so nothing would
+    look at them again. A lane can be retired by a field that arrived after it.
     """
     return sorted([p for p in open_proposals()
                    if proposal_hold(p)
-                   and int(p.get("sharpen_rounds") or 0) < SHARPEN_MAX_ROUNDS
+                   and not sharpen_converged(p)
                    and (p.get("headroom") is None or p["headroom"] >= SHARPEN_FLOOR)],
                   key=lambda p: (p.get("headroom") is not None,
                                  -(p.get("headroom") or 0),
@@ -7291,8 +9559,13 @@ def direction_view(lane: str | None = None) -> dict:
         # `hold` and `worth` are derived here rather than stored, so moving a bar
         # in Settings re-judges every waiting proposal at once instead of leaving
         # them labelled against a threshold that is no longer the threshold.
+        # `sharpen_done` is derived here too, and it carries its own reason: the
+        # button that disappears has to be able to say whether the objective
+        # stopped improving or was cut off by the spend cap.
         "proposals": sorted([{**p, "hold": proposal_hold(p), "worth": worth(p),
-                              "sharpen_rounds": int(p.get("sharpen_rounds") or 0)}
+                              "sharpen_rounds": int(p.get("sharpen_rounds") or 0),
+                              "sharpen_gain": sharpen_gain(p),
+                              "sharpen_done": sharpen_converged(p)}
                              for p in props if p.get("kind") == "goal"],
                             key=lambda p: p.get("at") or "", reverse=True),
         "questions": sorted([p for p in props if p.get("kind") == "question"],
@@ -7303,7 +9576,8 @@ def direction_view(lane: str | None = None) -> dict:
         "need_bar": need_bar(),
         "calibration": calibration(),
         "rungs": lane_rungs(),
-        "max_sharpen": SHARPEN_MAX_ROUNDS,
+        "sharpen_cap": SHARPEN_HARD_CAP,
+        "sharpen_gain_floor": SHARPEN_GAIN_FLOOR,
         "sharpen_floor": SHARPEN_FLOOR,
         # So the button can say what it is about to do rather than promising
         # research and then answering from recall.
@@ -7788,6 +10062,2284 @@ def observations() -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------- the report
+#
+# One HTML file that says what has happened, what is happening, and where this
+# is going. Everything on the console is a live view of one slice; a report is
+# the whole workspace at a moment, saved, so that the next one can be read
+# against it.
+#
+# Three rules, all of them the same rule the rest of this file runs on:
+#
+#   Every line answers to a recorded event. The report reads the stores and
+#   counts what is in them. It does not ask a model what happened, because a
+#   model would be reconstructing from the same records with a chance of being
+#   wrong about them.
+#
+#   "Since the last report" is a real boundary, not a window of days. A report
+#   records when it was taken; the next one covers what moved after that. A
+#   week in which nothing happened produces a report that says nothing
+#   happened, which is the true and useful answer.
+#
+#   The one part a model does write - suggested reading - is fetched with a web
+#   search and then every link is CHECKED by this harness before it ships. A
+#   plausible URL is exactly the failure mode, so a link that does not resolve
+#   is reported as unreachable rather than quietly kept or quietly dropped.
+
+def report_store() -> dict:
+    return load_json(REPORT_PATH, {"reports": []})
+
+
+def _save_reports(store: dict):
+    store["reports"] = store.get("reports", [])[-60:]
+    save_json(REPORT_PATH, store)
+
+
+def reports() -> list[dict]:
+    """Every report taken for this workspace, newest first."""
+    ws = current_workspace()
+    rows = [r for r in report_store().get("reports", []) if r.get("workspace") == ws]
+    return sorted(rows, key=lambda r: r.get("at") or "", reverse=True)
+
+
+def last_report() -> dict | None:
+    rows = reports()
+    return rows[0] if rows else None
+
+
+def _after(iso: str | None, since: str | None) -> bool:
+    """Whether a timestamp falls inside the window. No `since` means everything."""
+    if not since:
+        return True
+    return bool(iso) and str(iso) > since
+
+
+def report_window(since: str | None) -> dict:
+    """What moved since `since`. Empty lists are a real answer."""
+    store = direction_store()
+    revs = [r for r in store.get("reviews", []) if _after(r.get("at"), since)]
+    props = store.get("proposals", [])
+    rows = goals()
+
+    # A goal is counted as closed in this window if it left the running states
+    # while the window was open. `updated_at` is the only stamp a goal keeps for
+    # that, so a goal edited after it closed lands in the later window - which is
+    # the honest reading of the record rather than a guess at the earlier date.
+    closed = [g for g in rows
+              if g.get("state") not in ("running", "planning")
+              and _after(g.get("updated_at"), since)]
+    opened = [g for g in rows if _after(g.get("opened_at"), since)]
+
+    # Rung moves are the only measure of progress this stack recognises, so they
+    # are pulled out of the reviews and listed on their own.
+    ladder = []
+    for r in revs:
+        for e in (r.get("ladder") or []):
+            ladder.append({"lane": r.get("lane"), "at": r.get("at"),
+                           "claim": str(e.get("claim") or "")[:300],
+                           "from": e.get("from"), "to": e.get("to"),
+                           "goal_id": r.get("goal_id")})
+
+    tasks, spend = [], 0.0
+    for lane_name, recs in (board().get("tasks") or {}).items():
+        for r in recs:
+            if not _after(r.get("finished_at") or r.get("dispatched_at"), since):
+                continue
+            spend += float(r.get("cost_usd") or 0)
+            tasks.append({"lane": lane_name, "task_id": r.get("task_id"),
+                          "status": r.get("status"), "killed": bool(r.get("killed")),
+                          "at": r.get("finished_at") or r.get("dispatched_at"),
+                          "cost_usd": round(float(r.get("cost_usd") or 0), 2),
+                          "goal_id": r.get("goal_id"),
+                          "prompt": str(r.get("prompt") or "")[:200],
+                          "error": str(r.get("error") or "")[:200]})
+    tasks.sort(key=lambda t: t.get("at") or "", reverse=True)
+
+    obs = [{"name": o.get("name"), "lane": o.get("lane"), "state": o.get("state"),
+            "at": o.get("last_checked"), "check": o.get("check"),
+            "rc": o.get("last_rc")}
+           for o in obligations()
+           if _after(o.get("last_checked"), since) and o.get("state") in ("drifted", "broken")]
+
+    sup = [r for r in supervisor_store().get("reports", [])
+           if r.get("workspace") == current_workspace() and _after(r.get("at"), since)]
+
+    out = {
+        "goals_closed": closed, "goals_opened": opened,
+        "ladder": sorted(ladder, key=lambda e: e.get("at") or "", reverse=True),
+        "findings": [f for f in findings() if _after(f.get("at"), since)],
+        "reviews": sorted(revs, key=lambda r: r.get("at") or "", reverse=True),
+        "raised": [p for p in props if _after(p.get("at"), since)],
+        "adopted": [p for p in props
+                    if p.get("state") == "adopted" and _after(p.get("decided_at"), since)],
+        "declined": [p for p in props
+                     if p.get("state") == "declined" and _after(p.get("decided_at"), since)],
+        "tasks": tasks, "spend_usd": round(spend, 2),
+        "obligations": obs, "supervisor": sup,
+    }
+    out["counts"] = {k: len(v) for k, v in out.items() if isinstance(v, list)}
+    # Whether anything at all moved. Said plainly, because a report that lists
+    # six empty sections reads like a broken report rather than a quiet week.
+    out["quiet"] = not any(out["counts"].values())
+    return out
+
+
+def report_now() -> dict:
+    """What is in flight at the moment the report is taken."""
+    rows = goals()
+    stats = worker_stats()
+    b = board()
+    live = []
+    for lane_name, recs in (b.get("tasks") or {}).items():
+        for r in recs:
+            if r.get("status") != "running":
+                continue
+            s = stats.get(r.get("task_id")) or {}
+            live.append({"lane": lane_name, "task_id": r.get("task_id"),
+                         "goal_id": r.get("goal_id"),
+                         "prompt": str(r.get("prompt") or "")[:200],
+                         "dispatched_at": r.get("dispatched_at"),
+                         "elapsed_s": s.get("elapsed_s"), "rss_gb": s.get("rss_gb"),
+                         "cpu_pct": s.get("cpu_pct"), "stalled": bool(s.get("stalled")),
+                         "adopted": bool(s.get("adopted")),
+                         "doing": s.get("doing") or s.get("last") or ""})
+    lim = limits()
+    return {
+        "goals": [g for g in rows if g.get("state") in ("running", "planning")],
+        "blocked": [g for g in rows if g.get("state") == "blocked"],
+        "workers": sorted(live, key=lambda w: w.get("dispatched_at") or ""),
+        "worker_cap": lim["max_workers"], "live": live_workers(),
+        "limits": lim,
+        "consults": [c for c in consults() if c.get("blocked_on") or c.get("status") == "open"],
+        "spend_today": notional_spend_today(),
+        "day_limit": escalate_policy().get("notional_day_usd"),
+    }
+
+
+def report_headed() -> dict:
+    """Where this is going, and what is standing in the way of going there."""
+    sections = doctrine_sections()
+    props = sorted([{**p, "hold": proposal_hold(p), "worth": worth(p)}
+                    for p in open_proposals() if p.get("kind") == "goal"],
+                   key=lambda p: (p.get("worth") is None, -(p.get("worth") or 0)))
+    return {
+        "state": direction_state(None),
+        "proposals": props,
+        "questions": [p for p in open_proposals() if p.get("kind") == "question"],
+        "gates": escalations(),
+        "supervisor": (supervisor_view() or {}).get("last"),
+        "rungs": lane_rungs(), "ladder": list(LADDER_RUNGS),
+        "theses": _section(sections, "open theses", "open questions"),
+        "thesis": _section(sections, "thesis"),
+        "auto_adopt": bool(direction_store().get("auto_adopt")),
+        "bar": adopt_bar(), "need_bar": need_bar(),
+        "calibration": calibration(),
+    }
+
+
+def report_lanes() -> dict:
+    """Every lane, with the record it has actually built up."""
+    cfg = config()
+    rungs = lane_rungs()
+    rows = goals()
+    out = []
+    for name, lane in (cfg.get("lanes") or {}).items():
+        mine = [g for g in rows if g.get("lane") == name]
+        out.append({
+            "name": name, "path": lane.get("path"), "repo": lane.get("repo"),
+            "backend": lane_backend(lane), "rung": rungs.get(name),
+            "record": lane_record(name),
+            "goals": {"total": len(mine),
+                      "running": sum(1 for g in mine if g.get("state") == "running"),
+                      "done": sum(1 for g in mine if g.get("state") == "done"),
+                      "blocked": sum(1 for g in mine if g.get("state") == "blocked")},
+            "failure_streak": lane_failure_streak(name),
+        })
+    return {"lanes": sorted(out, key=lambda r: r["name"])}
+
+
+# How far back the charts look. Long enough for a trend, short enough that a
+# quiet fortnight does not bury a busy week at one pixel per day.
+HISTORY_DAYS = 21
+
+
+def report_history(days: int = HISTORY_DAYS) -> dict:
+    """Day by day, for as far back as the charts reach.
+
+    Deliberately NOT scoped to the report window. The window answers "what
+    moved since last time"; a chart answers "what has this looked like", and a
+    trend drawn from a single window would be one point pretending to be a line.
+    """
+    today = datetime.now(timezone.utc).date()
+    span = [str(today - timedelta(days=n)) for n in range(days - 1, -1, -1)]
+    first = span[0]
+    blank = {"runs": 0, "completed": 0, "failed": 0, "killed": 0, "spend": 0.0,
+             "opened": 0, "closed": 0, "rungs": 0, "findings": 0}
+    by_day = {d: dict(blank) for d in span}
+
+    def bump(iso, key, n=1):
+        d = str(iso or "")[:10]
+        if d in by_day:
+            by_day[d][key] += n
+
+    lanes: dict[str, dict] = {}
+
+    def lane(name):
+        return lanes.setdefault(str(name), {
+            "lane": str(name), "runs": 0, "completed": 0, "failed": 0,
+            "killed": 0, "spend": 0.0, "rungs": 0, "findings": 0})
+
+    for lane_name, recs in (board().get("tasks") or {}).items():
+        for r in recs:
+            at = r.get("finished_at") or r.get("dispatched_at")
+            cost = float(r.get("cost_usd") or 0)
+            status, killed = r.get("status"), bool(r.get("killed"))
+            L = lane(lane_name)
+            L["runs"] += 1
+            L["spend"] += cost
+            # `killed` is checked first: a run stopped by a limit is recorded as
+            # failed AND killed, and counting it in both columns would make the
+            # three outcomes add up to more than the runs they came from.
+            L["killed" if killed else
+              "completed" if status == "completed" else "failed"] += 1
+            if str(at or "")[:10] >= first:
+                bump(at, "runs")
+                bump(at, "spend", cost)
+                bump(at, "killed" if killed else
+                     "completed" if status == "completed" else "failed")
+
+    for g in goals():
+        bump(g.get("opened_at"), "opened")
+        if g.get("state") not in ("running", "planning"):
+            bump(g.get("updated_at"), "closed")
+
+    for r in direction_store().get("reviews", []):
+        n = len(r.get("ladder") or [])
+        if n:
+            bump(r.get("at"), "rungs", n)
+            lane(r.get("lane") or "?")["rungs"] += n
+
+    for f in findings():
+        bump(f.get("at"), "findings")
+        lane(f.get("lane") or "?")["findings"] += 1
+
+    rows = [{"day": d, **by_day[d]} for d in span]
+    tot = {k: round(sum(r[k] for r in rows), 2) for k in blank}
+    runs = sum(l["runs"] for l in lanes.values())
+    return {
+        "days": days, "from": first, "to": span[-1],
+        "series": rows, "totals": tot,
+        "lanes": sorted(lanes.values(), key=lambda l: -l["spend"]),
+        "outcomes": {"completed": sum(l["completed"] for l in lanes.values()),
+                     "failed": sum(l["failed"] for l in lanes.values()),
+                     "killed": sum(l["killed"] for l in lanes.values()),
+                     "runs": runs},
+        "spend_all_time": round(sum(l["spend"] for l in lanes.values()), 2),
+    }
+
+
+# A rating is only worth printing once there is enough behind it to mean
+# something. Under this many runs a lane is reported as unrated rather than
+# given a grade that one lucky afternoon would have earned.
+RATE_MIN_RUNS = 3
+
+RATING_BANDS = ((0.80, "strong", "ok"), (0.60, "steady", "ok"),
+                (0.40, "uneven", "warn"), (0.0, "stalled", "bad"))
+
+
+def _band(score: float) -> tuple[str, str]:
+    for floor, label, cls in RATING_BANDS:
+        if score >= floor:
+            return label, cls
+    return "stalled", "bad"
+
+
+def report_ratings() -> dict:
+    """A scorecard per lane, and the arithmetic that produced it in the open.
+
+    The score is a plain mean of whichever of four measures a lane actually has
+    a record for. It is a summary of this workspace's own record, not a judgment
+    of the code: a lane nobody has run is unrated, not bad.
+    """
+    hist = {l["lane"]: l for l in report_history()["lanes"]}
+    streaks, out = {}, []
+    for row in report_lanes()["lanes"]:
+        name = row["name"]
+        h = hist.get(name, {"runs": 0, "completed": 0, "failed": 0,
+                            "killed": 0, "spend": 0.0, "rungs": 0, "findings": 0})
+        g, runs = row["goals"], h["runs"]
+        streak = row["failure_streak"] or 0
+        streaks[name] = streak
+
+        # Evidence is always scored, never omitted. A lane with nothing on the
+        # ladder is not a lane with data missing - it is a lane whose claims are on
+        # record as unproven, and skipping the measure would score it on everything
+        # except the one thing it is worst at.
+        parts = {"evidence": ((LADDER_RUNGS.index(row["rung"]) + 1) / len(LADDER_RUNGS)
+                              if row["rung"] in LADDER_RUNGS else 0.0)}
+        if runs:
+            parts["reliability"] = h["completed"] / runs
+        if g["total"]:
+            parts["delivery"] = g["done"] / g["total"]
+        if runs:
+            parts["steadiness"] = max(0.0, 1.0 - streak / 3.0)
+
+        rated = runs >= RATE_MIN_RUNS and len(parts) >= 2
+        score = sum(parts.values()) / len(parts) if parts else None
+        label, cls = _band(score) if (rated and score is not None) else ("unrated", "")
+        out.append({
+            "lane": name, "rung": row["rung"], "backend": row["backend"],
+            "runs": runs, "completed": h["completed"], "failed": h["failed"],
+            "killed": h["killed"], "spend": round(h["spend"], 2),
+            "findings": h["findings"], "rungs_moved": h["rungs"],
+            "goals": g, "failure_streak": streak,
+            "success": round(h["completed"] / runs, 3) if runs else None,
+            "cost_per_run": round(h["spend"] / runs, 2) if runs else None,
+            "parts": {k: round(v, 3) for k, v in parts.items()},
+            "score": round(score, 3) if score is not None else None,
+            "rating": label, "cls": cls, "rated": rated,
+            "why_unrated": ("" if rated else
+                            f"{runs} run(s) on record, {RATE_MIN_RUNS} needed to rate"),
+        })
+    out.sort(key=lambda r: (r["score"] is None, -(r["score"] or 0), r["lane"]))
+    rated = [r for r in out if r["rated"]]
+    return {
+        "lanes": out, "rated": len(rated), "unrated": len(out) - len(rated),
+        "min_runs": RATE_MIN_RUNS,
+        "mean": round(sum(r["score"] for r in rated) / len(rated), 3) if rated else None,
+        "measures": {
+            "evidence": "how far up the evidence ladder this lane's claims have got; "
+                        "nothing on the ladder scores nothing",
+            "reliability": "worker runs that finished, over runs dispatched",
+            "delivery": "goals reached done, over goals opened in this lane",
+            "steadiness": "no run of consecutive failures; three in a row scores nothing",
+        },
+    }
+
+
+# Where an action item belongs. The four are not severities - they are four
+# different KINDS of answer, and mixing them is how "we should think about the
+# roadmap" ends up in the same list as "a worker is wedged".
+ACTION_GROUPS = (
+    ("now", "Do now", "Something is stopping work, and it will not clear itself."),
+    ("direction", "Change of direction",
+     "The records say where this is pointed needs revisiting, not just working harder at."),
+    ("goals", "Change to goal setting",
+     "How objectives are judged, sized and let through is off against what actually happened."),
+    ("watch", "Worth watching",
+     "Real, on the record, not yet worth interrupting anything for."),
+)
+
+_SEV_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
+def _problem_headline(o: dict) -> str:
+    """An observation as one scannable line: which thing, then what to do.
+
+    The fix alone is not enough to head an item. Five stopped goals in five
+    different lanes all carry the fix "answer it", and a list of five identical
+    headings is a list nobody reads down. The subject comes off the front of the
+    observation's own text, which is where it already names what it is about.
+    """
+    txt = " ".join(str(o.get("text") or "").split())
+    fix = " ".join(str(o.get("fix") or "").split()) or "look at this"
+    subject = re.split(r"[:.](?:\s|$)", txt, maxsplit=1)[0].strip()[:90]
+    return f"{subject} - {fix[:110]}" if subject else fix
+
+
+def report_actions(data: dict) -> dict:
+    """What to actually do, derived from the records the rest of the page shows.
+
+    Every item names the record that raised it. Nothing here is invented: if the
+    record clears, the item stops appearing on the next report by itself. That
+    is the whole point of deriving it rather than asking a model what it thinks
+    the operator should do.
+    """
+    H, N, W = data["headed"], data["now"], data["window"]
+    items = []
+
+    def add(group, sev, what, why, *, where="", evidence=""):
+        items.append({"group": group, "severity": sev, "what": what, "why": why,
+                      "where": where, "evidence": evidence})
+
+    # --- gates. The harness already decided these are stopping the fleet.
+    for g in H["gates"]:
+        add("now", "high", f'clear the {g["gate"]} gate', g["why"],
+            evidence=f'{g["at"]} against a limit of {g["limit"]}')
+
+    # --- standing problems. `fix` reads as an instruction on its own, but on its
+    # own it also repeats: five different stopped goals all say "answer it".
+    for o in data["problems"]:
+        add("now" if o.get("severity") == "high" else "watch",
+            o.get("severity") or "low",
+            _problem_headline(o), " ".join(str(o.get("text") or "").split()),
+            where=o.get("lane") or "", evidence=o.get("kind") or "")
+
+    # --- goals that stopped and were never picked back up.
+    for g in N["blocked"]:
+        add("now", "high",
+            f'unblock or close "{str(g.get("objective") or "")[:80]}"',
+            str(g.get("stopped_why") or "it is blocked and nothing is moving it"),
+            where=g.get("lane") or "", evidence=f'goal {g.get("id")}')
+
+    # --- nobody is working, and there is nothing stopping them.
+    st = H["state"]
+    if not N["live"] and st.get("ready"):
+        add("now", "high", f'dispatch the {st["ready"]} objective(s) that can start',
+            "nothing is running and nothing is holding these back",
+            evidence=f'{st["ready"]} ready, 0 of {N["worker_cap"]} workers busy')
+
+    # --- direction.
+    if st.get("verdict") in ("nowhere", "empty"):
+        add("direction", "high", "propose new objectives",
+            st.get("headline") or "there is nowhere left to go",
+            evidence=f'direction reads {st["verdict"]}')
+    if W["quiet"] and data.get("since"):
+        add("direction", "medium", "find out why nothing moved",
+            "not one goal, proposal, run or finding was recorded in this whole window",
+            evidence=f'window opened {data["since"]["at"]}')
+    for lane in data["lanes"]["lanes"]:
+        if not lane["rung"] and not lane["goals"]["total"]:
+            add("direction", "low",
+                f'decide whether {lane["name"]} is still in scope',
+                "no goal has ever been opened here and no claim has ever been "
+                "put on the ladder, so it is a lane in name only",
+                where=lane["name"], evidence=str(lane.get("path") or ""))
+
+    # --- goal setting. `held` is the direction engine's own account of why
+    # nothing can start, which makes it the exact list of what to change.
+    for h in (st.get("held") or []):
+        why = str(h.get("why") or "")
+        n = h.get("n") or 0
+        if "nobody has judged" in why:
+            add("goals", "high", f"judge worth on {n} objective(s)",
+                "they cannot be ranked, so they cannot start, so they sit there",
+                evidence=f"{n} unjudged")
+        elif "bar you set" in why:
+            add("goals", "medium",
+                f"{why} - either cut those {n} down or move the bar",
+                f"{n} objective(s) are held here. Held is not a decision; it is the "
+                "absence of one, and it costs the same as a no while looking like a "
+                "maybe.",
+                evidence=why)
+        else:
+            add("goals", "low", f"resolve {n} held objective(s)", why, evidence=why)
+
+    cal = H.get("calibration") or {}
+    cost = cal.get("cost") or {}
+    if cost.get("n") and cost.get("stated") and cost.get("actual"):
+        ratio = float(cost["actual"]) / float(cost["stated"])
+        if ratio >= 1.5 or ratio <= 0.67:
+            add("goals", "medium", "re-anchor the cost estimates",
+                f'estimates said ${cost["stated"]:.2f} and the work cost '
+                f'${cost["actual"]:.2f} - off by {ratio:.1f}x over {cost["n"]} '
+                "finished objective(s). Sizing decides what gets picked, so a "
+                "biased estimate picks the wrong work.",
+                evidence=f'{cost["n"]} finished')
+    if cal.get("n") and cal.get("stated") is not None and cal.get("actual") is not None:
+        gap = float(cal["actual"]) - float(cal["stated"])
+        if cal["n"] >= 3 and abs(gap) >= 0.2:
+            add("goals", "medium", "re-anchor the odds of finishing",
+                f'objectives were given {float(cal["stated"]):.0%} odds and '
+                f'{float(cal["actual"]):.0%} of them actually finished, over '
+                f'{cal["n"]} of them. The bar is set against a number that is wrong.',
+                evidence=f'{cal["n"]} judged')
+
+    # --- questions the architect asked and nobody answered.
+    # The question itself is the heading. Titling fourteen of these "answer an open
+    # question" makes a list nobody can scan, and knowing WHICH decision is being
+    # waited on is the entire value of the item.
+    for p in H["questions"]:
+        q = " ".join(str(p.get("text") or "").split())
+        add("now", "high", f"answer: {q[:150]}" if q else "answer an open question",
+            "a worker stopped here and asked. Until it is answered that thread "
+            "cannot continue, and the slot behind it stays idle.",
+            where=p.get("lane") or "", evidence=q[:400])
+
+    # --- money.
+    lim = N.get("day_limit")
+    if lim and N["spend_today"] >= float(lim) * 0.8:
+        add("watch", "medium", "the day's notional budget is nearly gone",
+            f'${N["spend_today"]:.2f} of ${float(lim):.2f} spent today',
+            evidence=f'{N["spend_today"] / float(lim):.0%} of the day limit')
+
+    # --- lanes that keep failing.
+    for r in data["ratings"]["lanes"]:
+        if r["failure_streak"] >= 2:
+            add("now", "high", f'stop dispatching into {r["lane"]} until it is fixed',
+                f'{r["failure_streak"]} run(s) in a row have failed there',
+                where=r["lane"], evidence=f'streak {r["failure_streak"]}')
+        elif r["rated"] and r["rating"] == "stalled":
+            add("watch", "medium", f'look at what {r["lane"]} is actually producing',
+                f'it scores {r["score"]:.2f} across '
+                + ", ".join(f"{k} {v:.0%}" for k, v in r["parts"].items()),
+                where=r["lane"], evidence=f'{r["runs"]} runs')
+
+    # --- obligations that used to hold and no longer do. Only the ones the
+    # observations did not already raise: `observations()` emits an
+    # `obligation-drifted` for these, and listing both prints the same problem
+    # twice under two different headings, which reads as two problems.
+    seen_obligations = {str(o.get("text") or "").split(" is no longer current")[0]
+                        for o in data["problems"]
+                        if str(o.get("kind") or "").startswith("obligation-")}
+    for o in data["obligations"]:
+        if o.get("name") in seen_obligations:
+            continue
+        if o.get("state") in ("drifted", "broken"):
+            add("now" if o.get("state") == "broken" else "watch",
+                "high" if o.get("state") == "broken" else "medium",
+                f'restore the {o.get("name")} obligation',
+                f'it is {o.get("state")}: `{str(o.get("check") or "")[:120]}`',
+                where=o.get("lane") or "", evidence=str(o.get("state")))
+
+    fs = data["findings_summary"]
+    if fs.get("contradicted"):
+        add("now", "high", "read the contradicted findings",
+            f'{fs["contradicted"]} finding(s) say something believed here is false. '
+            "Until they are read, everything built on top is built on the thing "
+            "that was just disproved.",
+            evidence=f'{fs["unread"]} unread in total')
+
+    items.sort(key=lambda i: (_SEV_RANK.get(i["severity"], 3), i["what"]))
+    groups = [{"key": k, "title": t, "why": w,
+               "items": [i for i in items if i["group"] == k]}
+              for k, t, w in ACTION_GROUPS]
+    return {"groups": groups, "total": len(items),
+            "high": sum(1 for i in items if i["severity"] == "high")}
+
+
+READING_SYSTEM = (
+    "You are finding OUTSIDE READING for the operator of a software workspace. You are "
+    "given what the workspace is for and what it is actually working on right now.\n\n"
+    "Search the web and return things worth reading or watching that would genuinely "
+    "help with THIS work: talks, papers, documentation, write-ups, videos, tools, prior "
+    "art, and people who have already solved the problem being worked on.\n\n"
+    "Reply with one JSON object and nothing else:\n"
+    "{\n"
+    '  "reading": [{"title": "...", "url": "https://...",\n'
+    '               "kind": "video|paper|docs|article|tool|talk",\n'
+    '               "what": "what it actually is, one sentence",\n'
+    '               "why": "what about the work in front of this operator it speaks to",\n'
+    '               "lane": "the lane it is relevant to, or the empty string"}],\n'
+    '  "nothing_found": true|false,\n'
+    '  "why_nothing": "if you found nothing worth sending, say why. Otherwise empty."\n'
+    "}\n\n"
+    "Rules:\n"
+    "- Only URLs you actually retrieved in this search. Every link is fetched and "
+    "checked before it is shown, so an invented one does not slip through - it shows up "
+    "as a dead link with your name on it.\n"
+    "- `why` must connect to something you were told about this workspace. A generic "
+    "recommendation that would suit any software project is not worth a line.\n"
+    "- At most 8. Fewer good ones beats a padded list.\n"
+    "- Returning nothing is a real answer and an honest one."
+)
+
+
+def _reading_context(data: dict) -> str:
+    """What the workspace is for and what it is doing, for a search to key on."""
+    out = [mission_block("What this workspace is for") or "", ""]
+    lanes = data.get("lanes", {}).get("lanes") or []
+    if lanes:
+        out.append("# The lanes, and how far each one's evidence has got\n")
+        for r in lanes:
+            out.append(f"- **{r['name']}** ({r.get('path')}): "
+                       + (f"evidence has reached `{r['rung']}`" if r.get("rung")
+                          else "no claim judged past `spec`")
+                       + f", {r['goals']['running']} running, {r['goals']['done']} finished")
+        out.append("")
+    live = data.get("now", {}).get("goals") or []
+    if live:
+        out.append("# What is being worked on right now\n")
+        for g in live[:12]:
+            out.append(f"- [{g.get('lane')}] {str(g.get('objective') or '')[:200]}")
+        out.append("")
+    props = data.get("headed", {}).get("proposals") or []
+    if props:
+        out.append("# What is proposed next\n")
+        for p in props[:10]:
+            out.append(f"- [{p.get('lane')}] {str(p.get('text') or '')[:200]}")
+        out.append("")
+    probs = data.get("problems") or []
+    if probs:
+        out.append("# Problems currently standing\n")
+        for o in probs[:10]:
+            out.append(f"- {str(o.get('text') or '')[:220]}")
+    return "\n".join(out).strip()
+
+
+def check_url(url: str, timeout: int = 8) -> dict:
+    """Whether a link actually resolves. The check that makes a citation a fact.
+
+    A HEAD is tried first because it is cheap, and a GET follows when a host
+    refuses HEAD - which several large ones do, YouTube among them. Anything
+    that is not clearly a success is reported with its status rather than
+    dropped, so a link the architect invented is visible as invented.
+    """
+    if not str(url or "").lower().startswith(("http://", "https://")):
+        return {"ok": False, "status": None, "why": "not an http url"}
+    req_headers = {"User-Agent": "Mozilla/5.0 (compatible; amp-report/1.0)"}
+    for method in ("HEAD", "GET"):
+        try:
+            req = urllib.request.Request(url, method=method, headers=req_headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                code = int(getattr(r, "status", 0) or 0)
+                if code < 400:
+                    return {"ok": True, "status": code, "why": ""}
+                if method == "GET":
+                    return {"ok": False, "status": code, "why": f"HTTP {code}"}
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 405, 501) and method == "HEAD":
+                continue                       # host refuses HEAD; try a GET
+            return {"ok": False, "status": e.code, "why": f"HTTP {e.code}"}
+        except Exception as e:                 # DNS, TLS, timeout, bad url
+            if method == "GET":
+                return {"ok": False, "status": None, "why": str(e)[:120]}
+    return {"ok": False, "status": None, "why": "no response"}
+
+
+def report_reading(data: dict) -> dict:
+    """Outside reading for what this workspace is doing. Every link checked.
+
+    Off by default and never on a timer: it is a web search and an architect
+    turn, and a report that quietly spends one every time it is taken would be
+    spending on the operator's behalf without being asked.
+    """
+    if not web_search_backend():
+        return {"available": False, "items": [],
+                "why": f"the architect is set to {architect_backend()}, which cannot search "
+                       f"the web from here. Set it to codex in Settings and this section "
+                       f"fills in."}
+    ok, why = role_ready("architect")
+    if not ok:
+        return {"available": False, "items": [], "why": why}
+    try:
+        res = architect_chat(
+            [{"role": "system", "content": READING_SYSTEM},
+             {"role": "user", "content": _reading_context(data)}],
+            role_model("architect"), 4000, web=True)
+    except Exception as e:
+        return {"available": False, "items": [], "why": f"the search failed: {str(e)[:200]}"}
+    text = ((res.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    out = _json_reply(text)
+    if out is None:
+        # A reply that did not parse is not the same answer as "I found
+        # nothing", and reporting it as one would quietly turn a broken round
+        # into a finding about the world.
+        return {"available": False, "items": [],
+                "why": "the architect answered, but not in the shape asked for, so "
+                       "nothing here can be trusted as a citation"}
+    items = []
+    for it in (out.get("reading") or [])[:8]:
+        url = str(it.get("url") or "").strip()
+        chk = check_url(url)
+        items.append({
+            "title": str(it.get("title") or url)[:200], "url": url,
+            "kind": str(it.get("kind") or "")[:20],
+            "what": str(it.get("what") or "")[:400],
+            "why": str(it.get("why") or "")[:400],
+            "lane": str(it.get("lane") or "")[:60],
+            "reachable": chk["ok"], "status": chk["status"], "check_why": chk["why"],
+        })
+    return {"available": True, "items": items,
+            "checked": len(items), "dead": sum(1 for i in items if not i["reachable"]),
+            "nothing_found": bool(out.get("nothing_found")) or not items,
+            "why_nothing": str(out.get("why_nothing") or "")[:400],
+            "tokens": (res.get("usage") or {}).get("total_tokens"), "at": now()}
+
+
+def report_data(*, web: bool = False) -> dict:
+    """The whole workspace at one moment, against the last report."""
+    prev = last_report()
+    since = (prev or {}).get("at")
+    data = {
+        "id": "r" + uuid.uuid4().hex[:10], "at": now(),
+        "workspace": {"slug": current_workspace(),
+                      "name": (workspace() or {}).get("name") or current_workspace()},
+        "mission": mission(),
+        "doctrine": doctrine_state(), "doctrine_path": str(DOCTRINE_PATH),
+        "since": {"id": prev.get("id"), "at": prev.get("at")} if prev else None,
+        "nth": len(reports()) + 1,
+        "window": report_window(since),
+        "now": report_now(),
+        "headed": report_headed(),
+        "lanes": report_lanes(),
+        "problems": observations(),
+        "findings_summary": findings_summary(),
+        # Leads workers left behind while doing something else. They are in the
+        # report because this is the one place a season of them is read at once.
+        "ideas": ideas()[:40],
+        "obligations": obligations(),
+        "obligations_summary": obligations_summary(),
+        "history": report_history(),
+        "ratings": report_ratings(),
+        "root": str(ROOT),
+    }
+    # Actions are derived LAST, from everything above: an action item is a
+    # reading of the records on this page, so it cannot be built before them.
+    data["actions"] = report_actions(data)
+    data["reading"] = (report_reading(data) if web else
+                       {"available": False, "items": [],
+                        "why": "this report was taken without a web search"})
+    return data
+
+
+# ------------------------------------------------------------ rendering it
+#
+# One file, no network, no build step. A report that needs a server to be read
+# is not a report you can keep, mail, or open in a year - and this one has to
+# survive the console it came from.
+
+REPORT_CSS = """
+:root{--bg:#0b0d10;--panel:#12151a;--line:#242a33;--fg:#dfe4ea;--muted:#8b94a3;
+--accent:#7dd3fc;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--chip:#1b2029}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.65 ui-sans-serif,
+system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+a{color:var(--accent)}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+.wrap{max-width:1080px;margin:0 auto;padding:0 20px 80px}
+header.top{border-bottom:1px solid var(--line);background:linear-gradient(180deg,#12151a,#0b0d10);
+padding:28px 0 20px;margin-bottom:0}
+header.top .wrap{padding-bottom:0}
+h1{margin:0 0 4px;font-size:22px;letter-spacing:.2px}
+h2{font-size:16px;margin:0 0 2px}
+h3{font-size:13px;margin:18px 0 6px;color:var(--muted);text-transform:uppercase;
+letter-spacing:.6px;font-weight:600}
+p{margin:6px 0}
+.muted{color:var(--muted)}
+.sub{color:var(--muted);font-size:13px}
+.verdict{margin:14px 0 0;padding:12px 14px;border:1px solid var(--line);border-radius:6px;
+background:var(--panel);border-left:3px solid var(--muted)}
+.verdict.ok{border-left-color:var(--ok)} .verdict.warn{border-left-color:var(--warn)}
+.verdict.bad{border-left-color:var(--bad)}
+.verdict b{font-size:15px}
+nav.jump{position:sticky;top:0;z-index:5;background:rgba(11,13,16,.94);
+backdrop-filter:blur(6px);border-bottom:1px solid var(--line);padding:8px 0;margin-bottom:6px}
+nav.jump .wrap{padding-top:0;padding-bottom:0;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+nav.jump a{padding:4px 9px;border:1px solid var(--line);border-radius:99px;font-size:12px;
+text-decoration:none;color:var(--fg);white-space:nowrap}
+nav.jump a:hover{border-color:var(--accent);color:var(--accent)}
+nav.jump a .n{color:var(--muted);margin-left:5px}
+.tools{display:flex;gap:8px;align-items:center;margin-left:auto}
+input[type=search]{background:var(--chip);border:1px solid var(--line);color:var(--fg);
+border-radius:5px;padding:5px 9px;font:inherit;font-size:12.5px;width:210px}
+button{background:var(--chip);border:1px solid var(--line);color:var(--fg);border-radius:5px;
+padding:5px 10px;font:inherit;font-size:12.5px;cursor:pointer}
+button:hover{border-color:var(--accent);color:var(--accent)}
+section{margin:26px 0 0;scroll-margin-top:54px}
+section>h2{display:flex;align-items:baseline;gap:10px}
+section>h2 .count{color:var(--muted);font-size:13px;font-weight:400}
+.card{border:1px solid var(--line);background:var(--panel);border-radius:6px;
+padding:11px 13px;margin:8px 0}
+.card.hi{border-left:3px solid var(--bad)} .card.mid{border-left:3px solid var(--warn)}
+.card.good{border-left:3px solid var(--ok)}
+.card .hd{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.card .hd .t{font-weight:600}
+.card .why{color:var(--muted);margin-top:4px}
+.chip{display:inline-block;background:var(--chip);border:1px solid var(--line);
+border-radius:99px;padding:1px 8px;font-size:11.5px;color:var(--muted);white-space:nowrap}
+.chip.lane{color:var(--accent);border-color:#274b5c}
+.chip.ok{color:var(--ok)} .chip.warn{color:var(--warn)} .chip.bad{color:var(--bad)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:10px;margin:10px 0}
+.stat{border:1px solid var(--line);background:var(--panel);border-radius:6px;padding:10px 12px}
+.stat .v{font-size:22px;font-weight:600;line-height:1.2}
+.stat .k{color:var(--muted);font-size:12px}
+.stat.bad .v{color:var(--bad)} .stat.warn .v{color:var(--warn)} .stat.ok .v{color:var(--ok)}
+table{border-collapse:collapse;width:100%;margin:8px 0;font-size:13px}
+th,td{text-align:left;padding:6px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.4px;
+cursor:pointer;user-select:none}
+th:hover{color:var(--accent)}
+tbody tr:hover{background:#161a20}
+.bar{height:5px;background:var(--chip);border-radius:3px;overflow:hidden;min-width:70px}
+.bar i{display:block;height:100%;background:var(--accent)}
+details{border:1px solid var(--line);border-radius:6px;background:var(--panel);margin:8px 0}
+details>summary{cursor:pointer;padding:9px 13px;font-weight:600;list-style:none;
+display:flex;gap:8px;align-items:baseline}
+details>summary::-webkit-details-marker{display:none}
+details>summary:before{content:"\\25B8";color:var(--muted);display:inline-block;
+transition:transform .12s}
+details[open]>summary:before{transform:rotate(90deg)}
+details>.body{padding:0 13px 11px;border-top:1px solid var(--line);margin-top:0}
+.rungs{display:flex;gap:3px;align-items:center;flex-wrap:wrap}
+.rung{padding:1px 7px;border-radius:99px;font-size:11px;border:1px solid var(--line);
+color:var(--muted)}
+.rung.on{background:#173a2a;color:var(--ok);border-color:#245c40}
+.empty{color:var(--muted);font-style:italic;padding:6px 0}
+.ladder-move{font-family:ui-monospace,monospace;font-size:12px}
+.ladder-move .to{color:var(--ok)}
+.hidden{display:none!important}
+.chart{margin:10px 0 14px}
+.chart svg{display:block;width:100%;height:auto;overflow:visible}
+.chart .cap{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;color:var(--muted);
+font-size:12px;margin-bottom:5px}
+.legend{display:flex;gap:11px;flex-wrap:wrap;font-size:11.5px;color:var(--muted)}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px}
+.axis{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:11px;
+margin-top:3px}
+.split{display:flex;height:16px;border-radius:4px;overflow:hidden;border:1px solid var(--line);
+margin-top:6px}
+.split span{display:block}
+.means{border-left:2px solid var(--line);padding:3px 0 3px 11px;margin:9px 0;
+color:var(--muted);font-size:13px}
+.means b{color:var(--fg);font-weight:600}
+.score{font-weight:600}
+.score.ok{color:var(--ok)} .score.warn{color:var(--warn)} .score.bad{color:var(--bad)}
+.act{border:1px solid var(--line);background:var(--panel);border-radius:6px;padding:11px 13px;
+margin:8px 0;border-left:3px solid var(--muted)}
+.act.high{border-left-color:var(--bad)} .act.medium{border-left-color:var(--warn)}
+.act.low{border-left-color:var(--ok)}
+.act .t{font-weight:600}
+.act .ev{color:var(--muted);font-size:12px;margin-top:5px}
+footer{margin-top:44px;padding-top:14px;border-top:1px solid var(--line);color:var(--muted);
+font-size:12px}
+pre.raw{white-space:pre-wrap;word-break:break-word;background:#0e1116;border:1px solid var(--line);
+border-radius:6px;padding:12px;max-height:420px;overflow:auto;font-size:11.5px}
+.dead{color:var(--bad);text-decoration:line-through}
+@media print{nav.jump{display:none}details{break-inside:avoid}details>.body{display:block!important}
+body{background:#fff;color:#111}.card,.stat,details,pre.raw{background:#fff}}
+"""
+
+REPORT_JS = """
+// Filter: hides any card, row or details block that does not match. Sections
+// with nothing left are hidden too, so filtering never leaves a bare heading
+// claiming a count it is no longer showing.
+const q = document.getElementById('q');
+function applyFilter(){
+  const t = (q.value || '').trim().toLowerCase();
+  document.querySelectorAll('[data-f]').forEach(el => {
+    el.classList.toggle('hidden', !!t && !el.dataset.f.includes(t));
+  });
+  document.querySelectorAll('section').forEach(s => {
+    const items = s.querySelectorAll('[data-f]');
+    const shown = [...items].filter(el => !el.classList.contains('hidden')).length;
+    s.classList.toggle('hidden', !!t && items.length > 0 && shown === 0);
+    const c = s.querySelector('h2 .count');
+    if (c && c.dataset.total) c.textContent = t ? shown + ' of ' + c.dataset.total : c.dataset.total;
+  });
+  document.querySelectorAll('nav.jump a').forEach(a => {
+    const s = document.querySelector(a.getAttribute('href'));
+    a.classList.toggle('hidden', !!(s && s.classList.contains('hidden')));
+  });
+}
+q.addEventListener('input', applyFilter);
+document.getElementById('expand').onclick = () => {
+  const any = [...document.querySelectorAll('details')].some(d => !d.open);
+  document.querySelectorAll('details').forEach(d => d.open = any);
+  document.getElementById('expand').textContent = any ? 'Collapse all' : 'Expand all';
+};
+// Sortable tables. Numeric when the whole column parses as a number, so a cost
+// column sorts as money rather than as text beginning with a dollar sign.
+// A cell states its sort key with data-v, on itself or on the chip inside it -
+// which is what lets a "when" column sort by instant instead of by wording.
+document.querySelectorAll('table').forEach(tb => {
+  tb.querySelectorAll('th').forEach((th, i) => th.onclick = () => {
+    const body = tb.tBodies[0], rows = [...body.rows];
+    const val = r => {
+      const c = r.cells[i];
+      if (!c) return '';
+      const k = c.dataset.v ?? c.querySelector('[data-v]')?.dataset.v;
+      return (k ?? c.textContent ?? '').trim();
+    };
+    const num = rows.every(r => val(r) === '' || !isNaN(parseFloat(val(r))));
+    const dir = th.dataset.dir === 'asc' ? -1 : 1;
+    tb.querySelectorAll('th').forEach(o => delete o.dataset.dir);
+    th.dataset.dir = dir === 1 ? 'asc' : 'desc';
+    rows.sort((a, b) => dir * (num ? (parseFloat(val(a)) || 0) - (parseFloat(val(b)) || 0)
+                                   : val(a).localeCompare(val(b))));
+    rows.forEach(r => body.appendChild(r));
+  });
+});
+document.getElementById('copyjson').onclick = async (e) => {
+  await navigator.clipboard.writeText(document.getElementById('rawjson').textContent);
+  e.target.textContent = 'Copied';
+  setTimeout(() => e.target.textContent = 'Copy JSON', 1200);
+};
+"""
+
+
+def _epoch(iso: str | None) -> int:
+    """A timestamp as a sortable number. 0 when there is nothing to read."""
+    try:
+        return int(datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp())
+    except (ValueError, TypeError):
+        return 0
+
+
+def _rel(iso: str | None, at: str | None = None) -> str:
+    """How long ago, in words. Empty when there is no timestamp to speak of."""
+    if not iso:
+        return ""
+    try:
+        a = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        b = (datetime.fromisoformat(str(at).replace("Z", "+00:00")) if at
+             else datetime.now(timezone.utc))
+        s = max(0, int((b - a).total_seconds()))
+    except (ValueError, TypeError):
+        return ""
+    for n, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if s >= n:
+            return f"{s // n}{unit} ago"
+    return "just now"
+
+
+# ------------------------------------------------------------ charts
+#
+# Inline SVG, drawn in Python from the same numbers the tables print. No
+# library and no network: a chart that pulls a script off a CDN is a blank box
+# the first time the file is opened offline, and these have to still draw in a
+# year on a machine that has never heard of this console.
+
+C_OK, C_WARN, C_BAD, C_ACCENT = "#4ade80", "#fbbf24", "#f87171", "#7dd3fc"
+CHART_W, CHART_H = 960, 140
+
+
+def _tick(v: float) -> str:
+    """A number as a person would write it. 3, not 3.0; 3.25, not 3.250000001.
+
+    Not `_num`. That name is already the score reader six thousand lines up, and
+    a second one down here silently replaced it for the whole module: every
+    architect score came back unreadable, so `_scored` raised and nothing was
+    ever scored again. The pipeline stopped, and the only visible symptom was
+    proposals that never moved.
+    """
+    return f"{v:.2f}".rstrip("0").rstrip(".") if v % 1 else str(int(v))
+
+
+def _svg(body: str, h: int = CHART_H) -> str:
+    return f'<svg viewBox="0 0 {CHART_W} {h}" role="img">{body}</svg>'
+
+
+def _legend(keys) -> str:
+    return ('<span class="legend">' + "".join(
+        f'<span><i style="background:{c}"></i>{html.escape(lb)}</span>' for _k, c, lb in keys)
+        + "</span>")
+
+
+def _axis(rows: list[dict]) -> str:
+    """First day, middle day, last day. Enough to place the shape in time."""
+    if not rows:
+        return ""
+    return ('<div class="axis">'
+            + "".join(f'<span>{html.escape(rows[i]["day"])}</span>'
+                      for i in (0, len(rows) // 2, -1))
+            + "</div>")
+
+
+def _chart_columns(rows: list[dict], keys, *, empty_msg: str, unit: str = "") -> str:
+    """One stacked column per day; the tallest column sets the scale.
+
+    The scale is printed in words rather than drawn as an axis, because at this
+    size an axis is three unreadable labels and the only number that matters is
+    how big it ever got.
+    """
+    top = max((sum(float(r.get(k) or 0) for k, _c, _l in keys) for r in rows), default=0)
+    if not rows or top <= 0:
+        return (f'<div class="chart"><div class="cap">{_legend(keys)}</div>'
+                f'<div class="empty">{html.escape(empty_msg)}</div></div>')
+    w = CHART_W / len(rows)
+    bw = max(2.0, w * 0.66)
+    body = [f'<line x1="0" y1="{CHART_H}" x2="{CHART_W}" y2="{CHART_H}" stroke="#242a33"/>']
+    for i, r in enumerate(rows):
+        x, y = i * w + (w - bw) / 2, float(CHART_H)
+        for k, colour, label in keys:
+            v = float(r.get(k) or 0)
+            if v <= 0:
+                continue
+            h = v / top * (CHART_H - 8)
+            y -= h
+            body.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bw:.1f}" height="{h:.1f}" '
+                        f'fill="{colour}" rx="1"><title>{html.escape(r["day"])}: '
+                        f'{unit}{_tick(v)} {html.escape(label)}</title></rect>')
+    return (f'<div class="chart"><div class="cap">{_legend(keys)}'
+            f'<span>tallest day: {unit}{_tick(top)}</span></div>'
+            + _svg("".join(body)) + _axis(rows) + "</div>")
+
+
+def _chart_grouped(rows: list[dict], keys, *, empty_msg: str) -> str:
+    """Side-by-side columns per day, scaled by the largest single value.
+
+    Not stacked, deliberately. Stacking is for series that partition a whole -
+    a run is completed or failed or killed, and the three add up to the runs.
+    Objectives opened and objectives closed do not add up to anything, and a
+    stack of them would print a peak that is neither number.
+    """
+    top = max((float(r.get(k) or 0) for r in rows for k, _c, _l in keys), default=0)
+    if not rows or top <= 0:
+        return (f'<div class="chart"><div class="cap">{_legend(keys)}</div>'
+                f'<div class="empty">{html.escape(empty_msg)}</div></div>')
+    w = CHART_W / len(rows)
+    bw = max(1.5, (w * 0.72) / len(keys))
+    body = [f'<line x1="0" y1="{CHART_H}" x2="{CHART_W}" y2="{CHART_H}" stroke="#242a33"/>']
+    for i, r in enumerate(rows):
+        x0 = i * w + (w - bw * len(keys)) / 2
+        for j, (k, colour, label) in enumerate(keys):
+            v = float(r.get(k) or 0)
+            if v <= 0:
+                continue
+            h = v / top * (CHART_H - 8)
+            body.append(f'<rect x="{x0 + j * bw:.1f}" y="{CHART_H - h:.1f}" '
+                        f'width="{bw:.1f}" height="{h:.1f}" fill="{colour}" rx="1">'
+                        f'<title>{html.escape(r["day"])}: {_tick(v)} '
+                        f'{html.escape(label)}</title></rect>')
+    return (f'<div class="chart"><div class="cap">{_legend(keys)}'
+            f'<span>biggest single day: {_tick(top)}</span></div>'
+            + _svg("".join(body)) + _axis(rows) + "</div>")
+
+
+def _chart_line(rows: list[dict], key: str, colour: str, *,
+                label: str, unit: str = "") -> str:
+    """A running total, drawn as a filled line.
+
+    Cumulative on purpose. A daily bar says which days were busy; a running
+    total says what the span has come to, and only one of those is a trend.
+    """
+    run, acc = [], 0.0
+    for r in rows:
+        acc += float(r.get(key) or 0)
+        run.append(acc)
+    top = max(run, default=0)
+    if top <= 0:
+        return ""
+    step = CHART_W / max(1, len(run) - 1)
+    pts = [(i * step, CHART_H - (v / top) * (CHART_H - 8)) for i, v in enumerate(run)]
+    line = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+    dots = "".join(
+        f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.6" fill="{colour}"><title>'
+        f'{html.escape(rows[i]["day"])}: {unit}{_tick(run[i])} {html.escape(label)}'
+        f'</title></circle>'
+        for i, (x, y) in enumerate(pts) if float(rows[i].get(key) or 0) > 0)
+    return (f'<div class="chart"><div class="cap"><span>{html.escape(label)}</span>'
+            f'<span>{unit}{_tick(top)} by {html.escape(rows[-1]["day"])}</span></div>'
+            + _svg(f'<polygon points="0,{CHART_H} {line} {CHART_W},{CHART_H}" '
+                   f'fill="{colour}" opacity=".13"/>'
+                   f'<polyline points="{line}" fill="none" stroke="{colour}" '
+                   f'stroke-width="2"/>{dots}')
+            + _axis(rows) + "</div>")
+
+
+def _chart_split(parts, total: int) -> str:
+    """One bar showing how a whole divides. Shares, since the counts are printed."""
+    if total <= 0:
+        return ""
+    e = html.escape
+    return ('<div class="split">' + "".join(
+        f'<span style="width:{100 * n / total:.2f}%;background:{c}" '
+        f'title="{e(lb)}: {n} of {total}"></span>' for n, c, lb in parts if n > 0)
+        + '</div><div class="axis"><span>'
+        + " &middot; ".join(f"{e(lb)} {n}/{total} ({n / total:.0%})"
+                            for n, _c, lb in parts if n > 0)
+        + "</span></div>")
+
+
+def render_report(data: dict) -> str:
+    """The whole report as one standalone page."""
+    e = html.escape
+    W, N, H = data["window"], data["now"], data["headed"]
+    at = data["at"]
+    out: list[str] = []
+    add = out.append
+
+    def sec(sid: str, title: str, total=None, note: str = ""):
+        c = ("" if total is None else
+             f'<span class="count" data-total="{total}">{total}</span>')
+        add(f'<section id="{sid}"><h2>{e(title)} {c}</h2>')
+        if note:
+            add(f'<p class="sub">{note}</p>')
+
+    def empty(msg: str):
+        add(f'<div class="empty">{e(msg)}</div>')
+
+    def means(txt: str):
+        # What the numbers just above actually say, in a sentence. Written from
+        # the numbers, so it cannot drift away from them the way a hand-written
+        # caption does the first time the data changes.
+        add(f'<div class="means">{txt}</div>')
+
+    def chips(*pairs) -> str:
+        return "".join(f'<span class="chip {cls}">{e(str(txt))}</span>'
+                       for txt, cls in pairs if txt not in (None, "", 0))
+
+    def card(title: str, body: str = "", *, cls: str = "", meta: str = "", f: str = ""):
+        key = e((f or title + " " + body + " " + meta).lower())
+        add(f'<div class="card {cls}" data-f="{key}">'
+            f'<div class="hd"><span class="t">{title}</span>{meta}</div>'
+            + (f'<div class="why">{body}</div>' if body else "") + "</div>")
+
+    def when(iso, label: str = "") -> str:
+        # `data-v` carries the instant as a number, so a "when" column sorts by
+        # time rather than by the spelling of "10m ago", which lands before
+        # "2h ago" alphabetically.
+        r = _rel(iso, at)
+        return (f'<span class="chip" data-v="{_epoch(iso)}" title="{e(str(iso or ""))}">'
+                f'{e(label + r if r else str(iso or ""))}</span>') if iso else ""
+
+    # ---- head
+    ws = data["workspace"]
+    since = data.get("since")
+    cover = (f'everything since report #{data["nth"] - 1}, taken {e(since["at"])} '
+             f'({_rel(since["at"], at)})' if since else
+             "everything on record - this is the first report for this workspace")
+    add(f'<header class="top"><div class="wrap">'
+        f'<h1>{e(ws["name"])} &mdash; report #{data["nth"]}</h1>'
+        f'<div class="sub">Taken {e(at)}. Covers {cover}.</div>')
+
+    # The verdict line. Two facts decide it and they are different facts: whether
+    # anything moved, and whether anything can move next.
+    gates = H.get("gates") or []
+    st = H.get("state") or {}
+    if W["quiet"]:
+        cls, head = "warn", "Nothing has moved since the last report."
+    elif gates:
+        cls, head = "warn", f"Work landed, and {len(gates)} gate(s) are holding the fleet."
+    elif st.get("verdict") == "nowhere":
+        cls, head = "bad", "Work landed, and there is nowhere left to go."
+    else:
+        cls, head = "ok", "Work landed and there is somewhere to go next."
+    add(f'<div class="verdict {cls}"><b>{e(head)}</b><div class="sub">'
+        f'{e(str(st.get("headline") or ""))}</div></div>')
+    if data["mission"]:
+        add('<details style="margin-top:12px"><summary>The mission this is measured against</summary>'
+            f'<div class="body"><p>{e(data["mission"]).replace(chr(10), "<br>")}</p></div></details>')
+    else:
+        add('<div class="verdict bad" style="margin-top:12px"><b>This workspace has no mission '
+            'set.</b><div class="sub">Nothing below can be judged as on it or off it.</div></div>')
+    add("</div></header>")
+
+    # ---- nav
+    nav = [("happened", "Since last report"), ("now", "Right now"),
+           ("headed", "Where it is headed"), ("lanes", "Lanes"),
+           ("history", "Over time"), ("ratings", "Scorecard"),
+           ("problems", "Problems"), ("findings", "Findings"),
+           ("ideas", "Noticed in passing"),
+           ("reading", "Reading"), ("actions", "What to do"), ("raw", "Raw")]
+    add('<nav class="jump"><div class="wrap">'
+        + "".join(f'<a href="#{i}">{e(t)}</a>' for i, t in nav)
+        + '<span class="tools"><input type="search" id="q" placeholder="filter everything">'
+          '<button id="expand">Expand all</button></span></div></nav>')
+    add('<div class="wrap">')
+
+    # ---- since the last report
+    sec("happened", "Since the last report", None,
+        "Counted from the records, not summarised by a model.")
+    add('<div class="grid">'
+        + _stat(len(W["goals_closed"]), "goals closed")
+        + _stat(len(W["ladder"]), "rung moves", "ok" if W["ladder"] else "")
+        + _stat(len(W["findings"]), "findings")
+        + _stat(len(W["tasks"]), "worker runs")
+        + _stat(f'${W["spend_usd"]:.2f}', "notional spend")
+        + _stat(len(W["raised"]), "objectives proposed")
+        + "</div>")
+    if W["quiet"]:
+        empty("Nothing at all moved in this window. No goal closed, nothing was "
+              "proposed, no worker ran and nothing was reported back.")
+    else:
+        means(
+            (f'<b>{len(W["ladder"])} claim(s) moved up the evidence ladder</b>, '
+             'which is the one number here that means something got harder to argue '
+             'with. ' if W["ladder"] else
+             '<b>No claim moved up the evidence ladder</b> in this window, so whatever '
+             'else happened, nothing got more provable. ')
+            + (f'{len(W["tasks"])} worker run(s) cost ${W["spend_usd"]:.2f} notional. '
+               if W["tasks"] else "No worker ran. ")
+            + (f'{len(W["goals_closed"])} objective(s) settled and '
+               f'{len(W["raised"])} new one(s) were proposed.'
+               if W["goals_closed"] or W["raised"] else
+               "No objective settled and none was proposed."))
+
+    if W["ladder"]:
+        add("<h3>Claims that moved up the ladder</h3>")
+        add(_table(["when", "lane", "claim", "move"],
+                   [[when(x["at"]), _lane(x["lane"]),
+                     e(x["claim"]),
+                     f'<span class="ladder-move">{e(str(x["from"] or "?"))} &rarr; '
+                     f'<span class="to">{e(str(x["to"] or "?"))}</span></span>']
+                    for x in W["ladder"]]))
+    if W["goals_closed"]:
+        add("<h3>Goals that closed</h3>")
+        for g in W["goals_closed"][:40]:
+            done = g.get("state") == "done"
+            card(e(str(g.get("objective") or "")[:220]),
+                 e(str(g.get("stopped_why") or g.get("stopped_on") or "")),
+                 cls="good" if done else "mid",
+                 meta=_lane(g.get("lane"))
+                      + chips((g.get("state"), "ok" if done else "warn"),
+                              (f'{g.get("met")}/{g.get("dod")} done-conditions', ""),
+                              (f'{g.get("rounds")} rounds', ""))
+                      + when(g.get("updated_at")))
+    if W["reviews"]:
+        add("<h3>Direction reviews</h3>")
+        for r in W["reviews"][:20]:
+            card(e((r.get("kind") or "review").title()
+                   + (f' - {r.get("lane")}' if r.get("lane") else "")),
+                 e(str(r.get("assessment") or "")[:600]),
+                 meta=chips((r.get("kind"), ""), ("web", "ok") if r.get("web") else ("", ""))
+                      + when(r.get("at")))
+    if W["adopted"] or W["declined"]:
+        add("<h3>Proposals decided</h3>")
+        for p in (W["adopted"] + W["declined"])[:30]:
+            adopted = p.get("state") == "adopted"
+            card(e(str(p.get("text") or "")[:220]), "",
+                 cls="good" if adopted else "",
+                 meta=_lane(p.get("lane"))
+                      + chips((p.get("state"), "ok" if adopted else "warn"))
+                      + when(p.get("decided_at")))
+    if W["tasks"]:
+        add("<h3>Worker runs</h3>")
+        add(_table(["when", "lane", "status", "cost", "what it was sent"],
+                   [[when(t["at"]), _lane(t["lane"]),
+                     chips((t["status"], "ok" if t["status"] == "completed"
+                            else "bad" if t["killed"] else "warn")),
+                     f'<span data-v="{t["cost_usd"]}">${t["cost_usd"]:.2f}</span>',
+                     e(t["prompt"]) + (f'<div class="muted">{e(t["error"])}</div>'
+                                       if t["error"] else "")]
+                    for t in W["tasks"][:60]]))
+    add("</section>")
+
+    # ---- right now
+    sec("now", "Right now", None, "What is in flight at the moment this was taken.")
+    cap = N["worker_cap"] or 0
+    add('<div class="grid">'
+        + _stat(f'{N["live"]}/{cap}', "workers running",
+                "warn" if cap and N["live"] >= cap else "ok" if N["live"] else "")
+        + _stat(len(N["goals"]), "goals live")
+        + _stat(len(N["blocked"]), "goals stopped", "bad" if N["blocked"] else "")
+        + _stat(f'${N["spend_today"]:.2f}', "notional today",
+                "bad" if N["day_limit"] and N["spend_today"] >= float(N["day_limit"]) else "")
+        + "</div>")
+    means(
+        (f'<b>{N["live"]} of {cap} worker slot(s) are busy.</b> ' if N["live"] else
+         f'<b>Nothing is running</b>, and there are {cap} worker slot(s) free. ')
+        + (f'{len(N["blocked"])} objective(s) are stopped waiting on a person - '
+           'those will not clear themselves. ' if N["blocked"] else "")
+        + (f'Today has cost ${N["spend_today"]:.2f} of a ${float(N["day_limit"]):.2f} '
+           'notional day limit.' if N["day_limit"] else
+           f'Today has cost ${N["spend_today"]:.2f}, against no day limit.'))
+    if N["workers"]:
+        add("<h3>Workers on the machine</h3>")
+        add(_table(["lane", "for", "cpu", "mem", "doing"],
+                   [[_lane(w["lane"]),
+                     f'<span data-v="{w["elapsed_s"] or 0}">{_dur(w["elapsed_s"])}</span>',
+                     f'{w["cpu_pct"] or 0}%', f'{w["rss_gb"] or 0} GB',
+                     e(str(w["doing"] or w["prompt"])[:160])
+                     + (' <span class="chip bad">stalled</span>' if w["stalled"] else "")
+                     + (' <span class="chip warn">adopted</span>' if w["adopted"] else "")]
+                    for w in N["workers"]]))
+    else:
+        empty("No worker is running.")
+    if N["goals"]:
+        add("<h3>Goals in flight</h3>")
+        for g in N["goals"]:
+            pct_done = int(100 * (g.get("tasks_done") or 0) / max(1, g.get("tasks_total") or 1))
+            card(e(str(g.get("objective") or "")[:220]),
+                 e(str(g.get("now") or "")),
+                 meta=_lane(g.get("lane"))
+                      + chips((g.get("state"), "ok"),
+                              (f'{g.get("tasks_done")}/{g.get("tasks_total")} steps', ""))
+                      + f'<span class="bar" style="width:80px"><i style="width:{pct_done}%"></i></span>')
+    if N["blocked"]:
+        add("<h3>Goals stopped, waiting on someone</h3>")
+        for g in N["blocked"]:
+            card(e(str(g.get("objective") or "")[:220]),
+                 e("; ".join(g.get("questions") or [])[:400]
+                   or str(g.get("stopped_why") or g.get("stopped_on") or "")),
+                 cls="hi", meta=_lane(g.get("lane")) + chips((g.get("stopped_on"), "bad")))
+    add("</section>")
+
+    # ---- where it is headed
+    sec("headed", "Where it is headed", None,
+        "The direction, what is waiting to start, and what is stopping it.")
+    add(f'<div class="verdict {"bad" if st.get("verdict") in ("nowhere",) else "warn" if st.get("verdict") in ("held", "empty", "unexplored") else "ok"}">'
+        f'<b>{e(str(st.get("verdict") or "unknown"))}</b>'
+        f'<div class="sub">{e(str(st.get("headline") or ""))}</div></div>')
+    means(
+        (f'<b>{len(gates)} gate(s) are holding the fleet.</b> A gate is a limit the '
+         'harness was told to stop at, so no amount of dispatching will get past one. '
+         if gates else "<b>No gate is holding the fleet.</b> ")
+        + (f'{st.get("ready") or 0} objective(s) could start now; '
+           f'{sum(h.get("n") or 0 for h in (st.get("held") or []))} are held back. '
+           if (st.get("ready") or st.get("held")) else "Nothing is waiting to start. ")
+        + (f'{len(H["questions"])} question(s) are open and nobody has answered them.'
+           if H["questions"] else "No question is waiting on an answer."))
+    if gates:
+        add("<h3>Gates holding the fleet</h3>")
+        for g in gates:
+            card(e(str(g.get("gate"))), e(str(g.get("why") or "")), cls="hi",
+                 meta=chips((f'at {g.get("at")}', "bad"), (f'limit {g.get("limit")}', "")))
+    if H["proposals"]:
+        add("<h3>Objectives waiting</h3>")
+        for p in H["proposals"][:30]:
+            hold = p.get("hold")
+            card(e(str(p.get("text") or "")[:260]),
+                 e(str(hold or "")) or e(str(p.get("why") or "")[:300]),
+                 cls="mid" if hold else "good",
+                 meta=_lane(p.get("lane"))
+                      + chips((f'odds {pct(p.get("confidence"))}', ""),
+                              (f'need {pct(p.get("need"))}', ""),
+                              (f'cost {usd(p.get("cost_usd"))}', ""),
+                              (f'worth {p.get("worth"):.2f}' if p.get("worth") is not None else "", ""),
+                              ("waiting" if hold else "ready", "warn" if hold else "ok")))
+    else:
+        empty("Nothing is waiting to start.")
+    if H["questions"]:
+        add("<h3>Questions nobody has settled</h3>")
+        for p in H["questions"][:20]:
+            card(e(str(p.get("text") or "")[:300]), "", meta=_lane(p.get("lane")))
+    sup = H.get("supervisor")
+    if sup:
+        add("<h3>The supervisor's last reading</h3>")
+        card(e(str(sup.get("verdict") or "")),
+             e(str(sup.get("assessment") or sup.get("summary") or "")[:800]),
+             cls="hi" if sup.get("verdict") == "off_mission" else
+                 "mid" if sup.get("verdict") == "drifting" else "good",
+             meta=when(sup.get("at")))
+    add("</section>")
+
+    # ---- lanes
+    lanes = data["lanes"]["lanes"]
+    sec("lanes", "Lanes", len(lanes),
+        "How far each lane's evidence has actually got, and how its goals tend to end.")
+    on_ladder = [r for r in lanes if r.get("rung")]
+    deployed = [r for r in on_ladder if _reached(r["rung"], "live_deployed")]
+    means(
+        f'<b>{len(on_ladder)} of {len(lanes)} lane(s) have any claim on the evidence '
+        f'ladder at all</b>, and {len(deployed)} have got as far as running somewhere '
+        'real. The ladder runs '
+        + " &rarr; ".join(e(x) for x in H["ladder"])
+        + ' - a lane sitting at the left end is a lane whose claims are still only '
+          'written down.')
+    for r in lanes:
+        rec = r["record"]
+        if rec["n"]:
+            stops = ", ".join(f"{v} on {k}" for k, v in sorted(rec["stops"].items())) or "none"
+            record = (f'Of its last {rec["n"]} settled goals, {rec["done"]} finished. '
+                      f'The rest stopped: {e(stops)}.')
+        else:
+            record = "No goal here has settled yet, so this lane has no record to judge by."
+        rungs = "".join(
+            f'<span class="rung{" on" if _reached(r.get("rung"), x) else ""}">{e(x)}</span>'
+            for x in H["ladder"])
+        add(f'<div class="card" data-f="{e((r["name"] + " " + str(r.get("path") or "")).lower())}">'
+            f'<div class="hd"><span class="t">{e(r["name"])}</span>'
+            f'<span class="chip mono">{e(str(r.get("path") or ""))}</span>'
+            + chips((r.get("backend"), ""),
+                    (f'{r["goals"]["running"]} running', "ok" if r["goals"]["running"] else ""),
+                    (f'{r["goals"]["blocked"]} stopped', "bad" if r["goals"]["blocked"] else ""))
+            + f'</div><div class="rungs" style="margin-top:7px">{rungs}</div>'
+            + f'<div class="why">{record}</div></div>')
+    add("</section>")
+
+    # ---- over time
+    hist = data["history"]
+    S, T = hist["series"], hist["totals"]
+    O = hist["outcomes"]
+    sec("history", "Over time", None,
+        f'Every day from {e(hist["from"])} to {e(hist["to"])}, from the same records. '
+        f'Deliberately wider than the report window: a trend drawn from one window '
+        f'is a single point pretending to be a line.')
+    add('<div class="grid">'
+        + _stat(T["runs"], f'worker runs in {hist["days"]} days')
+        + _stat(f'${T["spend"]:.2f}', "notional spend in that span")
+        + _stat(T["opened"], "objectives opened")
+        + _stat(T["closed"], "objectives closed",
+                "bad" if T["opened"] and not T["closed"] else
+                "warn" if T["closed"] < T["opened"] else "ok")
+        + _stat(T["rungs"], "rung moves", "ok" if T["rungs"] else "bad")
+        + _stat(T["findings"], "findings reported")
+        + "</div>")
+    busy = sum(1 for r in S if r["runs"] or r["opened"] or r["closed"] or r["findings"])
+    drift = T["opened"] - T["closed"]
+    means(
+        f'Something was recorded on <b>{busy} of the last {hist["days"]} days</b>. '
+        + (f'The backlog <b>grew by {drift}</b>: more objectives were opened than closed. '
+           if drift > 0 else
+           f'The backlog <b>shrank by {-drift}</b>: more objectives closed than opened. '
+           if drift < 0 else "Objectives opened and closed at the same rate. ")
+        + (f'Evidence moved up the ladder <b>{T["rungs"]} time(s)</b>, which is the only '
+           'one of these numbers that means a claim got harder to argue with.'
+           if T["rungs"] else
+           '<b>No claim moved up the evidence ladder at all</b> in this span, so however '
+           'busy the days below look, nothing got more provable.'))
+
+    add("<h3>Worker runs a day, by how they ended</h3>")
+    add(_chart_columns(S, [("completed", C_OK, "completed"),
+                           ("failed", C_WARN, "failed"),
+                           ("killed", C_BAD, "stopped by a limit")],
+                       empty_msg="no worker has run on any day in this span"))
+    add("<h3>Objectives opened against objectives closed</h3>")
+    add(_chart_grouped(S, [("opened", C_ACCENT, "opened"), ("closed", C_OK, "closed")],
+                       empty_msg="no objective was opened or closed in this span"))
+    add("<h3>What the work reported back</h3>")
+    add(_chart_grouped(S, [("rungs", C_OK, "rung moves"), ("findings", C_ACCENT, "findings")],
+                       empty_msg="nothing was reported back in this span"))
+    add("<h3>Notional spend, running total</h3>")
+    add(_chart_line(S, "spend", C_WARN, label="spent so far", unit="$")
+        or _chart_columns(S, [("spend", C_WARN, "spend")],
+                          empty_msg="nothing has been spent in this span", unit="$"))
+
+    add("<h3>How every run on record ended</h3>")
+    add(_chart_split([(O["completed"], C_OK, "completed"),
+                      (O["failed"], C_WARN, "failed"),
+                      (O["killed"], C_BAD, "stopped by a limit")], O["runs"])
+        or '<div class="empty">no worker run has ever been recorded here</div>')
+
+    add("<h3>Day by day</h3>")
+    add(_table(["day", "runs", "completed", "failed", "stopped", "spend",
+                "opened", "closed", "rungs", "findings"],
+               [[f'<span data-v="{r["day"]}">{e(r["day"])}</span>',
+                 str(r["runs"]), str(r["completed"]), str(r["failed"]), str(r["killed"]),
+                 f'<span data-v="{r["spend"]:.4f}">${r["spend"]:.2f}</span>',
+                 str(r["opened"]), str(r["closed"]), str(r["rungs"]), str(r["findings"])]
+                for r in reversed(S)]))
+    add("</section>")
+
+    # ---- scorecard
+    R = data["ratings"]
+    sec("ratings", "Lane scorecard", len(R["lanes"]),
+        f'A score per lane, and the arithmetic behind it in the open. A lane with '
+        f'fewer than {R["min_runs"]} runs on record is left unrated rather than given '
+        f'a grade one lucky afternoon would have earned.')
+    add('<div class="grid">'
+        + _stat(R["rated"], "lanes with enough record to rate")
+        + _stat(R["unrated"], "lanes not yet rated",
+                "warn" if R["unrated"] else "ok")
+        + _stat(f'{R["mean"]:.2f}' if R["mean"] is not None else "n/a", "mean score",
+                _band(R["mean"])[1] if R["mean"] is not None else "")
+        + _stat(f'${hist["spend_all_time"]:.2f}', "notional spend, all time")
+        + "</div>")
+    if R["rated"]:
+        best = R["lanes"][0]
+        worst = [x for x in R["lanes"] if x["rated"]][-1]
+        means(
+            f'<b>{e(best["lane"])}</b> scores highest at {best["score"]:.2f} '
+            f'({e(best["rating"])}); <b>{e(worst["lane"])}</b> lowest at '
+            f'{worst["score"]:.2f} ({e(worst["rating"])}). '
+            + (f'{R["unrated"]} lane(s) have too little on record to say anything about. '
+               if R["unrated"] else "")
+            + "A score is a summary of this workspace's own record, not a judgment of "
+              "the code: a lane nobody has run is unrated, not bad.")
+    else:
+        means("<b>Not one lane has enough on record to be rated yet.</b> "
+              f'Rating needs {R["min_runs"]} runs and at least two of the four measures; '
+              "until then the table below is a list of what is missing, not a ranking.")
+
+    add(_table(["lane", "rating", "score", "evidence", "runs", "finished", "cost/run",
+                "spend", "findings", "rungs", "goals done", "streak"],
+               [[_lane(r["lane"]),
+                 (f'<span class="score {r["cls"]}">{e(r["rating"])}</span>' if r["rated"]
+                  else f'<span class="chip" title="{e(r["why_unrated"])}">unrated</span>'),
+                 (f'<span data-v="{r["score"]}">{r["score"]:.2f}</span>'
+                  if r["score"] is not None else '<span data-v="-1">&mdash;</span>'),
+                 f'<span data-v="{LADDER_RUNGS.index(r["rung"]) + 1 if r["rung"] in LADDER_RUNGS else 0}">'
+                 f'{e(str(r["rung"] or "nothing on the ladder"))}</span>',
+                 str(r["runs"]),
+                 (f'<span data-v="{r["success"]}">{r["success"]:.0%}</span>'
+                  if r["success"] is not None else '<span data-v="-1">&mdash;</span>'),
+                 (f'<span data-v="{r["cost_per_run"]}">${r["cost_per_run"]:.2f}</span>'
+                  if r["cost_per_run"] is not None else '<span data-v="-1">&mdash;</span>'),
+                 f'<span data-v="{r["spend"]}">${r["spend"]:.2f}</span>',
+                 str(r["findings"]), str(r["rungs_moved"]),
+                 f'<span data-v="{r["goals"]["done"]}">{r["goals"]["done"]}'
+                 f'/{r["goals"]["total"]}</span>',
+                 (f'<span class="chip bad" data-v="{r["failure_streak"]}">'
+                  f'{r["failure_streak"]} failing</span>' if r["failure_streak"]
+                  else f'<span data-v="0">&mdash;</span>')]
+                for r in R["lanes"]]))
+
+    add("<h3>What each measure is counting</h3>")
+    add(_table(["measure", "what it counts", "best lane"],
+               [[e(k), e(v),
+                 (lambda ranked: (f'{_lane(ranked[0]["lane"])} '
+                                  f'{ranked[0]["parts"][k]:.0%}') if ranked else
+                  '<span class="muted">no lane has this measure yet</span>')(
+                     sorted((x for x in R["lanes"] if k in x["parts"]),
+                            key=lambda x: -x["parts"][k]))]
+                for k, v in R["measures"].items()]))
+    means("A lane's score is the plain mean of whichever of these four it has a record "
+          "for - not a weighted formula, because there is no evidence here for what the "
+          "weights should be. Every part is shown so the mean can be argued with.")
+
+    add("<h3>Where the money went</h3>")
+    top_spend = max((x["spend"] for x in R["lanes"]), default=0)
+    if top_spend > 0:
+        add(_table(["lane", "share of spend", "spend", "runs", "per run"],
+                   [[_lane(x["lane"]),
+                     f'<span class="bar" style="width:160px" data-v="{x["spend"]}">'
+                     f'<i style="width:{100 * x["spend"] / top_spend:.1f}%"></i></span>',
+                     f'<span data-v="{x["spend"]}">${x["spend"]:.2f}</span>',
+                     str(x["runs"]),
+                     (f'${x["cost_per_run"]:.2f}' if x["cost_per_run"] is not None
+                      else "&mdash;")]
+                    for x in R["lanes"] if x["spend"] > 0]))
+    else:
+        empty("Nothing has been spent in any lane yet.")
+    add("</section>")
+
+    # ---- problems
+    probs = data["problems"]
+    sec("problems", "Problems standing right now", len(probs),
+        "Computed from what is on disk. Nothing here was asked of a model.")
+    if not probs:
+        empty("Nothing is obviously wrong.")
+    for o in probs:
+        card(e(str(o.get("kind"))), e(str(o.get("text") or ""))
+             + (f'<div class="muted">Fix: {e(str(o.get("fix")))}</div>' if o.get("fix") else ""),
+             cls="hi" if o.get("severity") == "high" else "mid",
+             meta=_lane(o.get("lane")) + chips((o.get("severity"),
+                                                "bad" if o.get("severity") == "high" else "warn"))
+                  + when(o.get("at")))
+    add("</section>")
+
+    # ---- findings
+    fs = W["findings"]
+    fsum = data["findings_summary"]
+    sec("findings", "What the work reported back", len(fs),
+        f'{fsum.get("unread", 0)} unread in total, {fsum.get("contradicted", 0)} of them '
+        f'contradicting something this stack believed.')
+    if fsum.get("contradicted"):
+        means(f'<b>{fsum["contradicted"]} finding(s) say something believed here is '
+              'false.</b> Until those are read, anything built on top is built on the '
+              'thing that was just disproved - which is why a contradicted finding '
+              'outranks every other kind.')
+    if not fs:
+        empty("Nothing was reported back in this window.")
+    for f in fs[:80]:
+        b = f.get("bearing")
+        card(e(str(b or "")), e(str(f.get("text") or "")[:900]),
+             cls="hi" if b == "contradicted" else "good" if b == "advanced" else "",
+             meta=_lane(f.get("lane"))
+                  + chips((b, "bad" if b == "contradicted" else "ok" if b == "advanced" else ""),
+                          ("unread", "warn") if not f.get("read_at") else ("", ""))
+                  + when(f.get("at")))
+    add("</section>")
+
+    # ---- ideas
+    #
+    # The cheap channel. A worker with its hands in the code notices something
+    # that is not its task, says one line about it, and carries on. Nothing here
+    # has been judged - it is a list of leads, and its whole value is that they
+    # are read together, months of them at once, rather than one at a time in a
+    # transcript that gets deleted.
+    ids_ = data.get("ideas") or []
+    sec("ideas", "Noticed in passing, and never picked up", len(ids_) or None,
+        "Written by workers doing something else. None of it is scored, none of it is a "
+        "claim, and none of it has been acted on. Solving this report is what turns the "
+        "ones worth having into proposals.")
+    if not ids_:
+        empty("No worker has left anything on this list.")
+    for i in ids_[:60]:
+        n = int(i.get("seen") or 1)
+        card("", e(str(i.get("text") or "")[:600]),
+             meta=_lane(i.get("lane"))
+                  + chips((f"seen {n}x", "warn") if n > 1 else ("", ""))
+                  + when(i.get("at")))
+    if len(ids_) > 1:
+        means("These are the cheapest thing on this page and the only part of it nobody "
+              "has read. An idea repeated by several workers is several independent "
+              "people noticing the same gap, which is worth more than any one of them.")
+    add("</section>")
+
+    # ---- reading
+    rd = data.get("reading") or {}
+    items = rd.get("items") or []
+    sec("reading", "Worth reading", len(items) or None,
+        "Found by web search against what this workspace is doing. "
+        "Every link was fetched by the harness before it was printed.")
+    if not rd.get("available"):
+        empty(str(rd.get("why") or "no search was run"))
+    elif not items:
+        empty(str(rd.get("why_nothing") or "the search returned nothing worth sending"))
+    else:
+        add(f'<p class="sub">{rd.get("checked", 0)} link(s) checked, '
+            f'{rd.get("dead", 0)} did not resolve.</p>')
+        for it in items:
+            live_link = it["reachable"]
+            title = (f'<a href="{e(it["url"])}" target="_blank" rel="noreferrer noopener">'
+                     f'{e(it["title"])}</a>' if live_link else
+                     f'<span class="dead">{e(it["title"])}</span>')
+            card(title,
+                 e(it["what"]) + (f'<div class="muted">{e(it["why"])}</div>' if it["why"] else "")
+                 + ("" if live_link else
+                    f'<div class="muted">This link did not resolve '
+                    f'({e(str(it["check_why"] or it["status"]))}), so it is shown but not '
+                    f'linked - the architect may have invented it.</div>'),
+                 cls="" if live_link else "mid",
+                 meta=chips((it["kind"], ""), (it["lane"], "lane"))
+                      + chips(("checked", "ok") if live_link else ("unreachable", "bad")),
+                 f=(it["title"] + " " + it["what"] + " " + it["why"]).lower())
+    add("</section>")
+
+    # ---- what to do
+    A = data["actions"]
+    sec("actions", "What to do about it", A["total"],
+        "Every item names the record that raised it. Nothing here was invented: if "
+        "the record clears, the item stops appearing on the next report by itself.")
+    if not A["total"]:
+        empty("Nothing on record is asking for a decision. That is either a good "
+              "sign or a sign that nothing has been recorded.")
+    else:
+        means(f'<b>{A["high"]} of {A["total"]}</b> item(s) are the kind that stop work '
+              'rather than merely describe it. The four groups below are not '
+              'severities - they are four different kinds of answer, and mixing them '
+              'is how "revisit the roadmap" ends up in the same list as "a worker is '
+              'wedged".')
+    for g in A["groups"]:
+        if not g["items"]:
+            continue
+        add(f'<h3>{e(g["title"])} &mdash; {len(g["items"])}</h3>')
+        add(f'<p class="sub">{e(g["why"])}</p>')
+        for i in g["items"]:
+            add(f'<div class="act {e(i["severity"])}" '
+                f'data-f="{e((i["what"] + " " + i["why"] + " " + i["where"]).lower())}">'
+                f'<div class="hd"><span class="t">{e(i["what"])}</span> '
+                + _lane(i["where"])
+                + chips((i["severity"], "bad" if i["severity"] == "high"
+                         else "warn" if i["severity"] == "medium" else "ok"))
+                + f'</div><div class="why">{e(i["why"])}</div>'
+                + (f'<div class="ev">on the record: {e(i["evidence"])}</div>'
+                   if i["evidence"] else "")
+                + "</div>")
+    add("</section>")
+
+    # ---- raw
+    sec("raw", "Everything, as data", None,
+        "The exact record this page was rendered from.")
+    add('<p><button id="copyjson">Copy JSON</button></p>'
+        f'<pre class="raw" id="rawjson">{e(json.dumps(data, indent=2, default=str))}</pre>')
+    add("</section>")
+
+    add(f'<footer>Generated by the [&] console from {e(data["root"])} at {e(at)}. '
+        f'Report id <code>{e(data["id"])}</code>. '
+        f'Doctrine {e(str(data["doctrine"].get("digest") or "unpinned"))}'
+        + (" (changed since you ratified it)" if data["doctrine"].get("drifted") else "")
+        + ".</footer></div>")
+
+    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            f"<title>{e(ws['name'])} - report #{data['nth']}</title>"
+            f"<style>{REPORT_CSS}</style></head><body>"
+            + "".join(out)
+            + f"<script>{REPORT_JS}</script></body></html>")
+
+
+def _stat(value, key: str, cls: str = "") -> str:
+    return (f'<div class="stat {cls}"><div class="v">{html.escape(str(value))}</div>'
+            f'<div class="k">{html.escape(key)}</div></div>')
+
+
+def _lane(name) -> str:
+    return f'<span class="chip lane">{html.escape(str(name))}</span>' if name else ""
+
+
+def _dur(s) -> str:
+    s = int(s or 0)
+    return f"{s // 3600}h {s % 3600 // 60}m" if s >= 3600 else f"{s // 60}m {s % 60}s"
+
+
+def _reached(rung: str | None, x: str) -> bool:
+    """Whether a lane's evidence has got at least as far as rung `x`."""
+    if not rung or rung not in LADDER_RUNGS or x not in LADDER_RUNGS:
+        return False
+    return LADDER_RUNGS.index(x) <= LADDER_RUNGS.index(rung)
+
+
+def _table(head: list[str], rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    th = "".join(f"<th>{html.escape(h)}</th>" for h in head)
+    body = "".join(
+        '<tr data-f="' + html.escape(" ".join(re.sub("<[^>]+>", " ", c) for c in r).lower())
+        + '">' + "".join(f"<td>{c}</td>" for c in r) + "</tr>"
+        for r in rows)
+    return f"<table><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def make_report(*, web: bool = False) -> dict:
+    """Take a report, write it, and remember that it was taken.
+
+    Recording it is what makes the NEXT one mean anything: the window is
+    "since the last one", so a report that is not written down would make every
+    later report cover the whole history again.
+    """
+    data = report_data(web=web)
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    name = f"report-{data['at'].replace(':', '').replace('-', '')[:15]}-{data['id']}.html"
+    path = REPORT_DIR / name
+    path.write_text(render_report(data), encoding="utf-8")
+    # The same numbers the page was rendered from, kept beside it. The solver
+    # reads THIS, not a fresh survey: solving report six against the workspace
+    # as it is now would answer a question about today under the heading of a
+    # report taken on Tuesday, and every claim it made would be unfalsifiable.
+    data_name = name[:-len(".html")] + ".json"
+    (REPORT_DIR / data_name).write_text(json.dumps(data, indent=1, sort_keys=True) + "\n",
+                                        encoding="utf-8")
+    rec = {"id": data["id"], "at": data["at"], "workspace": data["workspace"]["slug"],
+           "file": name, "data_file": data_name, "nth": data["nth"],
+           "since": (data["since"] or {}).get("id"),
+           "web": bool(web and (data["reading"] or {}).get("available")),
+           "counts": data["window"]["counts"], "quiet": data["window"]["quiet"],
+           "gates": len(data["headed"].get("gates") or []),
+           "verdict": (data["headed"].get("state") or {}).get("verdict")}
+    store = report_store()
+    store.setdefault("reports", []).append(rec)
+    _save_reports(store)
+    return {"ok": True, **rec, "path": str(path)}
+
+
+# ---------------------------------------------------------------- the solver
+#
+# A report is a reading. This is the thing that acts on one.
+#
+# Everything else that proposes work looks at a slice: a direction review sees
+# one finished goal, a sharpen sees one objective, explore sees the lanes and
+# their findings. None of them sees the SHAPE - a lane whose reliability is 100%
+# and whose delivery is 20%, a gate that has held for three days, a rating that
+# fell between report four and report six, thirty-one action items of which
+# fourteen are the same stopped question. That shape is what a report is, and
+# until now nothing read it back.
+#
+# What the solver may do is deliberately narrow. It writes PROPOSALS, into the
+# same store, scored on the same four axes, held by the same bars and the same
+# gates. It does not adopt, it does not edit the mission, it does not touch the
+# doctrine, and it does not change a goal. Its recommendations about those are
+# text addressed to the operator, because every one of them is rule 6's.
+
+SOLVER_SYSTEM = (
+    "You are the consulting architect. You are reading a REPORT on the operator's stack - "
+    "not the stack itself. Everything in it was derived from recorded events, so it is what "
+    "actually happened, and the numbers are the ones the operator has in front of them.\n\n"
+    "You are answering one question: given this shape, what should change?\n\n"
+    "Reply with one JSON object and nothing else:\n"
+    "{\n"
+    '  "reading": "what the shape of this report actually says, in 3-6 sentences. The thing '
+    'a person would only see by looking at all of it at once",\n'
+    '  "next": [{"objective": "...", "lane": "...", "why": "which line of this report '
+    'made you propose it", ' + _SCORE_FIELDS + "}],\n"
+    '  "research": [{"question": "...", "why": "...", "settled_by": "...", "lane": "..."}],\n'
+    '  "goal_moves": [{"goal_id": "...", "move": "recalculate|improve|close|extend", '
+    '"why": "the recorded fact that says so"}],\n'
+    '  "direction": [{"change": "what to change about where this is pointed", '
+    '"why": "...", "evidence": "the line of the report that says so"}],\n'
+    '  "goal_setting": [{"change": "what to change about HOW objectives are chosen, scored, '
+    'or gated - the bars, the budgets, the thresholds", "why": "...", "evidence": "..."}],\n'
+    '  "picked_up": ["the id of an idea a worker left behind that you turned into an item '
+    'of `next` or `research` above"],\n'
+    '  "nothing": false, "why_nothing": "if the report says the stack is fine, say so here"\n'
+    "}\n\n"
+    "Rules:\n"
+    "- The section of things workers noticed in passing is the one part of this report "
+    "nobody has read. Each line was written by a worker with its hands in that code, doing "
+    "something else, and then dropped. That is where an objective nobody has thought of "
+    "comes from - and also where a great deal of noise comes from, so judge them: the ones "
+    "worth having become items of `next` or `research` like anything else, scored and "
+    "sourced, and their ids go in `picked_up`. Leave the rest alone; not picking one up is "
+    "not a rejection, and it will still be there next report.\n"
+    "- Cite the report. Every item carries the number, row or item it came off. An item you "
+    "cannot source to a line of this report is one you brought with you, and it is exactly "
+    "the thing a report exists to stop.\n"
+    "- `next` and `research` become real proposals that a worker fleet may start tonight. At "
+    "most three of each, and fewer is a better answer. Do not restate anything already open, "
+    "already proposed, or already turned down - you were given all three lists.\n"
+    "- `goal_moves` are about goals that already exist, by id, from the lists you were "
+    "given. `recalculate` when the plan was written against a tree that has since moved; "
+    "`improve` when the objective itself is what cannot land; `close` when the record says "
+    "it is finished or pointless; `extend` when it ran out of budget mid-flight. You are "
+    "recommending - the operator clicks.\n"
+    "- `direction` and `goal_setting` are the two things you may NOT do and may say. "
+    "`direction` is where the stack is pointed. `goal_setting` is the machinery that chooses "
+    "objectives: the adopt bars, the escalation limits, the round caps, the budgets. Both "
+    "are the operator's, both are written down here, and neither takes effect from this "
+    "call. Say the number you would change and what to.\n"
+    "- A gate that is up is not a bug. It is the operator being asked something. Say what is "
+    "being asked and what answering it would unblock; do not propose routing around it.\n"
+    + _SCORE_RULES + "\n"
+    "- `nothing` is a real answer. A quiet report with no gates up and no problems standing "
+    "should return empty lists, and saying so costs nothing. Filling six fields because "
+    "there are six fields is how a report starts generating work instead of reading it."
+)
+
+
+def _report_facts(d: dict) -> str:
+    """The report, flattened to the numbers. Not the page - the page is for a person."""
+    W, N, H = d.get("window") or {}, d.get("now") or {}, d.get("headed") or {}
+    R, HI = d.get("ratings") or {}, d.get("history") or {}
+    out = [f"# Report #{d.get('nth')} taken {d.get('at')}",
+           f"- covers: since {(d.get('since') or {}).get('at') or 'the beginning'}",
+           f"- verdict: {(H.get('state') or {}).get('verdict')}",
+           f"- quiet window: {W.get('quiet')}"]
+
+    if W.get("counts"):
+        out.append("\n## What moved in the window\n"
+                   + "\n".join(f"- {k}: {v}" for k, v in sorted(W["counts"].items())))
+    if W.get("ladder"):
+        out.append("\n## Rungs moved in the window\n"
+                   + "\n".join(f"- ({x.get('lane')}) {x.get('claim', '')[:160]}: "
+                               f"{x.get('from')} -> {x.get('to')}" for x in W["ladder"][:20]))
+
+    if H.get("gates"):
+        out.append("\n## Gates up right now, holding the whole fleet\n"
+                   + "\n".join(f"- **{g['gate']}**: at {g['at']}, limit {g['limit']}. "
+                               f"{g['why']}" for g in H["gates"]))
+    if H.get("proposals"):
+        out.append("\n## Proposals waiting, and what is holding each one\n"
+                   + "\n".join(f"- [{p.get('id')}] ({p.get('lane')}) odds {pct(p.get('confidence'))}, "
+                               f"need {pct(p.get('need'))}, {usd(p.get('cost_usd'))} — "
+                               f"held: {p.get('hold') or 'nothing'} — {p.get('text', '')[:200]}"
+                               for p in H["proposals"][:20]))
+    if H.get("questions"):
+        out.append("\n## Open questions a worker stopped to ask\n"
+                   + "\n".join(f"- ({q.get('lane')}) {q.get('text', '')[:250]}"
+                               for q in H["questions"][:20]))
+
+    for key, title in (("goals", "Goals running"), ("blocked", "Goals stopped")):
+        rows = N.get(key) or []
+        if rows:
+            out.append(f"\n## {title}\n" + "\n".join(
+                f"- [{g.get('id')}] ({g.get('lane')}) {g.get('state')}"
+                + (f", stopped on {g['stopped_on']}" if g.get("stopped_on") else "")
+                + f", {g.get('rounds', 0)} round(s): {str(g.get('objective'))[:200]}"
+                for g in rows[:20]))
+
+    if R.get("lanes"):
+        out.append("\n## Scorecard (0-1, derived from the records)\n"
+                   + "\n".join(
+                       f"- **{r['lane']}**: {r.get('score')} {r.get('grade', '')} — "
+                       + ", ".join(f"{k} {v}" for k, v in sorted((r.get("parts") or {}).items()))
+                       + f" — rung `{r.get('rung')}`, spent {usd(r.get('spend'))}"
+                       for r in R["lanes"]))
+    if R.get("measures"):
+        out.append("\n## What each measure counts\n"
+                   + "\n".join(f"- **{k}**: {v}" for k, v in sorted(R["measures"].items())))
+    if HI.get("series"):
+        # `days` is how MANY days the window covers; `series` is the days themselves.
+        days = [x for x in HI["series"] if any(v for k, v in x.items() if k != "day")]
+        if days:
+            out.append("\n## Day by day\n" + "\n".join(
+                "- " + x["day"] + ": " + ", ".join(f"{k} {v}" for k, v in sorted(x.items())
+                                                   if k != "day" and v)
+                for x in days[-21:]))
+
+    if d.get("problems"):
+        out.append("\n## Standing problems\n"
+                   + "\n".join(f"- [{o.get('severity')}] ({o.get('lane') or '-'}) "
+                               f"{' '.join(str(o.get('text') or '').split())[:300]} "
+                               f"— fix: {o.get('fix')}" for o in d["problems"][:25]))
+    acts = [a for grp in ((d.get("actions") or {}).get("groups") or [])
+            for a in (grp.get("items") or [])]
+    if acts:
+        out.append("\n## The action items this report already derived\n"
+                   + "\n".join(f"- [{a.get('group')}/{a.get('severity')}] {a.get('what')}"
+                               f" — {a.get('why')}" for a in acts[:40]))
+    if d.get("ideas"):
+        out.append("\n## Things workers noticed in passing and nobody has picked up\n"
+                   "Each was written by a worker doing something else. None is scored, "
+                   "none is a claim, and none has been acted on.\n"
+                   + "\n".join(f"- [{i.get('id')}] ({i.get('lane') or '-'}) "
+                               + (f"seen {i['seen']}x " if int(i.get("seen") or 1) > 1 else "")
+                               + str(i.get("text") or "")[:400] for i in d["ideas"][:40]))
+    if (d.get("findings_summary") or {}).get("unread"):
+        fs = d["findings_summary"]
+        out.append(f"\n## Findings\n- {fs['unread']} unread, of which "
+                   f"{fs.get('contradicted', 0)} contradict something we believed")
+    return "\n".join(out)
+
+
+def _solver_context(d: dict) -> str:
+    """The report, plus the three lists that stop it proposing what already exists."""
+    known = sorted(config().get("lanes") or {})
+    parts = [mission_block().strip(),
+             doctrine_block("The doctrine this stack is held to").strip(),
+             _report_facts(d),
+             "# The lanes that exist\n\n" + ", ".join(f"`{n}`" for n in known)]
+
+    live = [g for g in goals() if g["state"] in ("planning", "running", "blocked")]
+    if live:
+        parts.append("# Goals open right now, by id - do not propose these again\n\n"
+                     + "\n".join(f"- [{g['id']}] ({g['lane']}) {g['state']}: "
+                                 f"{g['objective'][:200]}" for g in live))
+    op = proposals()
+    if op:
+        parts.append("# Already proposed and waiting - do not restate them\n\n"
+                     + "\n".join(f"- ({p.get('lane')}) [{p.get('kind')}] "
+                                 f"{p.get('text', '')[:200]}" for p in op[:30]))
+    dis = proposals(state="dismissed")[:20]
+    if dis:
+        parts.append("# Already turned down by the operator - do not re-propose these\n\n"
+                     + "\n".join(f"- ({p.get('lane')}) {p.get('text', '')[:200]}" for p in dis))
+
+    # The numbers `goal_setting` is allowed to argue about, stated rather than
+    # implied. Asked to change a bar without being told what it is, a model
+    # invents one, and the operator gets a recommendation to set 0.6 to 0.6.
+    parts.append("# The dials that currently decide what gets started\n\n"
+                 f"- adopt bar (odds a proposal must reach): {adopt_bar():.2f}\n"
+                 f"- need bar (how much the mission must want it): {need_bar():.2f}\n"
+                 f"- sharpening stops when a round gains less than: {SHARPEN_GAIN_FLOOR}"
+                 f" (spend backstop: {SHARPEN_HARD_CAP} rounds)\n"
+                 f"- sharpen floor (headroom below which it stops trying): {SHARPEN_FLOOR}\n"
+                 f"- auto-adopt: {'on' if direction_store().get('auto_adopt') else 'off'}\n"
+                 f"- escalation limits: "
+                 + json.dumps(escalate_policy(), sort_keys=True))
+    return "\n\n".join(parts)
+
+
+def report_data_for(rid: str | None = None) -> tuple[dict | None, str]:
+    """The data a given report was rendered from, or why it cannot be read."""
+    rows = reports()
+    if not rows:
+        return None, "no report has been taken yet - take one first"
+    rec = next((r for r in rows if r.get("id") == rid), None) if rid else rows[0]
+    if not rec:
+        return None, f"no report {rid!r}"
+    name = rec.get("data_file")
+    if not name:
+        # Written before reports kept their data. Re-deriving would answer about
+        # today under an older report's heading, which is the one thing this
+        # must not do quietly.
+        return None, (f"report #{rec.get('nth')} was taken before reports kept their "
+                      f"numbers on disk, so it cannot be solved. Take a new one.")
+    path = REPORT_DIR / name
+    if not path.exists():
+        return None, f"the numbers for report #{rec.get('nth')} are missing from disk"
+    try:
+        return {**json.loads(path.read_text()), "_rec": rec}, ""
+    except (OSError, json.JSONDecodeError) as e:
+        return None, f"the numbers for report #{rec.get('nth')} could not be read: {e}"
+
+
+def solve_report(rid: str | None = None) -> dict:
+    """Read a report back and propose what to do about it. One architect call."""
+    if not architect_available():
+        return {"ok": False, "error": architect_off_reason()}
+    d, why = report_data_for(rid)
+    if not d:
+        return {"ok": False, "error": why}
+    rec = d["_rec"]
+
+    model = config().get("consult_model", DEFAULT_CONSULT)
+    resp = architect_chat([{"role": "system", "content": SOLVER_SYSTEM},
+                           {"role": "user", "content": _solver_context(d)}], model)
+    text = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    out = _json_reply(text)
+    if not out:
+        return {"ok": False, "error": "the architect's answer could not be read as JSON",
+                "raw": text[:2000]}
+
+    def _rows(key: str, fields: tuple[str, ...], limit: int = 6) -> list[dict]:
+        rows = []
+        for x in (out.get(key) or [])[:limit]:
+            if not isinstance(x, dict):
+                continue
+            row = {f: str(x.get(f) or "")[:600] for f in fields}
+            if any(row.values()):
+                rows.append(row)
+        return rows
+
+    by_id = {g["id"]: g for g in goals()}
+    moves = [{**m, "lane": by_id[m["goal_id"]]["lane"]}
+             for m in _rows("goal_moves", ("goal_id", "move", "why"))
+             # A move against a goal that does not exist is not a recommendation,
+             # it is a typo the operator would have to check by hand.
+             if m["goal_id"] in by_id
+             and m["move"] in ("recalculate", "improve", "close", "extend")]
+
+    rev = {"id": "d" + uuid.uuid4().hex[:9], "at": now(), "lane": None,
+           "goal_id": None, "goal": "", "kind": "solve", "web": False,
+           "report_id": rec.get("id"), "report_nth": rec.get("nth"),
+           "assessment": str(out.get("reading") or "")[:2000],
+           "ladder": [],
+           "goal_moves": moves,
+           "direction": _rows("direction", ("change", "why", "evidence")),
+           "goal_setting": _rows("goal_setting", ("change", "why", "evidence")),
+           "exhausted": bool(out.get("nothing")),
+           "why_exhausted": str(out.get("why_nothing") or "")[:600],
+           "tokens": (resp.get("usage") or {}).get("total_tokens") or 0}
+
+    known = set(config().get("lanes") or {})
+    seen = {_norm_prompt(p.get("text", "")) for p in direction_store().get("proposals", [])}
+    fresh, misfiled = [], []
+    for n in (out.get("next") or [])[:3]:
+        obj = str((n or {}).get("objective") or "").strip()
+        if not obj or _norm_prompt(obj) in seen:
+            continue
+        want = str(n.get("lane") or "").strip()
+        if want not in known:
+            misfiled.append({"objective": obj[:200], "lane": want})
+            continue
+        seen.add(_norm_prompt(obj))
+        fresh.append({"id": "p" + uuid.uuid4().hex[:9], "at": now(), "kind": "goal",
+                      "lane": want, "text": obj[:1000],
+                      "why": str(n.get("why") or "")[:1000], "state": "open",
+                      "review_id": rev["id"], "source": "solve",
+                      "from_report": rec.get("id"), **_scored(n)})
+    for r in (out.get("research") or [])[:3]:
+        qn = str((r or {}).get("question") or "").strip()
+        if not qn or _norm_prompt(qn) in seen:
+            continue
+        seen.add(_norm_prompt(qn))
+        want = str(r.get("lane") or "").strip()
+        fresh.append({"id": "p" + uuid.uuid4().hex[:9], "at": now(), "kind": "question",
+                      "lane": want if want in known else None,
+                      "text": qn[:1000], "why": str(r.get("why") or "")[:1000],
+                      "settled_by": str(r.get("settled_by") or "")[:1000],
+                      "state": "open", "review_id": rev["id"], "source": "solve",
+                      "from_report": rec.get("id")})
+
+    with _DIRECTION_LOCK:
+        store = direction_store()
+        store.setdefault("proposals", []).extend(fresh)
+        store.setdefault("reviews", []).append(rev)
+        _save_direction(store)
+
+    # An idea that became a proposal is off the list, because it is now being
+    # held to the bars - leaving it open would put the same thing in front of the
+    # next report twice, once scored and once not.
+    open_ideas = {i["id"] for i in ideas()}
+    picked = [x for x in (out.get("picked_up") or [])[:20]
+              if isinstance(x, str) and x in open_ideas]
+    if picked:
+        close_ideas(picked, "picked")
+    rev["picked_up"] = picked
+
+    ngoal = sum(1 for p in fresh if p["kind"] == "goal")
+    nq = len(fresh) - ngoal
+    add_note(f"solved report #{rec.get('nth')}: " + rev["assessment"][:400]
+             + (f" — {ngoal} objective(s) proposed" if ngoal else "")
+             + (f", {nq} open question(s)" if nq else "")
+             + (f", {len(moves)} move(s) on open goals" if moves else "")
+             + (f", {len(rev['direction'])} change(s) of direction" if rev["direction"] else "")
+             + (f", {len(rev['goal_setting'])} change(s) to how goals are set"
+                if rev["goal_setting"] else "")
+             + (" — nothing to do: " + rev["why_exhausted"][:200] if rev["exhausted"] else ""))
+
+    rev["proposals"] = fresh
+    rev["misfiled"] = misfiled
+    rev["ok"] = True
+    # Nothing is adopted, no goal is moved, no dial is turned. Every one of those
+    # is a click, and this call is a reading.
+    return rev
+
+
+# ------------------------------------------------------------- the settler
+#
+# The contradictions gate had no worker.
+#
+# A finding that says "something we believed is false" stops the fleet, and
+# rightly - building on a disproved claim is the one thing the ladder exists to
+# prevent. But nothing was ever assigned to SETTLE one. They accumulated, the
+# gate held, and the only way out was the operator reading eighteen paragraphs
+# of review prose and deciding what each one implied.
+#
+# Worse, most of them could not be settled at all. Six of the first eighteen say
+# some version of "this claim was recorded at a rung it did not earn" - and
+# until `retract_rung` existed there was no way to lower a rung, because
+# `lane_rungs` takes the maximum ever recorded. The architect could see the
+# mistake, file it, and watch the false rung go on being fed to every proposal
+# scored in every lane. The gate was not being difficult; it was pointing at a
+# hole.
+#
+# So this pass reads each contradiction against the record and routes it. What
+# it may do is narrow, and every route ends in something PERFORMED:
+#
+#   retract   - the claim was overstated. Name the ladder entry; the harness
+#               checks it was really recorded and takes the rung back.
+#   supersede - a later finding already refutes this one. Name it; the harness
+#               checks it exists and is actually later.
+#   work      - it needs code. The harness files a PROPOSAL, scored and held by
+#               the same bars as anything else. Not a task: adopting is rule 6's.
+#   keep      - it cannot be settled from the record. It stays unread.
+#
+# A verdict whose consequence the harness cannot perform is downgraded to
+# `keep`. That is the load-bearing rule: no finding is ever closed by an
+# opinion, only by a thing that happened and can be named.
+
+SETTLE_SYSTEM = (
+    "You are the consulting architect, settling CONTRADICTIONS on the operator's stack.\n\n"
+    "A contradiction is a finding that says something the stack believed and acted on is "
+    "false. Each one is quoted to you exactly as it was filed. They are blocking every "
+    "proposal in every lane, so they have to be resolved - but resolving one means saying "
+    "what it IMPLIES, not agreeing that it was filed.\n\n"
+    "For each finding give exactly one verdict:\n\n"
+    "- `retract`: the finding says a claim was recorded at a rung it did not earn. Give the "
+    "ladder entry VERBATIM from the list of recorded entries below - `claim` copied exactly, "
+    "and `to` the rung it was wrongly moved to. The rung will be taken back. Use this "
+    "whenever a finding disputes evidence rather than code.\n"
+    "- `supersede`: a LATER finding in this list already refutes or replaces this one - it "
+    "checked the same thing and got a different answer. Give `by` as that finding's id. It "
+    "must be later than the one you are settling.\n"
+    "- `work`: settling it needs code or a real run. Give an `objective` and a `lane`, and "
+    "score it. This becomes a proposal in the ordinary queue; it is not started.\n"
+    "- `keep`: you cannot settle it from what you have been given. Say why. This is a real "
+    "answer and it is better than a guess - the finding stays open and the operator reads it.\n\n"
+    "Rules:\n"
+    "- Do not invent a ladder entry. If the claim you want to retract is not in the recorded "
+    "list, the verdict is `keep`.\n"
+    "- Several findings often say the same thing about the same claim. Retract the entry once "
+    "and `supersede` the rest onto the finding that made the point best.\n"
+    "- A finding being old is not a reason to close it.\n"
+    "- Settling is not agreeing. If a finding is wrong, say so in `why` and `keep` it.\n\n"
+    "Reply with one JSON object and nothing else:\n"
+    "{\n"
+    '  "reading": "what these contradictions add up to, in 3-6 sentences: what the stack '
+    'has been getting wrong, not a list of the findings",\n'
+    '  "settle": [{"finding": "<id>", "verdict": "retract|supersede|work|keep", '
+    '"why": "the reason, addressed to the operator",\n'
+    '      "claim": "(retract) the recorded ladder entry, copied exactly", '
+    '"to": "(retract) the rung it was wrongly moved to",\n'
+    '      "by": "(supersede) the id of the later finding that settles it",\n'
+    '      "objective": "(work) what to do about it", "lane": "(work) which lane", '
+    + _SCORE_FIELDS + "}]\n"
+    "}"
+)
+
+
+def _settle_context(rows: list[dict]) -> str:
+    """The findings, the ladder entries they might be about, and the goals."""
+    cfg = config()
+    out = [f"# The mission\n\n{cfg.get('mission') or '(none set)'}"]
+
+    gone = retractions()
+    entries = []
+    for r in direction_store().get("reviews", []):
+        for e in (r.get("ladder") or []):
+            if not r.get("lane") or e.get("to") not in LADDER_RUNGS:
+                continue
+            if _rung_key(r.get("lane"), e.get("claim"), e.get("to")) in gone:
+                continue
+            entries.append(f"- **{r.get('lane')}** `{e.get('from')}` -> `{e.get('to')}`: "
+                           f"{str(e.get('claim') or '')[:400]}")
+    if entries:
+        out.append("# Every rung on record, and the claim it was moved for\n\n"
+                   "To `retract` one, copy its claim text exactly and give its `to` rung. "
+                   "Anything not on this list cannot be retracted.\n\n" + "\n".join(entries))
+    out.append("# The highest rung each lane is currently credited with\n\n"
+               + "\n".join(f"- {k}: `{v}`" for k, v in sorted(lane_rungs().items()))
+               + "\n\nThese are what every proposal in every lane is currently scored "
+                 "against. A rung that was not earned is inflating all of them.")
+
+    by_goal = {g["id"]: g for g in goals()}
+    seen_goals = []
+    for f in rows:
+        g = by_goal.get(f.get("goal_id") or "")
+        if g and g["id"] not in [x["id"] for x in seen_goals]:
+            seen_goals.append(g)
+    if seen_goals:
+        out.append("# The goals these findings came out of\n\n"
+                   + "\n".join(f"- `{g['id']}` **{g['lane']}** [{g.get('state')}]: "
+                               f"{str(g.get('objective') or '')[:400]}" for g in seen_goals))
+
+    lines = []
+    for f in sorted(rows, key=lambda x: x.get("at") or ""):
+        lines.append(f"## `{f['id']}` — {f.get('at')} — {f.get('lane')} — filed by "
+                     f"{f.get('source')} — goal `{f.get('goal_id') or 'none'}`\n\n"
+                     + str(f.get("text") or ""))
+    out.append("# The contradictions, oldest first\n\n"
+               "Oldest first on purpose: a later one often checked what an earlier one "
+               "asserted.\n\n" + "\n\n".join(lines))
+    return "\n\n".join(out)
+
+
+def settle_findings(lane: str | None = None, limit: int = 24) -> dict:
+    """Read the open contradictions and settle the ones that can be settled."""
+    if not architect_available():
+        return {"ok": False, "error": architect_off_reason()}
+    rows = [f for f in findings(lane=lane, unread_only=True)
+            if f.get("bearing") == "contradicted"][:limit]
+    if not rows:
+        return {"ok": False, "error": "no unread contradictions to settle"}
+
+    model = config().get("consult_model", DEFAULT_CONSULT)
+    resp = architect_chat([{"role": "system", "content": SETTLE_SYSTEM},
+                           {"role": "user", "content": _settle_context(rows)}], model)
+    text = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    out = _json_reply(text)
+    if not out:
+        return {"ok": False, "error": "the architect's answer could not be read as JSON",
+                "raw": text[:2000]}
+
+    by_id = {f["id"]: f for f in rows}
+    known = set(config().get("lanes") or {})
+    seen = {_norm_prompt(p.get("text", "")) for p in direction_store().get("proposals", [])}
+    rid = "d" + uuid.uuid4().hex[:9]
+    settled, kept, fresh, retracted = [], [], [], []
+
+    for v in (out.get("settle") or [])[:limit]:
+        if not isinstance(v, dict):
+            continue
+        f = by_id.get(str(v.get("finding") or ""))
+        if not f:
+            continue
+        verdict = str(v.get("verdict") or "").strip().lower()
+        why = str(v.get("why") or "")[:1000]
+        done = None
+
+        if verdict == "retract":
+            r = retract_rung(f.get("lane"), str(v.get("claim") or ""),
+                             str(v.get("to") or ""), why, finding_id=f["id"])
+            # No such entry was ever recorded, so there is nothing to take back
+            # and the finding is not settled by saying there was.
+            if r:
+                retracted.append(r)
+                done = {"how": "retract", "why": why, "retraction_id": r["id"],
+                        "claim": r["claim"], "to": r["to"]}
+            else:
+                why = ("no ladder entry matching that claim is on record, so there was "
+                       "nothing to retract — " + why)
+
+        elif verdict == "supersede":
+            later = by_id.get(str(v.get("by") or ""))
+            # It has to exist, be a different finding, and actually be later:
+            # "a newer one settles it" is only a reason if one is newer.
+            if later and later["id"] != f["id"] and (later.get("at") or "") > (f.get("at") or ""):
+                done = {"how": "supersede", "why": why, "by": later["id"]}
+            else:
+                why = ("the finding named as superseding it is not a later finding on "
+                       "record — " + why)
+
+        elif verdict == "work":
+            obj = str(v.get("objective") or "").strip()
+            want = str(v.get("lane") or "").strip() or f.get("lane")
+            if obj and want in known and _norm_prompt(obj) not in seen:
+                seen.add(_norm_prompt(obj))
+                p = {"id": "p" + uuid.uuid4().hex[:9], "at": now(), "kind": "goal",
+                     "lane": want, "text": obj[:1000], "why": why, "state": "open",
+                     "review_id": rid, "source": "settle", "from_finding": f["id"],
+                     **_scored(v)}
+                fresh.append(p)
+                done = {"how": "work", "why": why, "proposal_id": p["id"]}
+            else:
+                why = ("no proposal could be filed for it — " + why) if obj else why
+
+        if done:
+            if settle_finding(f["id"], {**done, "at": now(), "review_id": rid}):
+                settled.append({"finding": f["id"], **done})
+        else:
+            kept.append({"finding": f["id"], "why": why or "left for the operator to read",
+                         "text": str(f.get("text") or "")[:300]})
+
+    rev = {"id": rid, "at": now(), "lane": lane, "goal_id": None, "goal": "",
+           "kind": "settle", "web": False,
+           "assessment": str(out.get("reading") or "")[:2000],
+           "ladder": [], "goal_moves": [], "direction": [], "goal_setting": [],
+           "settled": settled, "kept": kept, "retractions": retracted,
+           "considered": [f["id"] for f in rows],
+           "tokens": (resp.get("usage") or {}).get("total_tokens") or 0}
+    with _DIRECTION_LOCK:
+        store = direction_store()
+        store.setdefault("proposals", []).extend(fresh)
+        store.setdefault("reviews", []).append(rev)
+        _save_direction(store)
+
+    add_note(f"settled {len(settled)} of {len(rows)} contradiction(s): " + rev["assessment"][:300]
+             + (f" — {len(retracted)} rung(s) retracted" if retracted else "")
+             + (f", {len(fresh)} proposal(s) filed" if fresh else "")
+             + (f", {len(kept)} left open for you" if kept else ""))
+
+    rev["proposals"] = fresh
+    rev["rungs_now"] = lane_rungs()
+    rev["ok"] = True
+    return rev
+
+
 def cmd_packet(args):
     zpath, brief = build_packet(args.lane, args.question or "(no question stated)", args.file or [])
     print(f"packet: {zpath}  ({zpath.stat().st_size} bytes)")
@@ -7834,6 +12386,66 @@ def cmd_credits(args):
     for k, m in CONSULT_MODELS.items():
         print(f"  {k:<6} {m}")
     return 0
+
+
+def cmd_db(args):
+    """The mirror from a terminal, so a backup never needs the console running."""
+    if args.sub == "status":
+        s = store.status()
+        print(f"database  {s['path']}")
+        if not s["exists"]:
+            print("  not created yet - run `amp db backup`")
+            return 0
+        print(f"  {s['docs']} documents, {s['revisions']} revisions, "
+              f"{s['bytes'] / 1e6:.2f} MB on disk")
+        print(f"  mirror {'on' if s['settings']['mirror'] == '1' else 'OFF'}, "
+              f"history {s['settings']['history_keep']} per document, "
+              f"cursor {s['cursor']}, device {s['device']}")
+        for w in s["workspaces"]:
+            print(f"    {w['workspace']:<12} {w['docs']:>4} docs  {w['bytes'] / 1e6:.2f} MB")
+        if s["failures"]["n"]:
+            print(f"  ! {s['failures']['n']} write(s) failed, last: {s['failures']['last']}")
+        return 0
+    if args.sub == "backup":
+        r = store.backup()
+        print(f"mirrored {r['written']} changed of {r['scanned']} files"
+              + (f", {r['failed']} failed" if r["failed"] else ""))
+        return 0
+    if args.sub == "verify":
+        v = store.verify()
+        print(f"{v['current']} current, {len(v['stale'])} stale, "
+              f"{len(v['missing'])} not mirrored, {len(v['held'])} held after deletion")
+        for label, rows in (("stale", v["stale"]), ("missing", v["missing"])):
+            for rel in rows[:20]:
+                print(f"  {label:<8} {rel}")
+        return 0 if v["clean"] else 1
+    if args.sub == "prune":
+        r = store.prune(args.keep)
+        print(f"removed {r['removed']} revisions, {r['kept']} kept "
+              f"({r['keep']} per document)")
+        store.compact()
+        return 0
+    if args.sub == "export":
+        dest = Path(args.dest or f"amp-backup-{datetime.now():%Y%m%d-%H%M%S}.db")
+        store.snapshot(dest)
+        print(f"wrote {dest} ({dest.stat().st_size / 1e6:.2f} MB)")
+        return 0
+    if args.sub == "show":
+        b = store.body(args.path, args.seq)
+        if b is None:
+            die(f"nothing held at {args.path}"
+                + (f" revision {args.seq}" if args.seq else ""))
+        sys.stdout.write(b.decode(errors="replace"))
+        return 0
+    if args.sub == "history":
+        rows = store.history(args.path, args.limit)
+        if not rows:
+            print(f"no history for {args.path}")
+            return 1
+        for r in rows:
+            print(f"  {r['seq']:>6}  {r['written_at']}  {r['bytes']:>9} B  {r['sha'][:12]}")
+        return 0
+    return 1
 
 
 # ---------------------------------------------------------------- cli
@@ -7932,6 +12544,23 @@ def main(argv=None):
 
     lg = sub.add_parser("login", help="connect a long-lived Claude worker token")
     lg.set_defaults(func=cmd_login)
+
+    dbp = sub.add_parser("db", help="the SQLite mirror of everything on disk")
+    dbs = dbp.add_subparsers(dest="sub", required=True)
+    dbs.add_parser("status", help="what the mirror holds")
+    dbs.add_parser("backup", help="sweep the state directory into the mirror")
+    dbs.add_parser("verify", help="compare the mirror against the files")
+    pr = dbs.add_parser("prune", help="drop old revisions and compact")
+    pr.add_argument("--keep", type=int, help="revisions per document")
+    ex = dbs.add_parser("export", help="write a consistent copy of the database")
+    ex.add_argument("dest", nargs="?")
+    hi = dbs.add_parser("history", help="revisions held for one document")
+    hi.add_argument("path", help="path relative to the state root, e.g. .board.json")
+    hi.add_argument("--limit", type=int, default=50)
+    sh = dbs.add_parser("show", help="print a held document (does not write disk)")
+    sh.add_argument("path")
+    sh.add_argument("--seq", type=int, help="a revision, default the current one")
+    dbp.set_defaults(func=cmd_db)
 
     args = p.parse_args(argv)
     return args.func(args) or 0

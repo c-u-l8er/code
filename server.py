@@ -19,6 +19,7 @@ import json
 import mimetypes
 import socket
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -30,6 +31,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import amp  # noqa: E402  the harness itself
+import preview  # noqa: E402  serving what a lane built, so you can look at it
+import store  # noqa: E402  the SQLite mirror of everything under .amp/
 
 ROOT = amp.ROOT  # workspace holding the lane worktrees
 
@@ -392,8 +395,18 @@ def _settle(name: str, rec: dict):
     # be missed. It is filed before anything below can return.
     try:
         amp.record_worker_finding(name, fresh)
+        # Same place, same reason: whatever it noticed in passing is in that one
+        # message and nowhere else once the worktree goes.
+        amp.record_worker_ideas(name, fresh)
     except Exception:
         traceback.print_exc()
+    rid = rec.get("spec_run_id")
+    if rid:
+        # A spec run owns what happens next to its writer, the same way a goal
+        # does: it reads the file back, records whether it moved, and sends the
+        # reviewer at it again. Nothing below applies.
+        amp.spec_worker_done(rid, name, fresh)
+        return
     gid = rec.get("goal_id")
     if gid:
         # A goal's worker reports to the goal, which judges it against the
@@ -579,7 +592,8 @@ def do_dispatch(body: dict, *, queue: bool = True) -> dict:
             return {"ok": False, "error": str(e) or "could not start the worker"}
         # Carried on the record so the settle step knows which architect, if any,
         # is waiting on this worker.
-        extra = {k: body[k] for k in ("consult_id", "report_back", "goal_id", "goal_task")
+        extra = {k: body[k] for k in ("consult_id", "report_back", "goal_id", "goal_task",
+                                      "spec_run_id", "spec_draft")
                  if body.get(k) is not None}
         if extra:
             rec.update(extra)
@@ -870,12 +884,218 @@ def do_ack_findings(body: dict) -> dict:
             "summary": amp.findings_summary()}
 
 
+def do_settle_findings(body: dict) -> dict:
+    """Work out what the open contradictions imply, and perform it.
+
+    The other half of `do_ack_findings`, and the reason that one stayed manual.
+    An ack says Travis has seen it. This says the harness DID something - took a
+    rung back, filed a proposal, matched it to a later finding that already
+    answered it - and closes the finding against that act. Anything it cannot
+    perform stays unread, so the gate only falls as far as the work justifies.
+    """
+    return amp.settle_findings(body.get("lane") or None)
+
+
+def do_ideas(lane: str | None) -> dict:
+    """Leads workers left behind. Nothing here has been judged or acted on."""
+    return {"ok": True, "ideas": amp.ideas(lane=lane)[:80]}
+
+
+def do_close_ideas(body: dict) -> dict:
+    """Take an idea off the list. `picked` means it became work; `dropped` means no.
+
+    Both are answers, and both are the operator's - a list nobody can clear is a
+    list that stops being read.
+    """
+    ids = body.get("ids") or ([body["id"]] if body.get("id") else [])
+    state = body.get("state") or "dropped"
+    if not ids:
+        return {"ok": False, "error": "no ids"}
+    if state not in ("picked", "dropped"):
+        return {"ok": False, "error": "state must be picked or dropped"}
+    return {"ok": True, "closed": amp.close_ideas([str(i) for i in ids], state)}
+
+
 # --------------------------------------------------------------- direction
 
 
 def do_direction(lane: str | None) -> dict:
     """The thesis, the values, what came back, and where there is left to go."""
     return {"ok": True, "direction": amp.direction_view(lane)}
+
+
+# ------------------------------------------------------------------ spec review
+
+
+def _dispatch_for_spec(run: dict, defects: list[str]) -> dict:
+    """One spec run's next writer, out to a worker in that run's lane.
+
+    `report_back: False` because it reports to the run, not to a consult thread.
+    Not queued: a spec run is a synchronous back-and-forth, and a writer that
+    sits in a queue leaves the run saying `waiting on worker` for an hour with
+    nothing running, which is indistinguishable from being stuck.
+    """
+    return do_dispatch({
+        "lane": run["lane"],
+        "prompt": amp.spec_worker_prompt(run, defects),
+        "backend": "claude",
+        "spec_run_id": run["id"],
+        "report_back": False,
+    }, queue=False)
+
+
+def do_spec(lane: str | None) -> dict:
+    """One lane's `docs/spec/` documents, and every run against them."""
+    lane = lane or ""
+    if lane not in amp.config()["lanes"]:
+        return {"ok": False, "error": f"unknown lane {lane!r}"}
+    return {"ok": True, "spec": amp.spec_view(lane)}
+
+
+def do_spec_run(rid: str | None) -> dict:
+    r = amp.load_specrun(rid or "")
+    return {"ok": True, "run": r} if r else {"ok": False, "error": f"no run {rid!r}"}
+
+
+def do_spec_start(body: dict) -> dict:
+    """Open a run. Slow on purpose - the first architect turn happens inline, so
+    the button either comes back with a verdict or comes back with the reason
+    there is not one."""
+    lane, rel = body.get("lane") or "", (body.get("rel") or "").strip()
+    if not rel:
+        return {"ok": False, "error": "say which document"}
+    if not amp.architect_available():
+        return {"ok": False, "error": amp.architect_off_reason()
+                + " - a spec run needs an architect to review it"}
+    if not amp.role_on("worker"):
+        return {"ok": False, "error": "workers are switched off in Settings"}
+    try:
+        r = amp.spec_review_open(lane, rel)
+    except SystemExit as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "run": r}
+
+
+def do_spec_close(body: dict) -> dict:
+    try:
+        return {"ok": True, "run": amp.close_specrun(body.get("id") or "")}
+    except SystemExit as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_spec_rate(body: dict) -> dict:
+    """Rate one document, or every unrated one in the lane.
+
+    Both on one route because they are the same call in a loop, and because the
+    difference the caller cares about - one architect turn or eleven - is
+    already visible in whether a `rel` was named.
+    """
+    lane, rel = body.get("lane") or "", (body.get("rel") or "").strip()
+    if lane not in amp.config()["lanes"]:
+        return {"ok": False, "error": f"unknown lane {lane!r}"}
+    if not amp.architect_available():
+        return {"ok": False, "error": amp.architect_off_reason()
+                + " - rating a document is an architect call"}
+    try:
+        if rel:
+            return {"ok": True, "rating": amp.spec_rate(lane, rel)}
+        return {"ok": True, "audit": amp.spec_audit(lane)}
+    except SystemExit as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_spec_campaign(body: dict) -> dict:
+    """Queue every document in the lane. The ticker starts them one at a time.
+
+    The first one is started here rather than on the next tick: a button that
+    queues work and then does nothing visible for a minute is indistinguishable
+    from a button that did not work.
+    """
+    lane = body.get("lane") or ""
+    if lane not in amp.config()["lanes"]:
+        return {"ok": False, "error": f"unknown lane {lane!r}"}
+    if not amp.architect_available():
+        return {"ok": False, "error": amp.architect_off_reason()
+                + " - a spec run needs an architect to review it"}
+    if not amp.role_on("worker"):
+        return {"ok": False, "error": "workers are switched off in Settings"}
+    try:
+        amp.spec_campaign_open(lane, rels=body.get("rels"))
+        return {"ok": True, "plan": amp.spec_campaign_step(lane) or amp.spec_plan(lane)}
+    except SystemExit as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_spec_campaign_stop(body: dict) -> dict:
+    lane = body.get("lane") or ""
+    plan = amp.spec_campaign_close(lane)
+    if not plan:
+        return {"ok": False, "error": f"no campaign on {lane!r}"}
+    # The run that is out stays out. It is paid for, it is mid-conversation, and
+    # stopping the campaign is a decision about what to start next - not about
+    # throwing away the document currently being rewritten. Stop it from its own
+    # button if that is what you meant.
+    return {"ok": True, "plan": plan}
+
+
+def do_spec_draft(body: dict) -> dict:
+    """Send a worker to write this lane's first design document from its code."""
+    lane = body.get("lane") or ""
+    if lane not in amp.config()["lanes"]:
+        return {"ok": False, "error": f"unknown lane {lane!r}"}
+    if amp.lane_spec_files(lane):
+        return {"ok": False, "error":
+                f"{lane} already has documents under docs/spec/ - sharpen those instead"}
+    if amp.spec_draft_status(lane):
+        # The button is disabled while one is out, so reaching here means two
+        # tabs, or a stale page. Refused rather than dispatched: the second
+        # worker would write the same file in the same worktree as the first.
+        return {"ok": False, "error": f"a draft worker is already out for {lane}"}
+    out = do_dispatch({
+        "lane": lane,
+        "prompt": amp.spec_draft_prompt(lane, amp.spec_candidates(lane)),
+        "backend": "claude",
+        "report_back": False,
+        # What makes the worker findable afterwards. Without it the only record
+        # that this was a draft is the prompt text.
+        "spec_draft": True,
+    })
+    return out
+
+
+def do_spec_candidates(lane: str | None) -> dict:
+    lane = lane or ""
+    if lane not in amp.config()["lanes"]:
+        return {"ok": False, "error": f"unknown lane {lane!r}"}
+    return {"ok": True, "candidates": amp.spec_candidates(lane)}
+
+
+def _recover_stuck_specruns() -> list[str]:
+    """A spec run whose writer finished while nobody was listening, picked back up.
+
+    Same failure and same test as a stopped consult: the run says it is waiting
+    on a worker, and the board says that worker is not running. Stopping is
+    indistinguishable from working, so the fact checked is on disk rather than
+    remembered.
+    """
+    moved = []
+    for row in amp.specruns():
+        if row.get("state") != "running" or row.get("waiting_on") != "worker":
+            continue
+        r = amp.load_specrun(row["id"])
+        rd = ((r or {}).get("rounds") or [{}])[-1]
+        tid = rd.get("task_id")
+        if not tid or rd.get("worker"):
+            continue
+        rec = (do_task(r["lane"], tid) or {}).get("task")
+        if not rec or rec.get("status") == "running":
+            continue
+        try:
+            amp.spec_worker_done(r["id"], r["lane"], rec)
+            moved.append(r["id"])
+        except Exception:
+            traceback.print_exc()
+    return moved
 
 
 def do_direction_review(body: dict) -> dict:
@@ -936,6 +1156,24 @@ def do_direction_proposal(body: dict) -> dict:
     return {"ok": False, "error": "action must be adopt, dismiss or sharpen"}
 
 
+def do_goal_reopen(body: dict) -> dict:
+    """Recalculate a live goal's plan, or improve the objective it is aiming at.
+
+    Both are architect calls that rewrite work in flight, so both are a click
+    and neither is on the heartbeat. `improve` answers first and applies only
+    when asked twice - changing what a goal is for is not a one-click action.
+    """
+    gid = body.get("goal_id") or ""
+    action = body.get("action") or ""
+    if not gid:
+        return {"ok": False, "error": "no goal_id"}
+    if action == "recalculate":
+        return amp.recalculate_goal(gid)
+    if action == "improve":
+        return amp.improve_goal(gid, apply=bool(body.get("apply")))
+    return {"ok": False, "error": "action must be recalculate or improve"}
+
+
 def do_direction_auto(body: dict) -> dict:
     """Let a review open its own goals, or stop letting it.
 
@@ -944,6 +1182,34 @@ def do_direction_auto(body: dict) -> dict:
     asked for, and is also exactly the thing rule 6 says is his to switch on.
     """
     return {"ok": True, "auto_adopt": amp.set_auto_adopt(bool(body.get("on")))}
+
+
+def do_auto_spec(body: dict) -> dict:
+    """Let the harness draft, rate and sharpen ONE lane's specs unasked.
+
+    `all` is offered because eleven lanes is eleven clicks, but it is an
+    explicit request rather than what one lane's checkbox quietly did before.
+    """
+    if body.get("all"):
+        lanes = sorted(amp.config().get("lanes") or {})
+        for name in lanes:
+            amp.set_auto_spec(name, bool(body.get("on")))
+        return {"ok": True, "lanes": lanes, "on": bool(body.get("on"))}
+    lane = body.get("lane") or ""
+    if lane not in amp.config()["lanes"]:
+        return {"ok": False, "error": f"unknown lane {lane!r}"}
+    return {"ok": True, "lane": lane, "on": amp.set_auto_spec(lane, bool(body.get("on")))}
+
+
+def do_spec_explore(body: dict) -> dict:
+    """Ask Direction what to build from this lane's documents, now."""
+    lane = body.get("lane") or ""
+    if lane not in amp.config()["lanes"]:
+        return {"ok": False, "error": f"unknown lane {lane!r}"}
+    try:
+        return amp.spec_explore(lane)
+    except SystemExit as e:
+        return {"ok": False, "error": str(e)}
 
 
 def do_ratify_doctrine() -> dict:
@@ -1039,6 +1305,48 @@ def do_supervise() -> dict:
 def do_supervisor() -> dict:
     return {"ok": True, "supervisor": amp.supervisor_view(),
             "reports": amp.supervisor_store().get("reports", [])[-12:][::-1]}
+
+
+# ---------------------------------------------------------------- reports
+
+
+def do_reports() -> dict:
+    """Every report taken, and what has moved since the last one.
+
+    `pending` is the same idea the supervisor strip uses: a report is not out of
+    date because it is old, it is out of date because the workspace moved after
+    it was taken. A quiet week leaves the last report perfectly current.
+    """
+    rows = amp.reports()
+    last = rows[0] if rows else None
+    w = amp.report_window((last or {}).get("at"))
+    return {"ok": True, "reports": rows[:20], "last": last,
+            "pending": sum(w["counts"].values()), "counts": w["counts"],
+            "can_web": amp.web_search_backend()}
+
+
+def do_report(body: dict) -> dict:
+    """Take a report. The web search is opt-in: it costs an architect turn."""
+    try:
+        rec = amp.make_report(web=bool(body.get("web")))
+    except Exception:
+        traceback.print_exc()
+        return {"ok": False, "error": traceback.format_exc(limit=3)}
+    return {**rec, "url": "/reports/" + rec["file"]}
+
+
+def do_solve_report(body: dict) -> dict:
+    """Read a report back and propose what to do about it.
+
+    A click, never the heartbeat. It writes proposals into the same store the
+    architect writes to, held by the same bars and the same gates, and it adopts
+    nothing - so a bad reading costs a dismissal, not a worker.
+    """
+    try:
+        return amp.solve_report(body.get("report_id") or None)
+    except Exception:
+        traceback.print_exc()
+        return {"ok": False, "error": traceback.format_exc(limit=3)}
 
 
 # ------------------------------------------------------------- obligations
@@ -1142,6 +1450,36 @@ def _pipeline_ticker():
             for r in amp.resume_adoption():
                 if r.get("ok"):
                     print(f"amp: adopted waiting proposal {r['proposal_id']}")
+        except Exception:
+            traceback.print_exc()
+        # A lane runs one worker at a time, so "sharpen every document" cannot be
+        # eleven runs started at once - it is a queue, and this is the only thing
+        # that empties it. Runs before sharpening so a lane that is already busy
+        # with a spec run is not also asked to start a proposal.
+        try:
+            for name in amp.spec_campaigns_step():
+                p = amp.spec_plan(name) or {}
+                cur = (p.get("current") or {}).get("rel")
+                print(f"amp: spec campaign {name} -> "
+                      + (f"sharpening {cur}" if cur
+                         else f"{p.get('state')}: {p.get('why')}"))
+        except Exception:
+            traceback.print_exc()
+        # Draft what is missing, rate what exists, sharpen what is under the bar.
+        # One step for the whole stack per tick, and only with `auto_spec` on.
+        # After the campaign step, so a lane whose queue is mid-drain is seen as
+        # busy here rather than being handed a second thing to do.
+        try:
+            for r in amp.spec_auto_run():
+                if r.get("ok"):
+                    print(f"amp: spec loop {r['lane']} -> {r['did']}"
+                          + (f" {r.get('rel')} {r.get('solidity')}" if r["did"] == "rate"
+                             else f" proposed {r.get('proposed')} goal(s)" if r["did"] == "explore"
+                             else f" — {r.get('thin')} thin document(s), none worth a round"
+                             if r["did"] == "settled"
+                             else f" ({r.get('queued', r.get('attempt'))})"))
+                else:
+                    print(f"amp: spec loop {r['lane']} {r['did']}: {r.get('error')}")
         except Exception:
             traceback.print_exc()
         # Anything still held back is held for one of two reasons - no odds on
@@ -1298,6 +1636,64 @@ def do_diff(lane: str, attempt: int | None, task_id: str | None) -> dict:
         "diff": p.stdout,
         "error": p.stderr.strip() if p.returncode != 0 else None,
     }
+
+
+def _preview_root(lane: str, source: str, subdir: str) -> tuple[Path | None, str]:
+    """The directory a preview serves. Returns (path, error).
+
+    Two sources, and the default is the worktree: the whole point is to see
+    what the worker just did, and the worker never touches the live checkout.
+    """
+    l = amp.config()["lanes"].get(lane)
+    if not l:
+        return None, f"unknown lane {lane!r}"
+    base = (amp.WORKTREE_DIR / lane if source == "worktree"
+            else (ROOT / l["path"]).resolve())
+    if not base.is_dir():
+        return None, ("no worker has run in this lane yet, so it has no worktree"
+                      if source == "worktree" else f"{base} is missing")
+    target = (base / (subdir or "")).resolve()
+    # A subdirectory is a place inside the tree, not a way out of it.
+    if not str(target).startswith(str(base.resolve())):
+        return None, "that subdirectory is outside the lane"
+    if not target.is_dir():
+        return None, f"{subdir!r} is not a directory in this lane"
+    return target, ""
+
+
+def do_preview(lane: str, source: str, subdir: str) -> dict:
+    """What is running, and what this tree looks like it wants to be served as."""
+    p = preview.get(lane)
+    out = {"ok": True, "preview": p.view() if p else None,
+           "sources": [s for s in ("worktree", "repo")
+                       if _preview_root(lane, s, "")[0] is not None]}
+    root, err = _preview_root(lane, source or "worktree", subdir or "")
+    if root is None:
+        return {**out, "root": None, "detected": None, "note": err}
+    return {**out, "root": str(root), "detected": preview.detect(root)}
+
+
+def do_preview_start(body: dict) -> dict:
+    lane = (body.get("lane") or "").strip()
+    root, err = _preview_root(lane, body.get("source") or "worktree",
+                              (body.get("dir") or "").strip())
+    if root is None:
+        return {"ok": False, "error": err}
+    return preview.start(lane, root, body.get("mode") or "static",
+                         body.get("cmd") or "")
+
+
+def do_preview_stop(body: dict) -> dict:
+    return preview.stop((body.get("lane") or "").strip())
+
+
+def do_preview_stamp(lane: str) -> dict:
+    """A fingerprint of the served tree, so the page can reload itself when a
+    worker changes it. Cheap enough to poll, which is the only requirement."""
+    p = preview.get(lane)
+    if p is None:
+        return {"ok": False, "error": "nothing is previewing this lane"}
+    return {"ok": True, "stamp": preview.stamp(p.root), "state": p.state, "url": p.url}
 
 
 def do_apply(body: dict) -> dict:
@@ -1574,6 +1970,79 @@ def do_settings_set(body: dict) -> dict:
     return {**do_settings(), "changed": changed}
 
 
+# ---------------------------------------------------------------- database
+#
+# `save_json` mirrors itself as it writes, so these endpoints are about the
+# things a write cannot do for itself: sweeping the files nothing calls
+# save_json for, saying whether the two copies agree, and handing the operator
+# a single file they can put somewhere else.
+
+
+def do_db() -> dict:
+    return store.status()
+
+
+def do_db_set(body: dict) -> dict:
+    changed = {}
+    for k in ("mirror", "history_keep", "sweep_min"):
+        if k in body:
+            try:
+                store.set_setting(k, body[k])
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+            changed[k] = body[k]
+    if not changed:
+        return {"ok": False, "error": "nothing to set - expected mirror, "
+                                      "history_keep or sweep_min"}
+    return {**store.status(), "changed": changed}
+
+
+def do_db_backup() -> dict:
+    return {**store.backup(), "status": store.status()}
+
+
+def do_db_verify() -> dict:
+    return store.verify()
+
+
+def do_db_prune(body: dict) -> dict:
+    r = store.prune(body.get("keep"))
+    store.compact()
+    return {**r, "status": store.status()}
+
+
+def do_db_history(path: str) -> dict:
+    if not path:
+        return {"ok": False, "error": "which document?"}
+    return {"ok": True, "path": path, "revisions": store.history(path)}
+
+
+def _mirror_ticker():
+    """Sweep the state directory into the mirror on a clock.
+
+    Every `save_json` already mirrors itself, so this is for what does not go
+    through it: packet zips, ruling and consult transcripts, published reports,
+    goal files - and whatever a later part of the harness writes without ever
+    being told this file exists. Catching those by sweeping rather than by
+    hooking each writer is the difference between one thing to maintain and a
+    growing list of places to remember.
+    """
+    while True:
+        mins = int(store.settings().get("sweep_min") or 0)
+        time.sleep(max(mins, 1) * 60.0)
+        if int(store.settings().get("sweep_min") or 0) <= 0 or not store.enabled():
+            continue
+        try:
+            store.backup()
+            # Trimmed on the same clock, not only when somebody opens Settings.
+            # The board alone is over a megabyte and is rewritten on every
+            # worker heartbeat, so a mirror nobody trims is a disk filling up
+            # quietly - which is its own way of losing data.
+            store.prune()
+        except Exception:
+            traceback.print_exc()
+
+
 def do_codex_auth_cancel() -> dict:
     global _CODEX_LOGIN
     with _CODEX_LOCK:
@@ -1622,8 +2091,10 @@ def chat_payload() -> dict:
     Task activity is derived rather than stored, so the thread cannot disagree
     with the board it is summarising.
     """
-    msgs = [{"kind": "note", "id": n["id"], "at": n["at"], "lane": n.get("lane"),
-             "text": n["text"]}
+    # An idea is a note, but a quieter one: it is an aside a worker made in
+    # passing, and it should not read like something that happened.
+    msgs = [{"kind": "idea" if n.get("kind") == "idea" else "note",
+             "id": n["id"], "at": n["at"], "lane": n.get("lane"), "text": n["text"]}
             for n in amp.notes()]
     # The orchestrator's own conversation. Unlike the rest of the feed this is
     # stored, because it is the thing itself rather than a summary of it.
@@ -1868,14 +2339,78 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_findings(
                     (q.get("lane") or [None])[0],
                     (q.get("unread") or [""])[0] == "1"))
+            if u.path == "/api/ideas":
+                return self._send(200, do_ideas((q.get("lane") or [None])[0]))
             if u.path == "/api/obligations":
                 return self._send(200, do_obligations())
             if u.path == "/api/direction":
                 return self._send(200, do_direction((q.get("lane") or [None])[0]))
+            if u.path == "/api/spec":
+                return self._send(200, do_spec((q.get("lane") or [None])[0]))
+            if u.path == "/api/spec/run":
+                return self._send(200, do_spec_run((q.get("id") or [None])[0]))
+            if u.path == "/api/spec/candidates":
+                return self._send(200, do_spec_candidates((q.get("lane") or [None])[0]))
             if u.path == "/api/workspaces":
                 return self._send(200, do_workspaces())
             if u.path == "/api/supervisor":
                 return self._send(200, do_supervisor())
+            if u.path == "/api/reports":
+                return self._send(200, do_reports())
+            if u.path.startswith("/reports/"):
+                # Served from the workspace state dir, not from HERE, so it is
+                # its own route rather than a hole in `_static`. Only the file
+                # name is taken from the request - a path with a slash or a
+                # `..` in it resolves to a name that is not there.
+                p = amp.REPORT_DIR / Path(u.path[len("/reports/"):]).name
+                if not p.is_file():
+                    return self._send(404, {"error": "no such report"})
+                return self._send(200, p.read_bytes(), "text/html; charset=utf-8")
+            if u.path == "/api/db":
+                return self._send(200, do_db())
+            if u.path == "/api/db/history":
+                return self._send(200, do_db_history((q.get("path") or [""])[0]))
+            if u.path == "/api/db/changes":
+                # The feed a cloud sync will read. Exposed now because a sync
+                # that has to be designed against a database with no change
+                # log is a rewrite, not a feature.
+                return self._send(200, store.changes(
+                    int((q.get("since") or ["0"])[0]),
+                    min(int((q.get("limit") or ["500"])[0]), 5000)))
+            if u.path == "/api/db/doc":
+                # A held document, current or at a revision. A read: this never
+                # writes over what is on disk. Recovering a file is a copy the
+                # operator makes deliberately, not a button that overwrites
+                # live state under a running harness.
+                seq = (q.get("seq") or [""])[0]
+                b = store.body((q.get("path") or [""])[0], int(seq) if seq else None)
+                if b is None:
+                    return self._send(404, {"error": "nothing held at that path"})
+                return self._send(200, b, "text/plain; charset=utf-8")
+            if u.path == "/api/db/export":
+                # Snapshotted through SQLite's own backup API rather than
+                # copied: a WAL database copied byte-for-byte while in use can
+                # be missing committed pages, which is the one thing a backup
+                # may not be.
+                tmp = Path(tempfile.gettempdir()) / f"amp-export-{int(time.time())}.db"
+                try:
+                    store.snapshot(tmp)
+                    data = tmp.read_bytes()
+                finally:
+                    tmp.unlink(missing_ok=True)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="amp-backup.db"')
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                return self.wfile.write(data)
+            if u.path == "/api/preview":
+                return self._send(200, do_preview((q.get("lane") or [""])[0],
+                                                  (q.get("source") or [""])[0],
+                                                  (q.get("dir") or [""])[0]))
+            if u.path == "/api/preview/stamp":
+                return self._send(200, do_preview_stamp((q.get("lane") or [""])[0]))
             if u.path == "/api/diff":
                 lane = (q.get("lane") or [""])[0]
                 attempt = q.get("attempt")
@@ -1909,6 +2444,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_push_goal(body))
             if u.path == "/api/goal/close":
                 return self._send(200, do_close_goal(body))
+            if u.path == "/api/goal/reopen":
+                return self._send(200, do_goal_reopen(body))
             # Two routes, not one with a flag. The dry run is something you can
             # call freely and often; the other one leaves the machine.
             if u.path == "/api/goal/publish/report":
@@ -1923,12 +2460,36 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_direction_explore(body))
             if u.path == "/api/direction/case":
                 return self._send(200, do_direction_case(body))
+            if u.path == "/api/spec/start":
+                return self._send(200, do_spec_start(body))
+            if u.path == "/api/spec/close":
+                return self._send(200, do_spec_close(body))
+            if u.path == "/api/spec/rate":
+                return self._send(200, do_spec_rate(body))
+            if u.path == "/api/spec/campaign":
+                return self._send(200, do_spec_campaign(body))
+            if u.path == "/api/spec/campaign/stop":
+                return self._send(200, do_spec_campaign_stop(body))
+            if u.path == "/api/spec/draft":
+                return self._send(200, do_spec_draft(body))
+            if u.path == "/api/report":
+                return self._send(200, do_report(body))
+            if u.path == "/api/report/solve":
+                return self._send(200, do_solve_report(body))
             if u.path == "/api/direction/proposal":
                 return self._send(200, do_direction_proposal(body))
             if u.path == "/api/direction/auto":
                 return self._send(200, do_direction_auto(body))
+            if u.path == "/api/spec/auto":
+                return self._send(200, do_auto_spec(body))
+            if u.path == "/api/spec/explore":
+                return self._send(200, do_spec_explore(body))
             if u.path == "/api/findings/ack":
                 return self._send(200, do_ack_findings(body))
+            if u.path == "/api/findings/settle":
+                return self._send(200, do_settle_findings(body))
+            if u.path == "/api/ideas/close":
+                return self._send(200, do_close_ideas(body))
             if u.path == "/api/doctrine/ratify":
                 return self._send(200, do_ratify_doctrine())
             # `use` moves the ground under everything else in this process and
@@ -1967,6 +2528,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_history_note(body))
             if u.path == "/api/history/ask":
                 return self._send(200, do_history_ask(body))
+            if u.path == "/api/preview/start":
+                return self._send(200, do_preview_start(body))
+            if u.path == "/api/preview/stop":
+                return self._send(200, do_preview_stop(body))
             if u.path == "/api/apply":
                 return self._send(200, do_apply(body))
             if u.path == "/api/lane/add":
@@ -1991,6 +2556,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_settings_set(body))
             if u.path == "/api/role/set":
                 return self._send(200, do_role_set(body))
+            if u.path == "/api/db/set":
+                return self._send(200, do_db_set(body))
+            if u.path == "/api/db/backup":
+                return self._send(200, do_db_backup())
+            if u.path == "/api/db/verify":
+                return self._send(200, do_db_verify())
+            if u.path == "/api/db/prune":
+                return self._send(200, do_db_prune(body))
             return self._send(404, {"error": "unknown endpoint"})
         except Exception:
             traceback.print_exc()
@@ -2047,6 +2620,13 @@ def main(argv=None):
     amp.ON_CONSULT_NEEDS = _gather_for_consult
     # A goal sends its own next task out.
     amp.ON_GOAL_DISPATCH = _dispatch_for_goal
+    # A spec run sends its own next writer out.
+    amp.ON_SPEC_DISPATCH = _dispatch_for_spec
+    # The unattended spec loop asks for a lane's first document. `queue=False`
+    # so a busy lane is refused rather than backed up: the loop comes round
+    # again in a minute and will ask again if the lane still has no spec, and a
+    # queue would collect one draft request per tick behind the same worker.
+    amp.ON_DRAFT_DISPATCH = lambda body: do_dispatch(body, queue=False)
     # The hooks above are deliberately set after adoption, so nothing dispatches
     # into a lane whose lock has not been re-taken yet. That leaves a window: a
     # worker that finished during it reported to nobody. This closes it.
@@ -2054,6 +2634,8 @@ def main(argv=None):
         print(f"  relayed a finished worker into consult {cid}")
     for gid in _recover_stuck_goals():
         print(f"  picked goal {gid} back up")
+    for sid in _recover_stuck_specruns():
+        print(f"  picked spec run {sid} back up")
     n_q = _load_queue()
     if n_q:
         print(f"  {n_q} queued task(s) restored")
@@ -2066,6 +2648,16 @@ def main(argv=None):
     threading.Thread(target=_obligation_ticker, daemon=True).start()
     print(f"  goals kept moving on a {_PIPELINE_TICK:.0f}s heartbeat")
     threading.Thread(target=_pipeline_ticker, daemon=True).start()
+    # One sweep at startup, before anything can be dispatched: whatever the
+    # last run left on disk is mirrored before this one starts changing it.
+    if store.enabled():
+        r = store.backup()
+        s = store.status()
+        print(f"  database {s['path']} - {s['docs']} documents, "
+              f"{s['revisions']} revisions ({r['written']} mirrored just now)")
+        threading.Thread(target=_mirror_ticker, daemon=True).start()
+    else:
+        print("  ! the SQLite mirror is off - only the JSON files are being kept")
     print(f"amp console -> {url}")
     if not amp.claude_available():
         print("  ! claude CLI not found - claude lanes cannot dispatch")
@@ -2079,6 +2671,10 @@ def main(argv=None):
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
+    finally:
+        # A preview's dev server is our child and holds a lane's worktree open.
+        # Left behind, it survives every restart of this file and accumulates.
+        preview.stop_all()
     return 0
 
 

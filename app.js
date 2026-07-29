@@ -7,7 +7,8 @@ const state = {
   goals: [], goal: null, observations: [], dismissed: new Set(), resumeOf: null,
   findings: [], findingsAll: false, findingsSeen: -1, direction: null,
   obligations: [], obligationsSeen: -1, workspace: null, supervisor: null,
-  settings: null,
+  settings: null, preview: null, pstamp: null,
+  specBusy: null, specPoll: null, specWork: null,
 };
 
 async function api(path, opts) {
@@ -266,6 +267,8 @@ async function openSettings() {
   $('settings').classList.remove('hidden');
   $('set-status').textContent = '';
   $('set-status').className = 'muted';
+  $('db-report').className = 'dbreport hidden';
+  loadDb();
   const s = await post('/api/settings');
   if (!s.ok) {
     $('set-status').textContent = s.error;
@@ -412,6 +415,130 @@ async function setFlag(key, value) {
   await refresh();
 }
 
+// ---------------------------------------------------------------- database
+//
+// The panel answers one question the rest of Settings does not: where does the
+// work you have done actually live, and is the second copy of it current. So
+// it leads with what the mirror holds rather than with its switches.
+
+function mb(n) {
+  return n == null ? '—' : n >= 1e6 ? (n / 1e6).toFixed(2) + ' MB'
+    : n >= 1e3 ? (n / 1e3).toFixed(1) + ' kB' : n + ' B';
+}
+
+function renderDb(d) {
+  state.db = d;
+  const box = $('db-box');
+  if (!d || d.ok === false) {
+    box.innerHTML = `<span class="err">${esc((d && d.error) || 'cannot read the database')}</span>`;
+    return;
+  }
+  if (!d.exists) {
+    box.innerHTML = '<span class="muted">No database yet. <b>Back up now</b> creates it '
+      + 'and copies everything currently on disk into it.</span>';
+  } else {
+    box.innerHTML =
+      `<div class="dbrow"><span class="k">file</span><code class="path">${esc(d.path)}</code></div>` +
+      `<div class="dbrow"><span class="k">holding</span>` +
+      `<b>${d.docs}</b> documents, <b>${d.revisions}</b> versions ` +
+      `<span class="muted">(${mb(d.bytes)} on disk, compressed from ` +
+      `${mb(d.doc_bytes)} of current files)</span></div>` +
+      `<div class="dbrow"><span class="k">last save</span>${esc(d.last_write || '—')}</div>` +
+      (d.workspaces || []).map((w) =>
+        `<div class="dbrow"><span class="k">${esc(w.workspace)}</span>` +
+        `${w.docs} documents, ${mb(w.bytes)}</div>`).join('') +
+      (d.failures && d.failures.n
+        ? `<div class="dbrow err"><span class="k">failed</span>${d.failures.n} write(s), ` +
+          `last ${esc(d.failures.last)} at ${esc(d.failures.at)} — the JSON files are ` +
+          `unaffected, this is the copy falling behind</div>`
+        : '');
+  }
+  const s = d.settings || {};
+  $('set-db-mirror').checked = s.mirror === '1';
+  if (document.activeElement !== $('set-db-keep')) $('set-db-keep').value = s.history_keep;
+  if (document.activeElement !== $('set-db-sweep')) $('set-db-sweep').value = s.sweep_min;
+  $('db-sync').innerHTML = d.exists
+    ? `<div class="dbrow"><span class="k">this machine</span><code>${esc(d.device)}</code></div>` +
+      `<div class="dbrow"><span class="k">change number</span>${d.cursor}` +
+      ` <span class="muted">— a sync would resume from here</span></div>` +
+      `<div class="dbrow"><span class="k">never stored</span><span class="v">` +
+      `${(d.excluded || []).map((e) => `<code>${esc(e)}</code>`).join('')}</span></div>`
+    : '<span class="muted">Nothing to describe until the database exists.</span>';
+}
+
+function dbReport(html, cls) {
+  const n = $('db-report');
+  n.className = 'dbreport ' + (cls || '');
+  n.innerHTML = html;
+}
+
+async function loadDb() {
+  renderDb(await api('/api/db'));
+}
+
+async function dbSet(key, value) {
+  const d = await post('/api/db/set', { [key]: value });
+  if (!d.ok && d.error) {
+    dbReport(esc(d.error), 'err');
+    return loadDb();
+  }
+  renderDb(d);
+  dbReport(
+    key === 'mirror'
+      ? value
+        ? 'Saves are being copied into the database again.'
+        : 'The database is no longer being written. Your JSON files are untouched and '
+          + 'everything already in the database is still there.'
+      : key === 'history_keep'
+      ? `Keeping the newest ${value} versions of each file. Trimming happens when you `
+        + 'ask for it, so nothing was removed just now.'
+      : Number(value) > 0
+      ? `Sweeping every ${value} minutes.`
+      : 'Sweeping is off — the button still works.',
+    'good');
+}
+
+async function dbBackup() {
+  dbReport('copying…', 'muted');
+  const r = await post('/api/db/backup');
+  if (!r.ok) return dbReport(esc(r.error || 'failed'), 'err');
+  renderDb(r.status);
+  dbReport(`Copied ${r.written} changed of ${r.scanned} files`
+    + (r.failed ? `, <span class="err">${r.failed} failed</span>` : '') + '.', 'good');
+}
+
+async function dbVerify() {
+  dbReport('comparing…', 'muted');
+  const v = await post('/api/db/verify');
+  if (!v.ok) return dbReport(esc(v.error || 'failed'), 'err');
+  const list = (label, rows) => rows.length
+    ? `<div class="dbrow"><span class="k">${label}</span><span class="v">` +
+      rows.slice(0, 12).map((p) => `<code>${esc(p)}</code>`).join('') +
+      (rows.length > 12 ? `<span class="muted">+${rows.length - 12} more</span>` : '') +
+      '</span></div>'
+    : '';
+  dbReport(
+    `<div class="dbrow"><span class="k">matching</span>${v.current} files</div>` +
+    list('changed since', v.stale) +
+    list('not copied', v.missing) +
+    // Not a fault. A file that is gone from disk but still held here is the
+    // reason the database exists, so it is reported in its own words.
+    list('kept after being deleted', v.held) +
+    (v.clean ? '<div class="dbrow good">The copy is current.</div>' : ''),
+    v.clean ? 'good' : '');
+}
+
+async function dbPrune() {
+  const keep = Number($('set-db-keep').value) || undefined;
+  dbReport('trimming…', 'muted');
+  const r = await post('/api/db/prune', { keep });
+  if (!r.ok) return dbReport(esc(r.error || 'failed'), 'err');
+  renderDb(r.status);
+  dbReport(`Removed ${r.removed} old versions, ${r.kept} kept `
+    + `(${r.keep} per file) and the file was compacted. The current copy of every `
+    + 'document is untouched.', 'good');
+}
+
 // The ChatGPT flow runs the other way round: the code goes from here into the
 // page, so there is nothing to submit and the console waits instead. One timer,
 // cleared on every exit, so cancelling and reconnecting cannot leave two.
@@ -533,7 +660,7 @@ function select(name) {
   const changed = state.sel !== name;
   state.sel = name;
   const lane = state.lanes.find((l) => l.name === name);
-  ['d-lane', 'f-lane', 'a-lane', 'l-lane'].forEach((id) => ($(id).textContent = name || '—'));
+  ['d-lane', 'f-lane', 'a-lane', 'l-lane', 'p-lane'].forEach((id) => ($(id).textContent = name || '—'));
   fillSessions(name);
   if (lane) {
     $('d-branch').value = lane.branch || 'main';
@@ -545,8 +672,19 @@ function select(name) {
   bindEnvPromptIfNeeded(lane);
   if (changed) {
     state.consult = null;
+    // The frame belongs to the lane it was started for; carrying it across a
+    // lane change would show you another lane's site under this lane's name.
+    state.preview = null;
+    state.pstamp = null;
+    $('p-frame').classList.add('hidden');
+    $('p-frame').removeAttribute('src');
+    $('p-empty').classList.remove('hidden');
     if ($('pane-ask').classList.contains('active')) loadConsults(name);
     if ($('pane-direction').classList.contains('active')) loadDirection();
+    // Always - the tab shows one lane's documents now, so a lane change is a
+    // change of everything on it.
+    if ($('pane-specs').classList.contains('active')) loadSpec();
+    if (previewActive()) loadPreview();
   }
 }
 
@@ -862,6 +1000,11 @@ function dockLine(m) {
     : '';
   if (m.kind === 'note')
     return `<div class="dm note"><span class="dm-at">${at}</span><span class="dm-body">${esc(m.text)}</span></div>`;
+  // Said once, cheaply, and then left alone. It is not news and nothing is
+  // waiting on it - the report is where these get read properly.
+  if (m.kind === 'idea')
+    return `<div class="dm idea"><span class="dm-at">${at}</span>` +
+           `<span class="dm-body">${esc(m.text)}</span></div>`;
   // A goal that stopped to ask something, with every question it asked - not
   // the first 400 characters of them joined together, which is what the note
   // this replaces could carry. There is no answer box here on purpose: this
@@ -1019,15 +1162,61 @@ function renderFindings(list) {
     .join('') +
     (hidden > 0 || state.findingsAll
       ? `<div class="fi more" id="fi-more">${state.findingsAll ? 'show less' : `${hidden} more`}</div>`
+      : '') +
+    (all.filter((f) => f.bearing === 'contradicted').length > 1
+      ? `<div class="fi-settle"><button id="fi-solve" title="One architect turn: work out what each ` +
+        `contradiction implies and perform it — take back a rung that was not earned, match one to a ` +
+        `later finding that already answered it, or file a proposal. Anything it cannot perform stays ` +
+        `open.">Settle contradictions</button>` +
+        // Re-rendered from state, not left in the DOM: settling ends by reloading
+        // the findings, which rebuilds this whole strip. Holding the outcome in a
+        // node here would destroy the one thing the operator needs to read.
+        `<span id="fi-solve-out" class="${esc((state.settle || {}).cls || 'muted')}">` +
+        `${esc((state.settle || {}).msg || '')}</span></div>`
       : '');
   const more = $('fi-more');
   if (more) more.onclick = () => { state.findingsAll = !state.findingsAll; renderFindings(all); };
+  const solve = $('fi-solve');
+  if (solve) solve.onclick = () => settleFindings(solve);
   el.querySelectorAll('.fi-x').forEach((b) =>
     b.addEventListener('click', async () => {
       await post('/api/findings/ack', { ids: [b.dataset.id] });
       loadFindings();
     })
   );
+}
+
+async function settleFindings(btn) {
+  const out = $('fi-solve-out');
+  btn.disabled = true;
+  btn.textContent = 'settling…';
+  out.textContent = 'reading each one against the record';
+  const r = await post('/api/findings/settle', {});
+  btn.disabled = false;
+  btn.textContent = 'Settle contradictions';
+  if (!r.ok) {
+    state.settle = { msg: r.error || 'failed', cls: 'err' };
+  } else {
+    const n = (r.settled || []).length;
+    const kept = (r.kept || []).length;
+    // The kept ones are the point of saying anything here: they are what the
+    // architect declined to close, and they are now the whole of what is
+    // holding the gate. Naming the count is how the operator knows what is
+    // left to read - and "0 settled" is the most useful answer of all, because
+    // it means nothing could be honestly closed.
+    state.settle = {
+      cls: n ? 'good' : 'muted',
+      msg:
+        `${n} settled` +
+        ((r.retractions || []).length ? `, ${r.retractions.length} rung(s) taken back` : '') +
+        ((r.proposals || []).length ? `, ${r.proposals.length} proposal(s) filed` : '') +
+        (kept ? ` — ${kept} left for you to read` : ''),
+    };
+  }
+  out.textContent = state.settle.msg;
+  out.className = state.settle.cls;
+  loadFindings();
+  loadChat();
 }
 
 async function loadFindings() {
@@ -1315,10 +1504,17 @@ async function loadGoal(gid) {
     `<div class="row goal-acts">` +
     (g.state === 'blocked' && !(g.questions || []).length
       ? `<button id="gp-go">Carry on anyway</button>` : '') +
+    // A goal that is still live can be re-planned against the repo as it is now,
+    // or aimed somewhere else. A done goal cannot: its evidence is what it is.
+    (g.state !== 'done'
+      ? `<button id="grec-go" title="Re-plan against the repo as it is now. Conditions already met keep their evidence.">Recalculate</button>` +
+        `<button id="gimp-go" title="Ask whether this goal is still aimed at the right thing. Answers first; applies only if you ask again.">Improve objective</button>`
+      : '') +
     (g.pr_url
       ? `<a class="prlink" href="${esc(g.pr_url)}" target="_blank" rel="noreferrer">pull request open &rarr;</a>`
       : g.state === 'done' ? `<button id="gpub-go">Open pull request</button>` : '') +
     `<button id="gc-go" class="danger">Abandon</button></div>` +
+    `<div id="greopen-out" class="gpub"></div>` +
     `<div id="gpub-out" class="gpub"></div>`;
   // Same reason as the list above, and it matters more here: this is where the
   // buttons are. A goal that is sitting still renders identically every tick,
@@ -1381,6 +1577,73 @@ async function loadGoal(gid) {
       rep.conditions.map((c) => `<div class="gl">✓ ${mdi(c.text)}</div>`).join('') +
       rep.commits.map((c) => `<div class="gl muted">${esc(c)}</div>`).join('') +
       `<div class="muted">Nothing merges. This opens a pull request and stops.</div>`;
+  };
+  // Re-planning a goal that is already running. One click, because it does not
+  // change what the goal is for: the objective is fixed, met conditions keep the
+  // evidence that met them, and what changes is the route.
+  const rec = $('grec-go');
+  if (rec) rec.onclick = async () => {
+    const out = $('greopen-out');
+    out.innerHTML = '<span class="muted">re-checking every condition, then re-planning…</span>';
+    rec.disabled = true; rec.textContent = 'recalculating…';
+    const r = await post('/api/goal/reopen', { goal_id: gid, action: 'recalculate' });
+    rec.disabled = false; rec.textContent = 'Recalculate';
+    if (!r.ok) {
+      out.innerHTML = `<span class="err">${esc(r.error || 'failed')}</span>`;
+      return;
+    }
+    out.innerHTML =
+      `<b class="good">re-planned</b> <span class="muted">${esc(r.kept_done)} met condition(s) kept their evidence` +
+      ((r.dropped_tasks || []).length ? `, ${(r.dropped_tasks || []).length} task(s) dropped` : '') + '</span>' +
+      // Evidence that quietly stops counting is the one outcome worth shouting
+      // about, so it is named here rather than left to the log.
+      ((r.lost_met || []).length
+        ? `<div class="err">no longer part of the definition, though it was met: ` +
+          r.lost_met.map((t) => esc(t)).join('; ') + '</div>' : '');
+    await refresh(); loadGoal(gid);
+  };
+  // Two clicks. The first asks what it would change and shows the answer; the
+  // second is the one that changes what this goal is for. Re-planning follows
+  // automatically, because a new objective with the old plan under it is the
+  // one state this must not leave behind.
+  const imp = $('gimp-go');
+  if (imp) imp.onclick = async () => {
+    const out = $('greopen-out');
+    if (imp.dataset.armed) {
+      imp.disabled = true; imp.textContent = 'applying…';
+      const r = await post('/api/goal/reopen', { goal_id: gid, action: 'improve', apply: true });
+      imp.disabled = false;
+      out.innerHTML = r.ok
+        ? '<span class="good">objective replaced, and the plan re-run under it</span>'
+        : `<span class="err">${esc(r.error || 'failed')}</span>`;
+      await refresh(); loadGoal(gid);
+      return;
+    }
+    out.innerHTML = '<span class="muted">asking whether this is still the right thing to be aiming at…</span>';
+    imp.disabled = true; imp.textContent = 'asking…';
+    const r = await post('/api/goal/reopen', { goal_id: gid, action: 'improve' });
+    imp.disabled = false;
+    if (!r.ok) {
+      imp.textContent = 'Improve objective';
+      out.innerHTML = `<span class="err">${esc(r.error || 'failed')}</span>`;
+      return;
+    }
+    if (!r.objective) {
+      // "This is already aimed correctly" is a real answer, not a failure, and
+      // arming the button after it would invite a change nobody asked for.
+      imp.textContent = 'Improve objective';
+      out.innerHTML = `<b>leave it as it is</b><div class="muted">${esc(r.assessment || r.why || '')}</div>`;
+      return;
+    }
+    imp.textContent = 'Use this objective';
+    imp.dataset.armed = '1';
+    imp.classList.add('primary');
+    out.innerHTML =
+      `<b>proposed objective</b><div class="gwhy md">${md(r.objective)}</div>` +
+      `<div class="muted">${esc(r.what_changed || '')}</div>` +
+      `<div class="muted">${esc(r.why || '')}</div>` +
+      (r.keeps_the_point ? `<div class="muted">still the point: ${esc(r.keeps_the_point)}</div>` : '') +
+      `<div class="muted">Applying this also re-plans the goal under it.</div>`;
   };
   $('gc-go').onclick = async () => {
     if (!confirm('Abandon this goal? Work already done stays in the worktree.')) return;
@@ -1502,15 +1765,24 @@ function calBlock(c, bar) {
  *  between two held proposals is a coin toss, and half the calls buy nothing. */
 function sharpenBtn(p, d) {
   const rounds = p.sharpen_rounds || 0;
-  if (rounds >= (d.max_sharpen || 2))
-    return `<span class="muted">sharpened ${rounds}× — no attempts left</span>`;
+  // Not an attempt count any more. The server decides whether another round is
+  // worth paying for by what the last one measured, and it says why — which is
+  // the useful half: "stopped improving" means this is as good as the objective
+  // gets, "hit the spend cap" means it was cut off still climbing.
+  if (p.sharpen_done)
+    return `<span class="muted">sharpened ${rounds}× — ${esc(p.sharpen_done)}</span>`;
   const h = p.headroom, floor = typeof d.sharpen_floor === 'number' ? d.sharpen_floor : 0.15;
   const known = h !== null && h !== undefined;
   const dim = known && h < floor;
+  // What the last round actually did, next to what the next one claims it can
+  // do. The claim is the architect's; the gain is the record's.
+  const gv = p.sharpen_gain;
+  const g = typeof gv === 'number'
+    ? ` · last round ${gv >= 0 ? '+' : ''}${Math.round(gv * 100)}%` : '';
   return `<button class="dp-s${dim ? ' dim' : ''}" data-id="${esc(p.id)}"` +
     ` title="${esc(p.why_headroom || 'nobody has judged whether another look would help')}">` +
     (known ? `Improve the odds · ${Math.round(h * 100)}% chance it helps`
-           : 'Improve the odds') + `</button>`;
+           : 'Improve the odds') + g + `</button>`;
 }
 
 function dirSection(s, cls) {
@@ -1805,6 +2077,575 @@ async function loadDirection() {
   }
 }
 
+/** One spec run: what the reviewer asked for, what the writer did about it.
+ *
+ *  Both halves on screen, because the whole point of the loop is that neither
+ *  side gets to be the only voice. A reviewer's demand that the writer refused
+ *  and explained is a different situation from one it satisfied, and a run that
+ *  ended `stalled` is telling you the two of them could not settle it. */
+function specRound(rd) {
+  const w = rd.worker || {};
+  const verdict = rd.verdict === 'SOLID'
+    ? `<span class="sp-v ok">solid</span>`
+    : `<span class="sp-v bad">needs work</span>`;
+  const defects = (rd.defects || []).length
+    ? `<ol class="sp-defects">` + rd.defects.map((d) => `<li>${esc(d)}</li>`).join('') + `</ol>`
+    : '';
+  // "changed" is the fact the stop rule turns on, so it is stated rather than
+  // left to be inferred from a diff nobody opened.
+  const moved = rd.changed === null || rd.changed === undefined ? ''
+    : rd.changed ? `<span class="sp-v ok">the file changed</span>`
+                 : `<span class="sp-v bad">the file did not change</span>`;
+  const reply = w.text
+    ? `<div class="sp-reply"><div class="sp-who">the writer` +
+      (w.agreed === true ? ' — says it is already solid'
+        : w.agreed === false ? ' — revised it' : '') +
+      ` ${moved}</div><pre>${esc(w.text)}</pre></div>`
+    : (rd.task_id ? `<div class="sp-reply muted">a writer is out on this round…</div>` : '');
+
+  return `<div class="sp-round"><div class="sp-who">round ${rd.n} · the reviewer ${verdict}` +
+    (rd.why ? ` — ${esc(rd.why)}` : '') + `</div>` + defects + reply + `</div>`;
+}
+
+const SP_STATE = {
+  running: ['live', 'the reviewer and the writer are still going'],
+  solid: ['ok', 'both of them say this document is solid'],
+  stalled: ['warn', 'they disagree — two rounds changed nothing on disk'],
+  capped: ['warn', 'stopped at the round cap without agreement'],
+  stopped: ['bad', 'stopped'],
+  closed: ['muted', 'closed by you'],
+};
+
+/** One run, folded. `r.rounds` is an array on the newest run and a count on the
+ *  older ones - the server sends the transcript only for the one that renders
+ *  open, and the rest are fetched by id the first time they are unfolded. */
+function specRun(r, open) {
+  const [cls, blurb] = SP_STATE[r.state] || ['muted', r.state];
+  const full = Array.isArray(r.rounds);
+  const n = full ? r.rounds.length : (r.rounds || 0);
+  const body = full
+    ? r.rounds.map(specRound).join('')
+    : `<div class="sp-round muted">…</div>`;
+  return `<details class="sp-run"${open ? ' open' : ''} data-id="${esc(r.id)}"` +
+    `${full ? '' : ' data-fetch="1"'}><summary>` +
+    `<span class="sp-badge ${cls}">${esc(r.state)}</span> ` +
+    `${n} round${n === 1 ? '' : 's'} · ` +
+    `${esc(r.why || blurb)}</summary>` + body +
+    (r.state === 'running'
+      ? `<div class="sp-act"><button class="sp-stop" data-id="${esc(r.id)}">Stop this run</button></div>`
+      : '') +
+    `</details>`;
+}
+
+/** What the rater said about one document.
+ *
+ *  Three numbers and a derived fourth. `worth` is the only one that decides
+ *  anything - it is what orders the queue - and the three it is derived from are
+ *  shown next to it so that a document sitting at the bottom of the list can be
+ *  argued with rather than just obeyed. */
+function specRating(f) {
+  const r = f.rating;
+  if (!r) return `<div class="sp-rate muted">unrated — nothing has judged this document</div>`;
+  if (r.error) return `<div class="sp-rate"><span class="err">${esc(r.error)}</span></div>`;
+  const n = (label, v, why, cls) =>
+    `<span class="sp-n ${cls || ''}" title="${esc(why || '')}">${label} ` +
+    `<b>${pcs(v)}</b></span>`;
+  // A rating is of a specific text. Once the document has moved, saying so is
+  // the only honest thing to do with it: the numbers are still the numbers
+  // somebody paid for, and they are no longer about the file on screen.
+  const stale = r.stale
+    ? `<span class="sp-n warn" title="the document has changed since it was rated">` +
+      `rated an older version</span>`
+    : '';
+  const gaps = (r.gaps || []).length
+    ? `<ul class="sp-gaps">` + r.gaps.map((g) => `<li>${esc(g)}</li>`).join('') + `</ul>`
+    : '';
+  return `<div class="sp-rate">` +
+    n('solid', r.solidity, r.why_solidity, r.solidity >= 0.7 ? 'ok' : '') +
+    n('needed', r.need, r.why_need) +
+    n('headroom', r.headroom, r.why_headroom) +
+    `<span class="sp-n worth" title="need × headroom — what one sharpen run on this ` +
+    `document is expected to be worth. It is what orders the queue.">worth ` +
+    `<b>${pcs(r.worth)}</b></span>` + stale +
+    `</div>` + gaps;
+}
+
+/** One document, and the buttons that put it through the loop. */
+function specFile(f, s) {
+  const live = (f.runs || []).find((r) => r.state === 'running');
+  const busy = state.specBusy === f.rel;
+  const queued = ((s.plan || {}).queue || []).includes(f.rel);
+  const label = live ? `${live.waiting_on === 'worker' ? 'writer' : 'reviewer'} is working…`
+    : busy ? 'starting…' : queued ? 'queued' : 'Sharpen until solid';
+  const rating = f.rating && !f.rating.error;
+  return `<section class="sp-file">` +
+    `<div class="sp-file-head">` +
+    (f.rank ? `<span class="sp-rank" title="where this sits in the sharpen queue">${f.rank}</span>` : '') +
+    `<code>${esc(f.rel)}</code>` +
+    `<span class="muted">${f.lines} lines · ${Math.round(f.bytes / 100) / 10}k</span>` +
+    // A document that only exists in the worktree is not in your repository
+    // yet, and a tab that listed it the same way as the others would be telling
+    // you the lane has a spec when what it has is a draft you have not read.
+    (f.unmerged ? `<span class="sp-n warn" title="written by a worker in amp/${esc(s.lane)} ` +
+      `and not merged — read it in the Diff tab">worktree only</span>` : '') +
+    `<button class="sp-rate-go" data-rel="${esc(f.rel)}"` +
+    `${state.specWork || !s.architect ? ' disabled' : ''}` +
+    ` title="one architect call: how solid it is, how much the mission needs it, ` +
+    `and whether sharpening would move it">${rating ? 'Re-rate' : 'Rate'}</button>` +
+    `<button class="sp-go" data-rel="${esc(f.rel)}"` +
+    `${live || busy || !s.architect ? ' disabled' : ''}` +
+    ` title="${esc(s.architect ? 'Codex reviews it, a Claude worker rewrites it in the worktree, until both agree' : s.architect_why || '')}">` +
+    `${esc(label)}</button></div>` +
+    specRating(f) +
+    // Newest run open, the rest folded. Runs come back newest-first, so the one
+    // worth reading is always the first one - and if it is live, the rounds
+    // appearing under it are what "still going" looks like.
+    ((f.runs || []).map((r, i) => specRun(r, i === 0)).join('')) +
+    `</section>`;
+}
+
+const SP_PLAN = {
+  running: 'live',
+  done: 'ok',
+  stopped: 'bad',
+};
+
+/** The campaign strip: what is queued, what is out, what was skipped and why. */
+function specPlan(p) {
+  if (!p) return '';
+  const cur = p.current
+    ? `<span class="sp-n live">sharpening <code>${esc(p.current.rel)}</code></span>`
+    : '';
+  const done = (p.done || []).length
+    ? `<span class="sp-n" title="${esc((p.done || []).map((d) => `${d.rel} — ${d.state}`).join('\n'))}">` +
+      `${p.done.length} done</span>`
+    : '';
+  const queued = (p.queue || []).length
+    ? `<span class="sp-n" title="${esc((p.queue || []).join('\n'))}">${p.queue.length} queued</span>`
+    : '';
+  // Skipped is not the same as finished and is the number most likely to be
+  // surprising - a campaign that "did nothing" usually means the bar held
+  // everything back, and that is a setting, not a fault.
+  const skipped = (p.skipped || []).length
+    ? `<span class="sp-n warn" title="${esc(p.skipped.map((x) => `${x.rel} — ${x.why}`).join('\n'))}">` +
+      `${p.skipped.length} under the ${p.bar} bar</span>`
+    : '';
+  return `<div class="sp-plan">` +
+    `<span class="sp-badge ${SP_PLAN[p.state] || 'muted'}">${esc(p.state)}</span> ` +
+    cur + queued + done + skipped +
+    (p.why ? `<span class="muted">${esc(p.why)}</span>` : '') +
+    (p.state === 'running'
+      ? `<button class="sp-stop" id="sp-plan-stop">Stop the queue</button>` : '') +
+    `</div>`;
+}
+
+/** A lane with no documents of its own: what to do about it.
+ *
+ *  Two answers, because there are two problems wearing the same face. Either
+ *  the design was never written down, or it was written down somewhere else -
+ *  and the second is cheap to check, so it is checked first and the answer is
+ *  shown before the button that would pay a worker to write a second copy. */
+function specRecover(s) {
+  const found = (s.candidates || []).length
+    ? `<div class="sp-found"><div class="sp-who">` +
+      `Design documents elsewhere in the repository that are mostly about this ` +
+      `lane. Every <code>docs/spec/</code> was read, not only the ones that are ` +
+      `lanes. The count is how often they name this lane, and it is what orders ` +
+      `them.</div>` +
+      s.candidates.map((c) =>
+        `<div class="sp-cand"><code>${esc(c.path)}</code>` +
+        `<span class="sp-n">${c.hits} mentions</span>` +
+        (!c.lane
+          ? `<span class="sp-n warn" title="no lane in this console covers that ` +
+            `directory, so nothing here is watching it">no lane owns it</span>`
+          : c.names_host ? ''
+          : `<span class="sp-n warn" title="it never names the lane it is filed ` +
+            `under">never names ${esc(c.lane)}</span>`) +
+        `<span class="muted">${c.lines} lines${c.title ? ' · ' + esc(c.title) : ''}</span></div>`
+      ).join('') +
+      `<div class="sp-who">Moving one is a decision with a blast radius — it belongs ` +
+      `to whichever lane you say it does, and nothing here will move it for you.</div>` +
+      `</div>`
+    : `<div class="sp-who">Nothing elsewhere in the repository reads as this lane's ` +
+      `design either — every <code>docs/spec/</code> outside this lane was searched.</div>`;
+  return `<div class="sp-gap">${esc(s.gap)} — this lane has no spec, so every ` +
+    `<code>need</code> score it gets is judged against whatever the reader could find.</div>` +
+    found + specDrafting(s);
+}
+
+/* The draft worker, while it is out.
+ *
+ *  Dispatch returns in about a second and the worker runs for minutes, so the
+ *  button's own busy state is over almost immediately - which is what made this
+ *  look like a button that did nothing. This reads the running task off the
+ *  server instead, so it stays up for as long as the work does and is still
+ *  there after a reload. */
+function specDrafting(s) {
+  const d = s.drafting;
+  if (d) {
+    const since = d.at ? ` · started ${ago(d.at)}` : '';
+    return `<div class="sp-drafting">` +
+      `<span class="dot"></span>` +
+      (d.state === 'queued'
+        ? `<b>queued</b> at position ${d.position} — a lane runs one worker at a ` +
+          `time, so this starts when the one ahead of it finishes`
+        : `<b>a worker is reading the code</b> and writing ` +
+          `<code>docs/spec/SPEC.md</code> into the worktree`) +
+      `<span class="muted">${since}</span>` +
+      (d.task_id
+        ? ` <button class="sp-watch" data-task="${esc(d.task_id)}" ` +
+          `title="open this worker's transcript">watch it</button>`
+        : '') +
+      `</div>`;
+  }
+  return `<div class="sp-file-head"><button class="sp-go" id="sp-draft"` +
+    `${state.specWork ? ' disabled' : ''}` +
+    ` title="a worker reads the code and writes docs/spec/SPEC.md in the worktree. ` +
+    `It is told to describe what the code already commits to, not to design.">` +
+    `${state.specWork === 'draft' ? 'sending a worker…' : 'Draft one from the code'}` +
+    `</button></div>`;
+}
+
+const SP_VERDICT = {
+  missing: ['bad', 'no design document at all'],
+  unrated: ['warn', 'not judged yet'],
+  thin: ['warn', 'under the bar'],
+  solid: ['ok', 'over the bar'],
+};
+
+/* The unattended loop: its switch, where the lane stands, and what it spent.
+ *
+ *  The verdict is shown whether or not the loop is on. It is the same fact
+ *  either way, and a threshold you can only see while automation is running is
+ *  a threshold nobody can check against. */
+function specAuto(s) {
+  const st = s.state || {};
+  const a = s.auto || {};
+  const [cls, said] = SP_VERDICT[st.verdict] || ['muted', st.verdict || '—'];
+  // Capped, and the caps are shown as counts rather than as "on"/"off". A loop
+  // that has stopped because it ran out of attempts looks exactly like a loop
+  // that is switched off unless it says which.
+  const spent = [];
+  if (a.drafts) spent.push(`${a.drafts}/${a.max_drafts} draft${a.drafts > 1 ? 's' : ''}`);
+  if (a.campaigns) spent.push(`${a.campaigns}/${a.max_campaigns} campaigns`);
+  const stopped = a.on && (
+    // Settled first: it is the only one of these that cost nothing, and reading
+    // it as a spent budget would be exactly backwards.
+    (a.settled
+      ? 'it stopped without spending: these documents are under the bar, but none of ' +
+        'them is judged worth a sharpen round — a round would not move them far ' +
+        'enough, or the mission does not need them enough. Edit one, or re-rate it, ' +
+        'and the loop picks the lane back up.'
+      : st.verdict === 'missing' && a.drafts >= a.max_drafts
+      ? 'it has used every draft attempt on this lane and stopped — a lane where drafting keeps producing nothing needs you, not another worker'
+      : st.verdict === 'thin' && a.campaigns >= a.max_campaigns
+      ? 'it has used every campaign on this lane and stopped — these documents did not converge and need a person'
+      : ''));
+  // Named for the lane it governs. It used to say "run this on its own" while
+  // writing a stack-wide setting, so switching one lane on switched on eleven.
+  return `<div class="sp-auto">` +
+    `<label title="for ${esc(s.lane)} only: draft what is missing, rate what exists, ` +
+    `sharpen what is under the bar, then ask Direction what to build from it. ` +
+    `One step per tick. This spends — workers into worktrees, and architect calls.">` +
+    `<input type="checkbox" id="sp-auto"${a.on ? ' checked' : ''}> ` +
+    `run the loop on <b>${esc(s.lane)}</b>` +
+    `</label>` +
+    `<button id="sp-auto-all" class="sp-watch" title="turn the loop on for every ` +
+    `lane at once. Spelled out as its own button because one lane's checkbox ` +
+    `quietly doing this is the bug it replaces.">every lane</button>` +
+    `<span class="sp-n ${cls}" title="${esc(said)}">${esc(st.verdict || '—')}</span>` +
+    (st.solidity === null || st.solidity === undefined ? ''
+      : `<span class="sp-n">lowest solidity ${pcs(st.solidity)}</span>`) +
+    `<span class="muted">bar ${pcs(st.bar)}` +
+    (spent.length ? ` · spent ${spent.join(', ')}` : '') + `</span>` +
+    // What it is doing RIGHT NOW. An architect call takes tens of seconds on a
+    // background thread, and without this the tab went from idle to a changed
+    // verdict with nothing in between.
+    (a.busy
+      ? `<div class="sp-working"><span class="dot"></span>` +
+        `${esc(a.busy.what)}<span class="muted"> · started ${ago(a.busy.at)}</span></div>`
+      : '') +
+    (stopped ? `<div class="sp-stopped">${esc(stopped)}</div>` : '') +
+    specDirection(s) +
+    ((a.log || []).length
+      ? `<div class="muted sp-autolog">last: ${esc(a.log[0].what)} — ` +
+        `${esc(a.log[0].why)} · ${ago(a.log[0].at)}</div>`
+      : '') +
+    `</div>`;
+}
+
+/* The hand-off into Direction.
+ *
+ *  Reaching the bar is not the end of the loop, it is the point of it - a
+ *  document nothing ever reads changed nothing. The loop does this on its own
+ *  once per version of the documents; the button is here because "once" is the
+ *  right rule for something on a heartbeat and the wrong rule for the only way
+ *  to get an answer, since the first answer can just be a bad one. */
+function specDirection(s) {
+  const a = s.auto || {};
+  const busy = state.specWork === 'explore';
+  const said = !a.explored_at
+    ? 'Direction has not been asked about these documents'
+    : a.explored_stale
+    ? `asked ${ago(a.explored_at)}, but the documents have changed since`
+    // "proposal(s)", not "goal(s)". They are two different things on two
+    // different tabs, and calling the first one by the second one's name sends
+    // people to Goals to look for something that is not there.
+    : `asked ${ago(a.explored_at)} · ${a.proposed || 0} proposal(s) on Direction, ` +
+      `awaiting adoption`;
+  return `<div class="sp-dir">` +
+    `<button id="sp-explore"${state.specWork ? ' disabled' : ''}` +
+    ` title="one architect call. Reads this lane's documents, its scores and its ` +
+    `named gaps, and writes PROPOSALS onto the Direction tab. They do not become ` +
+    `goals and no worker starts until you adopt one there.">` +
+    `${busy ? 'asking…' : a.explored_at ? 'Ask Direction again' : 'Propose goals from this spec'}` +
+    `</button><span class="muted">${esc(said)}</span></div>`;
+}
+
+function renderSpec(s) {
+  $('sp-lane').textContent = s.lane || '—';
+  // Said once, at the top: the writer works in a worktree and you merge it.
+  // A tab that starts workers without saying where they write is a tab that
+  // looks like it is editing your files.
+  const head = `<div class="sp-head">` +
+    `Everything under <code>${esc(s.path)}/docs/spec/</code>. Sharpening sends the ` +
+    `document to the reviewer, then to a writer in this lane's <code>amp/${esc(s.lane)}</code> ` +
+    `worktree, and repeats until both of them say it is solid — or until it stops ` +
+    `changing, or hits ${s.max_rounds} rounds. Your checkout is never written to; ` +
+    `merge it yourself from the Diff tab.` +
+    (s.architect ? '' : ` <span class="err">${esc(s.architect_why || '')}</span>`) +
+    `</div>`;
+  // The two whole-lane actions. Rating first, and left of sharpening, because
+  // it is the cheap one and it is what decides the order the expensive one runs
+  // in - a queue built from unrated documents is alphabetical wearing a ranking.
+  const bar = (s.files || []).length
+    ? `<div class="sp-bar">` +
+      `<button id="sp-audit"${state.specWork || !s.architect ? ' disabled' : ''}` +
+      ` title="one architect call per document that has changed since it was last ` +
+      `rated. Already-rated documents are skipped.">` +
+      `${state.specWork === 'audit' ? 'rating…' : 'Rate every document'}</button>` +
+      `<button id="sp-all"${state.specWork || !s.architect ? ' disabled' : ''}` +
+      ` title="queue every document, best first, and sharpen them one at a time — ` +
+      `a lane runs one worker at a time, so this is a queue rather than ${(s.files || []).length} runs at once">` +
+      `${state.specWork === 'all' ? 'starting…' : 'Sharpen every document'}</button>` +
+      `<span class="muted">a campaign skips anything whose worth is under ${s.worth_bar}</span>` +
+      `</div>` + specPlan(s.plan)
+    : '';
+  // The loop, and where this lane stands against its threshold. Rendered above
+  // everything including the recovery panel, because "a worker is coming for
+  // this on its own" changes what the buttons under it are for.
+  const auto = specAuto(s);
+  // A draft worker is shown either way. `specRecover` carries it while the lane
+  // is still empty; once the worker has written the file the lane is no longer
+  // empty but the worker is still running, and that is the moment the indicator
+  // matters most - it is the difference between "finished" and "wrote a file".
+  const body = s.gap
+    ? specRecover(s)
+    : (s.drafting ? specDrafting(s) : '') +
+      (s.files || []).map((f) => specFile(f, s)).join('');
+  // Runs whose document is gone. Kept visible so a rename cannot silently
+  // swallow a review somebody paid for.
+  const orphans = (s.orphans || []).length
+    ? `<section class="sp-file"><div class="sp-file-head">` +
+      `<code class="muted">documents that are no longer there</code></div>` +
+      s.orphans.map((r) => specRun({ ...r, why: `${r.rel} — ${r.why || ''}` }, false)).join('') +
+      `</section>`
+    : '';
+  $('sp-out').innerHTML = head + auto + bar + body + orphans;
+
+  if ($('sp-auto')) {
+    $('sp-auto').onchange = async (e) => {
+      const on = e.target.checked;
+      $('sp-status').textContent = on
+        ? `the loop will run on ${state.sel} — no other lane is affected`
+        : `the loop is off for ${state.sel}`;
+      await post('/api/spec/auto', { lane: state.sel, on });
+      loadSpec();
+    };
+  }
+  if ($('sp-auto-all')) {
+    $('sp-auto-all').onclick = async () => {
+      const on = !((s.auto || {}).on);
+      if (!confirm(`Turn the spec loop ${on ? 'ON' : 'off'} for every lane?\n\n` +
+                   (on ? 'It will draft missing specs, rate them, sharpen anything ' +
+                         'under the bar, and ask Direction what to build. That means ' +
+                         'real workers and real architect calls, one step per tick.'
+                       : 'Nothing already running is stopped.'))) return;
+      const r = await post('/api/spec/auto', { all: true, on });
+      $('sp-status').textContent = `loop ${on ? 'on' : 'off'} for ${(r.lanes || []).length} lanes`;
+      loadSpec();
+    };
+  }
+  if ($('sp-explore')) {
+    $('sp-explore').onclick = () =>
+      specWork('explore', '/api/spec/explore', { lane: state.sel },
+               'asking direction what to build from these documents…');
+  }
+
+  $('sp-out').querySelectorAll('.sp-go[data-rel]').forEach((b) => {
+    b.onclick = () => startSpecRun(b.dataset.rel);
+  });
+  $('sp-out').querySelectorAll('.sp-watch').forEach((b) => {
+    b.onclick = () => openWorkerLog(state.sel, b.dataset.task);
+  });
+  $('sp-out').querySelectorAll('.sp-rate-go').forEach((b) => {
+    b.onclick = () => specWork('rate', '/api/spec/rate',
+                              { lane: state.sel, rel: b.dataset.rel },
+                              `rating ${b.dataset.rel}…`);
+  });
+  if ($('sp-audit')) {
+    $('sp-audit').onclick = () => specWork('audit', '/api/spec/rate', { lane: state.sel },
+                                           'rating every document…');
+  }
+  if ($('sp-all')) {
+    $('sp-all').onclick = () => specWork('all', '/api/spec/campaign', { lane: state.sel },
+                                         'queueing every document…');
+  }
+  if ($('sp-plan-stop')) {
+    $('sp-plan-stop').onclick = () =>
+      specWork('all', '/api/spec/campaign/stop', { lane: state.sel },
+               'stopping the queue…');
+  }
+  if ($('sp-draft')) {
+    $('sp-draft').onclick = () => specWork('draft', '/api/spec/draft', { lane: state.sel },
+                                           'sending a worker to draft one…');
+  }
+  $('sp-out').querySelectorAll('.sp-stop').forEach((b) => {
+    b.onclick = async () => {
+      b.disabled = true;
+      await post('/api/spec/close', { id: b.dataset.id });
+      loadSpec();
+    };
+  });
+  // Older runs arrive as a summary. Their transcript is fetched the first time
+  // they are unfolded, and replaces the placeholder in place - not by redrawing
+  // the pane, which would close the thing that was just opened.
+  $('sp-out').querySelectorAll('.sp-run[data-fetch]').forEach((d) => {
+    d.ontoggle = async () => {
+      if (!d.open || d.dataset.fetch !== '1') return;
+      d.dataset.fetch = '0';
+      const got = await api('/api/spec/run?id=' + encodeURIComponent(d.dataset.id));
+      const ph = d.querySelector('.sp-round');
+      if (!ph) return;
+      ph.outerHTML = got.ok
+        ? ((got.run.rounds || []).map(specRound).join('') || '<div class="sp-round muted">no rounds</div>')
+        : `<div class="sp-round"><span class="err">${esc(got.error)}</span></div>`;
+    };
+  });
+
+  // A run advances without anyone clicking: a writer finishes, the settle hook
+  // sends the reviewer back in, and rounds appear. Poll only while one is live,
+  // and only while this tab is the one being looked at - the whole reason the
+  // old tab did not poll is that reading every spec on disk each tick is a cost
+  // for nothing, and that is still true when nothing is running.
+  clearTimeout(state.specPoll);
+  // A running campaign counts as live even with nothing out right now: it is
+  // waiting on the ticker to start the next document, and a pane that stopped
+  // polling in that gap would sit on `0 queued` until somebody clicked.
+  // A draft worker is live too, and it is the one case where nothing on this
+  // tab changes until it finishes - so without it the pane would show a running
+  // worker forever and never notice the document it wrote.
+  // The loop advances on the heartbeat thread with nothing clicked, so a tab
+  // that only polls while a run is out would show a stale verdict for as long
+  // as it was open. `busy` alone is not enough - most of the loop's time is
+  // spent between steps, waiting for the next tick.
+  const lp = s.auto || {};
+  const live = (s.files || []).some((f) => (f.runs || []).some((r) => r.state === 'running'))
+    || (s.plan || {}).state === 'running'
+    || !!s.drafting
+    || !!lp.busy
+    // A settled lane is switched on and deliberately doing nothing, so polling
+    // it every four seconds is asking a question that has already been answered.
+    || (lp.on && !lp.settled && (s.state || {}).verdict !== 'solid');
+  if (live && $('pane-specs').classList.contains('active')) {
+    state.specPoll = setTimeout(loadSpec, 4000);
+  }
+}
+
+/** One whole-lane action: disable everything, call, redraw.
+ *
+ *  `specWork` is a single string rather than a flag per button because these
+ *  all end in an architect call or a worker, and two of them running at once is
+ *  either a wasted call or a lane lock collision. One at a time is not a
+ *  limitation being worked around - it is the actual constraint underneath. */
+async function specWork(kind, path, body, status) {
+  if (state.specWork) return;
+  state.specWork = kind;
+  $('sp-status').textContent = status;
+  // Redraw first so the buttons read as busy for the whole call, not after it.
+  await loadSpec();
+  try {
+    const r = await post(path, body);
+    if (!r.ok) {
+      $('sp-status').textContent = r.error || 'that did not work';
+    } else if (kind === 'explore') {
+      const n = r.proposed || 0;
+      // Says PROPOSAL, and says adopt. The first version said they were "on the
+      // Direction tab, waiting for you", which is true and was still read as
+      // "there are new goals" - so the next place looked was the Goals tab,
+      // where nothing had appeared and nothing was going to. A proposal is not a
+      // goal until it is adopted, and the sentence that announces one is the
+      // place to say so.
+      $('sp-status').innerHTML = n
+        ? `${n} <b>proposal(s)</b> on the Direction tab — not goals yet. ` +
+          `Nothing starts until you adopt one. ` +
+          `<button id="sp-goto-dir" class="sp-watch">open Direction</button>`
+        : esc('nothing worth proposing from these documents: ' +
+              ((r.why_exhausted || r.assessment || '').slice(0, 160) || 'no reason given'));
+      const go = $('sp-goto-dir');
+      if (go) go.onclick = () => showTab('direction');
+    } else if (r.audit) {
+      const a = r.audit;
+      const failed = (a.failed || []).length ? ` · ${a.failed[0].error}` : '';
+      $('sp-status').textContent =
+        `rated ${a.rated.length}, skipped ${a.skipped.length} already current${failed}`;
+    } else {
+      $('sp-status').textContent = '';
+    }
+  } catch (e) {
+    $('sp-status').textContent = String(e.message || e);
+  } finally {
+    state.specWork = null;
+    loadSpec();
+  }
+}
+
+async function loadSpec() {
+  const lane = state.sel;
+  if (!lane) { $('sp-out').innerHTML = '<span class="muted">pick a lane</span>'; return; }
+  try {
+    const r = await api('/api/spec?lane=' + encodeURIComponent(lane));
+    if (!r.ok) throw new Error(r.error);
+    renderSpec(r.spec || {});
+  } catch (e) {
+    $('sp-out').innerHTML = `<span class="err">${esc(String(e.message || e))}</span>`;
+  }
+}
+
+/** The first architect turn runs inline, so this takes a while and can come
+ *  back with a verdict already. `specBusy` exists so the button says so - a
+ *  button that looks pressable during a 90-second call gets pressed again. */
+async function startSpecRun(rel) {
+  state.specBusy = rel;
+  $('sp-status').textContent = `reviewing ${rel}…`;
+  // Redraw first, so the button reads `starting…` for the whole call rather
+  // than after it.
+  await loadSpec();
+  try {
+    const r = await post('/api/spec/start', { lane: state.sel, rel });
+    $('sp-status').textContent = r.ok ? '' : (r.error || 'could not start');
+  } catch (e) {
+    $('sp-status').textContent = String(e.message || e);
+  } finally {
+    state.specBusy = null;
+    loadSpec();
+  }
+}
+
+function wireSpecs() {
+  $('btn-specs').onclick = loadSpec;
+}
+
 function wireDirection() {
   $('dir-auto').onchange = async () => {
     const on = $('dir-auto').checked;
@@ -2082,6 +2923,157 @@ function wireMission() {
   };
 }
 
+// ---------------------------------------------------------------- reports
+//
+// A report is a file, so this sheet is mostly about the file: what the next one
+// would cover, and every one already taken. The page itself is not rendered
+// here - it opens in its own tab, because it is meant to outlive the console.
+
+/** What has moved since the last report, in the terms the report uses. */
+function pendingLine(r) {
+  const c = r.counts || {};
+  const say = [
+    [c.goals_closed, 'goal closed', 'goals closed'],
+    [c.ladder, 'rung move', 'rung moves'],
+    [c.findings, 'finding', 'findings'],
+    [c.raised, 'objective proposed', 'objectives proposed'],
+    [c.tasks, 'worker run', 'worker runs'],
+  ].filter(([n]) => n > 0).map(([n, one, many]) => `${n} ${n === 1 ? one : many}`);
+  if (!r.last) return 'No report has been taken for this workspace yet, so the first one covers everything on record.';
+  if (!say.length) return `Nothing has moved since the last report, taken ${ago(r.last.at)}. Taking another would say exactly that.`;
+  return `${say.join(', ')} since the last report, taken ${ago(r.last.at)}.`;
+}
+
+function renderReports(r) {
+  const since = $('rp-since');
+  since.textContent = pendingLine(r);
+  since.className = 'rp-since' + (r.last && !r.pending ? ' quiet' : '');
+
+  // The checkbox is only honest if the architect can actually search. Off and
+  // disabled with the reason showing beats a tick that silently does nothing.
+  $('rp-web').disabled = !r.can_web;
+  if (!r.can_web) $('rp-web').checked = false;
+  $('rp-web-why').textContent = r.can_web
+    ? 'One architect turn with a web search. Every link it returns is fetched by the harness before it is printed, so an invented one shows up as unreachable rather than as a citation.'
+    : 'The architect cannot search the web as configured, so this is off. Set the architect to codex in Settings to turn it on.';
+
+  const list = r.reports || [];
+  $('rp-list').innerHTML = list.length ? list.map((x) => {
+    const bits = [
+      x.quiet ? 'nothing moved' : Object.entries(x.counts || {})
+        .filter(([, n]) => n > 0).map(([k, n]) => `${n} ${k.replace(/_/g, ' ')}`).join(', '),
+      x.gates ? `${x.gates} gate(s) holding` : '',
+      x.web ? 'with reading' : '',
+    ].filter(Boolean);
+    // Only a report that kept its own numbers can be solved. Re-deriving them
+    // now would answer a question about today under an older report's heading.
+    const solve = x.data_file
+      ? `<button class="dm-open" data-solve="${esc(x.id)}">Solve</button>`
+      : '<span class="muted" title="taken before reports kept their numbers on disk">—</span>';
+    return `<div class="rp-row">
+      <a href="/reports/${encodeURIComponent(x.file)}" target="_blank" rel="noreferrer noopener">#${x.nth}</a>
+      <span class="muted">${esc(ago(x.at))}</span>
+      <span class="rp-what">${esc(bits.join(' · '))}</span>
+      ${solve}
+    </div>`;
+  }).join('') : '<div class="muted">none yet</div>';
+
+  $('rp-list').querySelectorAll('[data-solve]').forEach((b) => {
+    b.onclick = () => solveReport(b.dataset.solve, b);
+  });
+}
+
+/** What the solver made of a report. Nothing here has been acted on. */
+function renderSolved(r) {
+  const box = $('rp-solved');
+  const sec = (title, rows, line) => rows.length
+    ? `<h4>${title}</h4><ul class="rp-sol">${rows.map(line).join('')}</ul>` : '';
+  box.innerHTML = `
+    <div class="rp-reading">${esc(r.assessment || '')}</div>
+    ${sec('Proposed, and now waiting with the rest',
+      (r.proposals || []).filter((p) => p.kind === 'goal'),
+      (p) => `<li><b>${esc(p.lane)}</b> ${esc(p.text)}<br><span class="muted">${esc(p.why || '')}</span></li>`)}
+    ${sec('Open questions it wants settled first',
+      (r.proposals || []).filter((p) => p.kind === 'question'),
+      (p) => `<li>${esc(p.text)}<br><span class="muted">${esc(p.why || '')}</span></li>`)}
+    ${sec('Moves on goals already open &mdash; yours to make', r.goal_moves || [],
+      (m) => `<li><button class="dm-open" data-gm="${esc(m.goal_id)}" data-lane="${esc(m.lane || '')}"
+              >${esc(m.goal_id)}</button> <b>${esc(m.move)}</b> &mdash; ${esc(m.why)}</li>`)}
+    ${sec('What it would change about the direction, if it could', r.direction || [],
+      (x) => `<li>${esc(x.change)}<br><span class="muted">${esc(x.why)} — ${esc(x.evidence)}</span></li>`)}
+    ${sec('What it would change about how goals are set', r.goal_setting || [],
+      (x) => `<li>${esc(x.change)}<br><span class="muted">${esc(x.why)} — ${esc(x.evidence)}</span></li>`)}
+    ${(r.misfiled || []).length
+      ? `<p class="muted">Dropped, no such lane: ${r.misfiled.map((m) => esc(m.lane || '(none)')).join(', ')}</p>` : ''}
+    ${r.exhausted ? `<p class="muted">Nothing to do: ${esc(r.why_exhausted || '')}</p>` : ''}`;
+  box.querySelectorAll('[data-gm]').forEach((b) => {
+    b.onclick = () => {
+      $('report').classList.add('hidden');
+      openGoal(b.dataset.lane || null, b.dataset.gm);
+    };
+  });
+}
+
+async function solveReport(rid, btn) {
+  const st = $('rp-status');
+  btn.disabled = true;
+  st.textContent = 'reading the report back and working out what it asks for';
+  st.className = 'muted';
+  $('rp-solved').innerHTML = '';
+  const r = await post('/api/report/solve', { report_id: rid });
+  btn.disabled = false;
+  if (!r.ok) {
+    st.textContent = r.error || 'failed';
+    st.className = 'err';
+    return;
+  }
+  const n = (r.proposals || []).length;
+  st.textContent = n ? `${n} proposal(s) written, none adopted` : 'nothing new to propose';
+  st.className = n ? 'good' : 'muted';
+  renderSolved(r);
+  loadChat();
+}
+
+async function loadReports() {
+  const r = await api('/api/reports');
+  if (r.ok) renderReports(r);
+}
+
+async function openReports() {
+  $('report').classList.remove('hidden');
+  $('rp-status').textContent = '';
+  $('rp-status').className = 'muted';
+  await loadReports();
+}
+
+function wireReports() {
+  $('btn-report').onclick = openReports;
+  $('btn-rp-close').onclick = () => $('report').classList.add('hidden');
+  $('btn-rp-take').onclick = async () => {
+    const b = $('btn-rp-take');
+    const st = $('rp-status');
+    const web = $('rp-web').checked;
+    b.disabled = true;
+    b.textContent = 'taking…';
+    st.textContent = web
+      ? 'reading the workspace, then searching the web and checking every link'
+      : 'reading the workspace';
+    st.className = 'muted';
+    const r = await post('/api/report', { web });
+    b.disabled = false;
+    b.textContent = 'Take a report';
+    if (!r.ok) {
+      st.textContent = r.error || 'failed';
+      st.className = 'err';
+      return;
+    }
+    st.textContent = `report #${r.nth} written`;
+    st.className = 'good';
+    await loadReports();
+    window.open(r.url, '_blank', 'noreferrer');
+  };
+}
+
 function openConsult(lane, cid) {
   if (lane !== state.sel) select(lane);
   state.consult = cid;          // what showTab's load will settle on
@@ -2333,6 +3325,16 @@ $('set-bar').oninput = (e) => { $('set-bar-out').textContent = e.target.value + 
 $('set-bar').onchange = (e) => setFlag('adopt_confidence', Number(e.target.value) / 100);
 $('set-need').oninput = (e) => { $('set-need-out').textContent = e.target.value + '%'; };
 $('set-need').onchange = (e) => setFlag('adopt_need', Number(e.target.value) / 100);
+$('set-db-mirror').onchange = (e) => dbSet('mirror', e.target.checked);
+$('set-db-keep').onchange = (e) => dbSet('history_keep', e.target.value);
+$('set-db-sweep').onchange = (e) => dbSet('sweep_min', e.target.value);
+$('btn-db-backup').onclick = dbBackup;
+$('btn-db-verify').onclick = dbVerify;
+$('btn-db-prune').onclick = dbPrune;
+// A plain navigation, not a fetch: the server sends it as an attachment and the
+// browser saves it where the operator keeps things. Holding a 20 MB database in
+// a blob first would only add a copy in memory.
+$('btn-db-export').onclick = () => { window.location = '/api/db/export'; };
 $('btn-cx-cancel').onclick = () => {
   cxStop();
   post('/api/codex-auth/cancel');
@@ -2363,6 +3365,129 @@ $('btn-apply').onclick = async () => {
   const r = await post('/api/apply', { lane: state.sel, attempt: a ? Number(a) : null });
   $('f-out').innerHTML = (r.ok ? '<span class="good">applied</span>\n\n' : '<span class="err">failed</span>\n\n') + esc(r.output);
 };
+
+// ---------------------------------------------------------------- preview
+//
+// The frame points at a port this console started, not at a path on it: a page
+// only resolves its own absolute paths - and a dev server only reaches its
+// live-reload socket - at the root of an origin.
+
+let _frameNonce = 0;
+
+function previewActive() {
+  return $('pane-preview').classList.contains('active');
+}
+
+function applyPreviewMode() {
+  const cmd = $('p-mode').value === 'command';
+  document.querySelectorAll('.p-cmd-only').forEach((n) => n.classList.toggle('hidden', !cmd));
+}
+
+function frameSrc(url) {
+  // A distinct URL every time, because "reload" has to mean it even when the
+  // browser has just been told the same address it is already showing.
+  $('p-frame').src = url + (url.includes('?') ? '&' : '?') + '_amp=' + (++_frameNonce);
+  $('p-frame').classList.remove('hidden');
+  $('p-empty').classList.add('hidden');
+}
+
+function renderPreview(r) {
+  const p = r.preview;
+  state.preview = p;
+  const dot = $('p-dot');
+  const live = p && p.state === 'running' && p.url;
+  dot.className = 'dot ' + (live ? 'ok' : p && p.state === 'starting' ? 'warn' : p && p.state === 'failed' ? 'bad' : '');
+  $('p-url').textContent = live ? p.url : (p ? p.state : 'not running');
+  $('p-url').href = live ? p.url : '#';
+  // What is actually being served: the controls beside it describe what Start
+  // would do next, which is not the same thing the moment you retarget them.
+  $('p-url').title = p ? p.root + (p.cmd ? '\n$ ' + p.cmd : '') : '';
+  $('p-out').textContent = p ? (p.log || []).join('\n') : '';
+  if (p && p.log && p.log.length && !$('p-out').classList.contains('hidden')) {
+    $('p-out').scrollTop = $('p-out').scrollHeight;
+  }
+  const note = (p && p.error) || r.note ||
+    (r.detected ? `${r.detected.why}${r.detected.warn ? ' — ' + r.detected.warn : ''}` : '');
+  $('p-status').innerHTML = (p && p.error) || r.note ? `<span class="err">${esc(note)}</span>` : esc(note);
+  if (live && $('p-frame').src.indexOf(p.url) !== 0) frameSrc(p.url);
+  if (!p || p.state === 'stopped') {
+    $('p-frame').classList.add('hidden');
+    $('p-frame').removeAttribute('src');
+    $('p-empty').classList.remove('hidden');
+  }
+}
+
+async function loadPreview() {
+  if (!state.sel) return;
+  const q = `lane=${encodeURIComponent(state.sel)}&source=${$('p-source').value}` +
+    `&dir=${encodeURIComponent($('p-dir').value.trim())}`;
+  const r = await api('/api/preview?' + q);
+  // A running preview names its own settings; a stopped one takes the tree's
+  // suggestion, so Start does the obvious thing without being configured.
+  if (r.preview && r.preview.state !== 'stopped') {
+    $('p-mode').value = r.preview.mode;
+    $('p-cmd').value = r.preview.cmd || '';
+  } else if (r.detected) {
+    $('p-mode').value = r.detected.mode;
+    $('p-cmd').value = r.detected.cmd || '';
+    if (r.detected.dir && !$('p-dir').value.trim()) $('p-dir').value = r.detected.dir;
+  }
+  applyPreviewMode();
+  renderPreview(r);
+}
+
+async function startPreview() {
+  if (!state.sel) return;
+  $('p-status').textContent = 'starting…';
+  state.pstamp = null;
+  const r = await post('/api/preview/start', {
+    lane: state.sel, source: $('p-source').value, dir: $('p-dir').value.trim(),
+    mode: $('p-mode').value, cmd: $('p-cmd').value,
+  });
+  if (!r.ok) {
+    $('p-status').innerHTML = `<span class="err">${esc(r.error || 'failed')}</span>`;
+    return;
+  }
+  renderPreview(r);
+}
+
+async function stopPreview() {
+  if (!state.sel) return;
+  await post('/api/preview/stop', { lane: state.sel });
+  state.preview = null;
+  state.pstamp = null;
+  loadPreview();
+}
+
+/** Poll while the tab is open: a command takes a while to say where it landed,
+ *  and a worker editing the tree is the whole reason to be looking. */
+async function previewTick() {
+  if (!previewActive() || !state.sel) return;
+  const p = state.preview;
+  if (!p || p.state === 'stopped') return;
+  if (p.state !== 'running') return loadPreview();
+  if (!$('p-auto').checked) return;
+  const r = await api('/api/preview/stamp?lane=' + encodeURIComponent(state.sel));
+  if (!r.ok) return loadPreview();
+  if (r.state !== 'running') return loadPreview();
+  if (state.pstamp && state.pstamp !== r.stamp && r.url) frameSrc(r.url);
+  state.pstamp = r.stamp;
+}
+
+$('btn-p-start').onclick = startPreview;
+$('btn-p-stop').onclick = stopPreview;
+$('btn-p-reload').onclick = () => state.preview && state.preview.url && frameSrc(state.preview.url);
+$('p-mode').onchange = applyPreviewMode;
+$('p-source').onchange = () => { $('p-dir').value = ''; loadPreview(); };
+$('p-dir').onchange = loadPreview;
+$('btn-p-log').onclick = () => $('p-out').classList.toggle('hidden');
+$('p-width').onchange = () => {
+  const w = $('p-width').value;
+  $('p-frame').style.width = w === '0' ? '100%' : w + 'px';
+  $('p-stage').classList.toggle('narrow', w !== '0');
+};
+
+setInterval(previewTick, 1500);
 
 // ---------------------------------------------------------------- consults
 //
@@ -2663,7 +3788,9 @@ function showTab(name) {
   // Loaded on open, not on every poll: it reads a file and a store off disk, and
   // nothing in it changes between ticks except when a goal finishes.
   if (name === 'direction') loadDirection();
+  if (name === 'specs') loadSpec();
   if (name === 'history' && !state.history.length) loadHistory();
+  if (name === 'preview' && state.sel) loadPreview();
 }
 
 document.querySelectorAll('.tab').forEach((t) =>
@@ -2684,7 +3811,9 @@ $('dock-toggle').onclick = () => {
 wireLaneAdd();
 wireGoals();
 wireDirection();
+wireSpecs();
 wireMission();
+wireReports();
 refresh();
 loadCredits();
 loadChat();

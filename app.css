@@ -313,6 +313,64 @@ pre.diff, .ruling {
 }
 .ruling-item:hover { background: var(--panel2); }
 
+/* ---------- preview ---------- */
+
+.preview-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+.preview-bar .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+.preview-bar .dot.ok { background: var(--ok); }
+.preview-bar .dot.warn { background: var(--warn); }
+.preview-bar .dot.bad { background: var(--bad); }
+.preview-bar .p-url {
+  color: var(--accent);
+  text-decoration: none;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.preview-bar .p-url:hover { text-decoration: underline; }
+
+/* White, and only here. Every other surface in this console is dark, but a
+   site being previewed is not ours to theme - an unstyled page on our
+   background would look like a page with a bug in it. */
+.preview-stage {
+  flex: 1 1 auto;
+  min-height: 240px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: auto;
+}
+.preview-stage.narrow { background: var(--bg); display: flex; justify-content: center; }
+.preview-stage .empty { background: var(--panel); height: 100%; }
+#p-frame { width: 100%; height: 100%; border: 0; background: #fff; display: block; }
+#p-frame.hidden { display: none; }
+
+.preview-log {
+  flex: 0 0 auto;
+  max-height: 30%;
+  overflow: auto;
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* ---------- transcript ---------- */
 
 .log {
@@ -492,6 +550,10 @@ pre.diff, .ruling {
 .dm.in .dm-body { background: #14251a; }
 .dm.in.bad .dm-body { background: #2a1414; }
 .dm.note .dm-body { background: transparent; border: 1px dashed var(--line); color: var(--muted); }
+/* Quieter than a note, because nothing is waiting on it. A worker saw something
+ * on its way past and said so; the report is where it gets read properly. */
+.dm.idea .dm-body { background: transparent; color: var(--muted); font-style: italic;
+                    border-left: 2px solid var(--line); border-radius: 0; }
 .dm.esc .dm-body { background: #2b2410; border-left: 3px solid var(--warn); }
 .dm.rule .dm-body { background: #241a33; border-left: 3px solid #a78bfa; }
 
@@ -577,6 +639,34 @@ pre.diff, .ruling {
 
 .switch { display: flex; align-items: center; gap: 9px; cursor: pointer; }
 .switch input { width: auto; margin: 0; cursor: pointer; }
+
+/* ---------- reports ---------- */
+
+.rp-since {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 8px 10px;
+  background: var(--panel2, var(--panel));
+  font-size: 12px;
+}
+/* Nothing moved is not a warning, it is just the answer. */
+.rp-since.quiet { border-left-color: var(--muted); color: var(--muted); }
+
+.rp-list { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+.rp-row { display: flex; gap: 10px; align-items: baseline; font-size: 12px; }
+.rp-row a { color: var(--accent); flex: 0 0 auto; }
+.rp-row .rp-what { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; }
+
+/* What the solver made of a report. It is a reading, not a decision, so it sits
+ * below the list rather than replacing it, and nothing in it is a live control
+ * except the goal ids, which only navigate. */
+.rp-solved:empty { display: none; }
+.rp-solved { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.rp-solved h4 { margin: 12px 0 4px; }
+.rp-reading { font-size: 13px; line-height: 1.5; }
+.rp-sol { margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.5; }
+.rp-sol li { margin-bottom: 6px; }
 
 /* The backend choice sits above the switches because it decides whether they
  * are relevant at all, and its readiness note reads on the same line. */
@@ -731,6 +821,18 @@ pre.diff, .ruling {
 .fi-x:hover { color: var(--fg); border-color: var(--muted); }
 .fi.more { color: var(--muted); border-left-color: transparent; font-size: 11px; cursor: pointer; }
 .fi.more:hover { color: var(--fg); }
+.fi-settle { display: flex; align-items: center; gap: 8px; padding: 6px 0 2px; font-size: 11px; }
+.fi-settle button {
+  padding: 2px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  background: none;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+}
+.fi-settle button:hover:not(:disabled) { color: var(--fg); border-color: var(--muted); }
+.fi-settle button:disabled { opacity: 0.5; cursor: default; }
 
 /* ---------------------------------------------------------- obligations
    Standing chores whose check currently says no. Deliberately quieter than a
@@ -913,6 +1015,160 @@ pre.diff, .ruling {
    The tab about what the work is for. Sections are separated by rule rather
    than boxed: this is a document to be read top to bottom, not a dashboard of
    independent widgets, and boxing each part would invite skimming one. */
+/* Specs. One lane's design documents and the loop that sharpens them. Plain on
+   purpose: the interesting thing on this pane is an argument between two models,
+   and styling it as a dashboard would make it look decided. */
+.specs { padding: 4px 2px 40px; overflow: auto; font-size: 12px; }
+.sp-head { color: var(--muted); font-size: 11px; line-height: 1.6; padding: 2px 0 12px; }
+/* A lane with nothing under docs/spec/. Marked, never hidden. */
+.sp-gap { color: var(--bad); font-size: 11.5px; line-height: 1.6; padding: 2px 0 8px; }
+
+/* The two whole-lane actions, and the queue they drive. */
+.sp-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 0 0 10px; }
+.sp-bar button {
+  padding: 3px 11px; border-radius: 10px; cursor: pointer; font-size: 11px;
+  background: #23303f; border: 1px solid #3a5570; color: #cfe2f5;
+}
+.sp-bar button:hover:not(:disabled) { background: #2c3d51; }
+.sp-bar button:disabled { opacity: .5; cursor: default; }
+.sp-bar .muted { font-size: 11px; }
+
+.sp-plan {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  border: 1px solid var(--line); border-radius: 5px; background: var(--panel);
+  padding: 6px 9px; margin: 0 0 10px; font-size: 11.5px;
+}
+.sp-plan .muted { font-size: 11px; }
+.sp-plan .sp-stop { margin-left: auto; }
+
+/* One rated number. The sentence behind it is on the title, because on the
+   surface the numbers have to sit on one line together or they stop being
+   comparable, which is the only thing they are for. */
+.sp-rate { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 5px 0 0; }
+.sp-rate.muted { font-size: 11px; }
+.sp-n { font-size: 10.5px; color: var(--muted); cursor: help; }
+.sp-n b { color: var(--fg); font-weight: 500; }
+.sp-n.ok b { color: var(--ok); }
+.sp-n.warn { color: var(--warn); }
+.sp-n.live { color: #cfe2f5; }
+/* The one number that decides anything. */
+.sp-n.worth b { color: #cfe2f5; }
+.sp-gaps { margin: 5px 0 0; padding: 0 0 0 18px; font-size: 11px; line-height: 1.6; color: var(--muted); }
+/* Queue position. Left of the filename so the list reads as ordered rather than
+   as a set that happens to be in some order. */
+.sp-rank {
+  min-width: 16px; text-align: center; font-size: 10px; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 9px; padding: 0 5px;
+}
+/* The cheap button of the pair, so it does not compete with Sharpen. */
+.sp-rate-go {
+  margin-left: auto; padding: 2px 9px; border-radius: 10px; cursor: pointer;
+  background: transparent; border: 1px solid var(--line); color: var(--muted); font-size: 11px;
+}
+.sp-rate-go:hover:not(:disabled) { color: var(--fg); border-color: #3a5570; }
+.sp-rate-go:disabled { opacity: .5; cursor: default; }
+/* With a Rate button on the line, Sharpen is no longer the thing pushed right. */
+.sp-rate-go + .sp-go { margin-left: 0; }
+
+/* Documents elsewhere in the stack that look like this lane's. Deliberately not
+   a list of buttons: moving one is a decision about what a repo is for. */
+.sp-auto {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 10px; margin: 0 0 10px; font-size: 11.5px;
+  border: 1px solid var(--line); border-radius: 4px; background: var(--panel2);
+}
+.sp-auto label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.sp-auto .muted { font-size: 11px; }
+.sp-stopped, .sp-autolog, .sp-working, .sp-dir {
+  flex-basis: 100%; font-size: 11px; line-height: 1.6;
+}
+.sp-stopped { color: var(--warn); }
+.sp-working { display: flex; align-items: center; gap: 7px; color: var(--accent); }
+.sp-working .dot {
+  width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto;
+  background: var(--accent); animation: pulse 1.4s ease-in-out infinite;
+}
+.sp-dir { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-top: 2px; }
+.sp-dir button {
+  background: #22303f; border: 1px solid var(--line); color: var(--fg);
+  border-radius: 3px; padding: 3px 9px; font-size: 11px; cursor: pointer;
+}
+.sp-dir button:hover:not(:disabled) { background: #2c3d51; }
+.sp-dir button:disabled { opacity: .5; cursor: default; }
+
+.sp-found { padding: 4px 0 10px; }
+.sp-cand {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 3px 0; font-size: 11.5px;
+}
+.sp-cand code { color: var(--fg); }
+
+/* The draft worker while it is out. Reads as live work rather than as a
+   message, because it is the only thing on the tab that is still happening. */
+.sp-drafting {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 6px 0 10px; padding: 8px 10px; font-size: 11.5px; line-height: 1.6;
+  border: 1px solid var(--line); border-left: 2px solid var(--accent);
+  border-radius: 4px; background: #16202b;
+}
+/* `.dot` is scoped to .health/.run/.preview-bar, so it needs its own rule here
+   or it renders as a span with no size - present in the markup, invisible on
+   the screen, which is the exact failure this whole strip exists to fix. */
+.sp-drafting .dot {
+  width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto;
+  background: var(--accent); animation: pulse 1.4s ease-in-out infinite;
+}
+.sp-drafting code { color: var(--fg); }
+.sp-drafting .muted { font-size: 11px; }
+.sp-watch {
+  background: #22303f; border: 1px solid var(--line); color: var(--fg);
+  border-radius: 3px; padding: 2px 8px; font-size: 11px; cursor: pointer;
+}
+.sp-watch:hover { background: #2c3d51; }
+
+.sp-file { border-top: 1px solid var(--line); padding: 10px 0 8px; }
+.sp-file-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sp-file-head code { color: var(--fg); font-size: 12px; }
+/* Pushed right so it is the last thing on the line rather than something you
+   land on while reading the filename. */
+.sp-go {
+  margin-left: auto; padding: 2px 10px; border-radius: 10px; cursor: pointer;
+  background: #23303f; border: 1px solid #3a5570; color: #cfe2f5; font-size: 11px;
+}
+.sp-go:hover:not(:disabled) { background: #2c3d51; }
+.sp-go:disabled { opacity: .5; cursor: default; }
+
+.sp-run { margin: 8px 0 0; border: 1px solid var(--line); border-radius: 5px; background: var(--panel); }
+.sp-run summary { cursor: pointer; padding: 5px 9px; font-size: 11.5px; color: var(--muted); }
+.sp-badge { font-size: 10.5px; border: 1px solid var(--line); border-radius: 10px; padding: 1px 8px; }
+.sp-badge.ok { color: var(--ok); border-color: rgba(74, 222, 128, .3); }
+.sp-badge.warn { color: var(--warn); border-color: rgba(251, 191, 36, .3); }
+.sp-badge.bad { color: var(--bad); border-color: rgba(248, 113, 113, .3); }
+.sp-badge.live { color: #cfe2f5; border-color: #3a5570; }
+.sp-badge.muted { opacity: .7; }
+
+.sp-round { border-top: 1px solid var(--line); padding: 7px 10px 9px; }
+.sp-who { font-size: 11px; color: var(--muted); line-height: 1.6; }
+.sp-v { font-size: 10.5px; }
+.sp-v.ok { color: var(--ok); }
+.sp-v.bad { color: var(--warn); }
+.sp-defects { margin: 6px 0 0; padding: 0 0 0 20px; font-size: 11.5px; line-height: 1.65; }
+.sp-defects li { margin: 0 0 4px; }
+/* The writer's reply, set apart from the demands it is answering - reading them
+   as one block is how you end up believing whichever spoke last. */
+.sp-reply { margin: 8px 0 0; border-left: 2px solid var(--line); padding: 0 0 0 9px; }
+.sp-reply pre {
+  margin: 4px 0 0; font-family: var(--mono); font-size: 11px; line-height: 1.55;
+  white-space: pre-wrap; word-break: break-word; color: var(--muted);
+  max-height: 260px; overflow: auto;
+}
+.sp-act { border-top: 1px solid var(--line); padding: 7px 10px; }
+.sp-stop {
+  padding: 2px 10px; border-radius: 10px; cursor: pointer; font-size: 11px;
+  background: transparent; border: 1px solid rgba(248, 113, 113, .35); color: var(--bad);
+}
+.sp-stop:hover:not(:disabled) { background: rgba(248, 113, 113, .08); }
+
 .direction { padding: 4px 2px 40px; overflow: auto; }
 .dsec { border-top: 1px solid var(--line); padding: 14px 0 4px; }
 .dsec:first-child { border-top: none; }
@@ -1050,6 +1306,33 @@ pre.diff, .ruling {
 .barrow input[type=range] { flex: 1; max-width: 260px; }
 .barout { font-variant-numeric: tabular-nums; color: var(--fg); }
 .setcal { margin: 6px 0 10px; }
+
+/* -------------------------------------------------- the database panel
+   A label column and a value column, because every line here is a fact about
+   where your work is and the question is always the same one. */
+.dbbox, .dbsync, .dbreport {
+  font-size: 12px; line-height: 1.7; margin: 6px 0 10px;
+  border-left: 2px solid var(--line); padding: 6px 0 6px 10px;
+}
+.dbrow { display: flex; gap: 10px; align-items: baseline; }
+.dbrow .k {
+  color: var(--muted); flex: 0 0 130px; text-align: right;
+  font-size: 11px; text-transform: lowercase;
+}
+/* A list of names is a list, not a paragraph: without its own wrapping box
+   each name becomes a flex item and the row breaks them mid-word. */
+.dbrow .v { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 4px 10px; }
+.dbrow code { color: var(--accent); }
+.dbrow .path { word-break: break-all; }
+.dbrow b { font-variant-numeric: tabular-nums; }
+.dbreport.good { border-left-color: var(--ok); }
+.dbreport.err { border-left-color: var(--bad); }
+.dbreport.hidden { display: none; }
+.barrow input.num {
+  width: 84px; background: var(--bg); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px;
+  font-variant-numeric: tabular-nums;
+}
 
 /* An open question is not an objective and does not get the accent border -
    nothing here can be adopted, only answered, and only by Travis. */

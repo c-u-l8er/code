@@ -9,3 +9,6 @@ __pycache__/
 config.json
 packets/
 rulings/
+
+# Server log from a locally launched console.
+.amp-server.log
