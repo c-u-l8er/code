@@ -7025,6 +7025,244 @@ def auto_sharpen() -> list[dict]:
     return []
 
 
+def direction_state(lane: str | None = None) -> dict:
+    """Where the direction itself stands. Derived, never stored.
+
+    "Nowhere left to go" is a real answer and it is the one the panel used to be
+    worst at showing: it looked exactly like "nothing has run yet", which is a
+    completely different situation with a completely different fix. These are the
+    facts that tell them apart, and they are kept separate on purpose -
+    proposals waiting is about the list, gates up is about the workspace, and
+    merging them into one traffic light would hide whichever was true.
+    """
+    store = direction_store()
+    props = [p for p in store.get("proposals", [])
+             if p.get("state") == "open" and p.get("kind") == "goal"
+             and (not lane or p.get("lane") == lane)]
+    held: dict[str, int] = {}
+    ready = 0
+    for p in props:
+        why = proposal_hold(p)
+        if why:
+            held[why] = held.get(why, 0) + 1
+        else:
+            ready += 1
+
+    ex = [r for r in store.get("reviews", []) if r.get("kind") == "explore"]
+    last_ex = max(ex, key=lambda r: r.get("at") or "") if ex else None
+    cases = [r for r in store.get("reviews", []) if r.get("kind") == "case"]
+    last_case = max(cases, key=lambda r: r.get("at") or "") if cases else None
+    gates = escalations(lane)
+    running = sum(1 for g in goals(lane) if g.get("state") == "running")
+
+    if props and ready:
+        verdict = "ready"
+        headline = (f"{ready} objective(s) can start"
+                    + (f", {len(props) - ready} waiting on you" if len(props) - ready else ""))
+    elif props:
+        verdict = "held"
+        headline = (f"{len(props)} objective(s) waiting, none of them able to start - "
+                    + "; ".join(f"{n} because {w}" for w, n in sorted(held.items(),
+                                                                     key=lambda kv: -kv[1])))
+    elif last_ex and last_ex.get("exhausted"):
+        verdict = "nowhere"
+        headline = ("nowhere left to go that this stack can see. Explored "
+                    + str(last_ex.get("at") or "")[:16].replace("T", " ")
+                    + (" including the web" if last_ex.get("web") else "")
+                    + " and it found nothing worth proposing.")
+    elif last_ex:
+        verdict = "empty"
+        headline = "nothing waiting. The last look found things but none of them survived."
+    else:
+        verdict = "unexplored"
+        headline = ("nothing waiting, and nobody has gone looking. A review only fires when "
+                    "a goal finishes.")
+
+    return {
+        "verdict": verdict,
+        "headline": headline,
+        "waiting": len(props),
+        "ready": ready,
+        "running": running,
+        "held": [{"why": w, "n": n} for w, n in sorted(held.items(), key=lambda kv: -kv[1])],
+        # Kept beside the verdict rather than folded into it. A lane can have
+        # objectives ready to start AND be unable to start them, and one number
+        # cannot say both.
+        "gates": gates,
+        "auto_adopt": bool(store.get("auto_adopt")),
+        "last_explore": ({k: last_ex.get(k) for k in
+                          ("id", "at", "lane", "web", "exhausted", "why_exhausted",
+                           "assessment", "tokens")}
+                         if last_ex else None),
+        "last_explore_found": sum(1 for p in store.get("proposals", [])
+                                  if last_ex and p.get("review_id") == last_ex.get("id")),
+        "last_case": last_case,
+        # The button that writes the case is offered when there is a case to
+        # write: the direction is stuck, or the workspace is.
+        "case_worth_asking": verdict in ("nowhere", "empty", "held", "unexplored") or bool(gates),
+    }
+
+
+# --------------------------------------------------------------------- the case
+#
+# What to do when the honest answer is "nowhere". Exploring can tell you the
+# stack has run out of moves; it cannot tell you why, because the reason is
+# almost never in the code - it is a decision nobody has made. This writes that
+# up and puts it in front of the operator, which is the only place it can be
+# settled. It proposes no objective, because there is none to propose: that is
+# the situation being described.
+
+CASE_SYSTEM = (
+    "You are the consulting architect. The operator's stack has run out of moves it can "
+    "make by itself, and you are being asked to write up why and put it in front of them.\n\n"
+    "You are given the mission, the doctrine, where each lane's evidence has got to, what "
+    "the work has reported, everything proposed and everything turned down, the thresholds "
+    "currently holding the fleet, and what the last look for new direction concluded.\n\n"
+    "This is NOT a request for another objective. If there were one worth proposing it "
+    "would already be on the list. Almost always the real blocker is a decision nobody has "
+    "made - what counts as good enough, what to spend, what to publish, what to entrench, "
+    "which of two directions to take - and the work cannot make it. Find it and state it.\n\n"
+    "Reply with one JSON object and nothing else:\n"
+    "{\n"
+    '  "situation": "what is actually true right now, 3-5 sentences, no consolation",\n'
+    '  "blocked_on": [{"what": "the specific thing", '
+    '"whose": "operator|work|world",\n'
+    '                  "why": "why nothing moves until it is settled"}],\n'
+    '  "decisions": [{"decision": "the question only the operator can answer, as a '
+    'question",\n'
+    '                 "options": ["the real alternatives, including doing nothing"],\n'
+    '                 "recommend": "which one, and it must be one of the options",\n'
+    '                 "because": "the reason, in terms of the mission",\n'
+    '                 "unlocks": "what specifically becomes possible once it is settled",\n'
+    '                 "cost_of_waiting": "what it costs to leave this open"}],\n'
+    '  "direction_change": {"what": "a change to the direction itself, if the honest '
+    'reading is that the current one is wrong", "why": "...", "instead": "..."} or null,\n'
+    '  "nothing_needed": false,\n'
+    '  "why_nothing_needed": "if the stack is genuinely fine and simply between things, '
+    'say so plainly"\n'
+    "}\n\n"
+    "Rules:\n"
+    "- Name the decision, do not make it. Recommending is your job; deciding is the "
+    "operator's, and writing as though it were settled is the one thing you may not do.\n"
+    "- `whose` must be honest. `operator` is money, credentials, accounts, deploy targets, "
+    "what counts as good enough, what to publish, what to entrench. `work` is something a "
+    "worker could go and do - and if anything is `work`, say in `situation` why it is not "
+    "already proposed, because that is a hole in the pipeline and worth more than the case. "
+    "`world` is something that does not exist yet, anywhere.\n"
+    "- At most three decisions, ordered by what unlocks most. A list of everything that "
+    "could be decided is worthless; the operator needs the one to make first.\n"
+    "- `cost_of_waiting` may not be rhetorical. If leaving it open costs nothing much, say "
+    "that - it is useful, and it is how the operator knows which to ignore.\n"
+    "- `direction_change` is for when the mission or the doctrine is what is wrong, not the "
+    "plan under it. It is a serious thing to say and usually null. Say it when it is true.\n"
+    "- If the stack is simply between things and needs nothing, set `nothing_needed` and "
+    "say so. That is a better answer than an invented crisis."
+)
+
+
+def _case_context(lane: str | None) -> str:
+    st = direction_state(lane)
+    parts = [_explore_context(lane, web=False),
+             "# Where the direction itself stands\n\n" + st["headline"]]
+    if st["held"]:
+        parts.append("## Waiting objectives nothing will start\n\n"
+                     + "\n".join(f"- {h['n']} because {h['why']}" for h in st["held"]))
+    if st["gates"]:
+        parts.append("# Thresholds currently holding the whole workspace\n\n"
+                     + "\n".join(f"- **{g['gate']}** (at {g['at']}, your limit {g['limit']}): "
+                                 f"{g['why']}" for g in st["gates"]))
+    ex = st["last_explore"]
+    if ex:
+        parts.append("# What the last look for new direction concluded\n\n"
+                     + f"{ex.get('assessment') or ''}\n\n"
+                     + (f"It concluded there was nowhere left to go: {ex.get('why_exhausted')}"
+                        if ex.get("exhausted") else
+                        f"It proposed {st['last_explore_found']} thing(s)."))
+    return "\n\n".join(parts)
+
+
+def direction_case(lane: str | None = None) -> dict:
+    """Write up why the stack is stuck and put it in front of the operator.
+
+    Costs one architect call. Produces no objective - if there were one worth
+    proposing it would be on the list already, and the absence is the point.
+    """
+    if not architect_available():
+        return {"ok": False, "error": architect_off_reason()}
+    model = config().get("consult_model", DEFAULT_CONSULT)
+    resp = architect_chat([{"role": "system", "content": CASE_SYSTEM},
+                           {"role": "user", "content": _case_context(lane)}], model)
+    text = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    out = _json_reply(text)
+    if not out:
+        return {"ok": False, "error": "the architect's answer could not be read as JSON",
+                "raw": text[:2000]}
+
+    def _dec(d):
+        opts = [str(o)[:300] for o in (d.get("options") or []) if str(o).strip()][:5]
+        rec = str(d.get("recommend") or "")[:300]
+        return {"decision": str(d.get("decision") or "")[:500], "options": opts,
+                "recommend": rec,
+                # Said out loud rather than silently corrected. A recommendation
+                # that is not one of the options is the architect having drifted
+                # off the question it was asked, and hiding that would leave the
+                # operator choosing between three things and told to pick a
+                # fourth.
+                "off_options": bool(rec and opts and rec not in opts),
+                "because": str(d.get("because") or "")[:600],
+                "unlocks": str(d.get("unlocks") or "")[:400],
+                "cost_of_waiting": str(d.get("cost_of_waiting") or "")[:400]}
+
+    ch = out.get("direction_change")
+    rec = {"id": "d" + uuid.uuid4().hex[:9], "at": now(), "lane": lane,
+           "kind": "case", "goal_id": None, "goal": "", "ladder": [],
+           "assessment": str(out.get("situation") or "")[:2000],
+           "blocked_on": [{"what": str(b.get("what") or "")[:400],
+                           "whose": str(b.get("whose") or "")[:20],
+                           "why": str(b.get("why") or "")[:600]}
+                          for b in (out.get("blocked_on") or []) if isinstance(b, dict)][:6],
+           "decisions": [_dec(d) for d in (out.get("decisions") or [])
+                         if isinstance(d, dict)][:3],
+           "direction_change": ({"what": str(ch.get("what") or "")[:600],
+                                 "why": str(ch.get("why") or "")[:600],
+                                 "instead": str(ch.get("instead") or "")[:600]}
+                                if isinstance(ch, dict) and str(ch.get("what") or "").strip()
+                                else None),
+           "nothing_needed": bool(out.get("nothing_needed")),
+           "why_nothing_needed": str(out.get("why_nothing_needed") or "")[:600],
+           "exhausted": False, "why_exhausted": "",
+           "tokens": (resp.get("usage") or {}).get("total_tokens") or 0}
+
+    with _DIRECTION_LOCK:
+        store = direction_store()
+        store.setdefault("reviews", []).append(rec)
+        _save_direction(store)
+
+    # Into the orchestrator thread in full, not summarised. This is the one
+    # thing the harness produces that is addressed to Travis rather than about
+    # the work, and it is useless if it has to be gone looking for.
+    body = [f"the case for {lane or 'the whole stack'}: {rec['assessment']}"]
+    for d in rec["decisions"]:
+        body.append(f"\n— YOUR CALL: {d['decision']}"
+                    + (f"\n  options: {' | '.join(d['options'])}" if d["options"] else "")
+                    + (f"\n  it recommends: {d['recommend']}" if d["recommend"] else "")
+                    + (" (which is not one of the options it gave)" if d["off_options"] else "")
+                    + (f"\n  because: {d['because']}" if d["because"] else "")
+                    + (f"\n  unlocks: {d['unlocks']}" if d["unlocks"] else "")
+                    + (f"\n  leaving it open costs: {d['cost_of_waiting']}"
+                       if d["cost_of_waiting"] else ""))
+    if rec["direction_change"]:
+        body.append(f"\n— IT THINKS THE DIRECTION ITSELF IS WRONG: "
+                    f"{rec['direction_change']['what']} — {rec['direction_change']['why']} "
+                    f"Instead: {rec['direction_change']['instead']}")
+    if rec["nothing_needed"]:
+        body.append(f"\n— it says nothing is needed: {rec['why_nothing_needed']}")
+    add_note("\n".join(body)[:4000], lane=lane)
+
+    rec["ok"] = True
+    return rec
+
+
 def direction_view(lane: str | None = None) -> dict:
     """Everything the Direction tab shows, assembled in one place."""
     sections = doctrine_sections()
@@ -7034,7 +7272,12 @@ def direction_view(lane: str | None = None) -> dict:
         props = [p for p in props if p.get("lane") == lane]
     revs = sorted(store.get("reviews", []), key=lambda r: r.get("at") or "", reverse=True)
     if lane:
-        revs = [r for r in revs if r.get("lane") == lane]
+        # Explores and cases are about the whole stack, so filtering them by the
+        # lane that happened to be selected when the button was pressed hides
+        # them from every other lane - which is how a 90-second architect call
+        # can run, record, and look to the operator like nothing happened.
+        revs = [r for r in revs
+                if r.get("lane") == lane or r.get("kind") in ("explore", "case")]
     thesis = _section(sections, "thesis")
     return {
         "thesis": thesis,
@@ -7065,6 +7308,7 @@ def direction_view(lane: str | None = None) -> dict:
         # So the button can say what it is about to do rather than promising
         # research and then answering from recall.
         "can_web": web_search_backend(),
+        "state": direction_state(lane),
         "doctrine_state": doctrine_state(),
         "doctrine_path": str(DOCTRINE_PATH),
         # A lane whose goal is finished and never reviewed is exactly where the

@@ -1544,16 +1544,98 @@ function originLine(p) {
     (src ? ` — ${src}` : '') + `</div>`;
 }
 
-/** The other way a proposal can appear: asked for, rather than waited for. */
+const VERDICT_LINE = {
+  ready: ['ok', 'there is somewhere to go'],
+  held: ['warn', 'there is somewhere to go, and nothing will go there'],
+  nowhere: ['bad', 'nowhere left to go'],
+  empty: ['warn', 'nothing waiting'],
+  unexplored: ['warn', 'nobody has looked'],
+};
+
+/** What the last look actually concluded. Without this the button is a button
+    that spends 90 seconds and changes nothing on screen. */
+function lastExplore(s) {
+  const e = s.last_explore;
+  if (!e) return '';
+  const when = String(e.at || '').slice(0, 16).replace('T', ' ');
+  const how = `looked across every lane${e.web ? ' and searched the web' : ''}, ${esc(when)}`;
+  if (e.exhausted) {
+    return `<div class="dnowhere"><b>Last look: nothing worth proposing.</b>` +
+      `<div class="muted">${esc(how)}</div>` +
+      (e.assessment ? `<div class="md">${md(e.assessment)}</div>` : '') +
+      (e.why_exhausted ? `<div class="why-x">Why nothing: ${mdi(e.why_exhausted)}</div>` : '') +
+      `</div>`;
+  }
+  return `<div class="dlast"><b>Last look found ${s.last_explore_found || 0}.</b> ` +
+    `<span class="muted">${esc(how)}</span>` +
+    (e.assessment ? `<div class="md">${md(e.assessment)}</div>` : '') + `</div>`;
+}
+
+/** The case: what is actually stopping this, and which decisions are Travis's. */
+function caseBlock(c) {
+  if (!c) return '';
+  const when = String(c.at || '').slice(0, 16).replace('T', ' ');
+  return `<div class="dcase"><div class="muted">the case, ${esc(when)}` +
+    `${c.lane ? ' · ' + esc(c.lane) : ' · whole stack'} — also in your thread</div>` +
+    `<div class="md">${md(c.assessment || '')}</div>` +
+    (c.blocked_on || []).map((b) =>
+      `<div class="dblock"><span class="whose ${esc(b.whose)}">${esc(b.whose)}</span>` +
+      `${mdi(b.what)}<div class="muted">${mdi(b.why)}</div></div>`).join('') +
+    (c.decisions || []).map((d) =>
+      `<div class="ddec"><b>${mdi(d.decision)}</b>` +
+      (d.options || []).map((o) =>
+        `<div class="dopt${o === d.recommend ? ' rec' : ''}">${mdi(o)}` +
+        (o === d.recommend ? ' <span class="tag">it recommends this</span>' : '') +
+        `</div>`).join('') +
+      (d.off_options
+        ? `<div class="warnt">it recommends ${mdi(d.recommend)}, which is not one of the ` +
+          `options it gave</div>` : '') +
+      (d.because ? `<div class="muted">because ${mdi(d.because)}</div>` : '') +
+      (d.unlocks ? `<div class="unlocks">unlocks: ${mdi(d.unlocks)}</div>` : '') +
+      (d.cost_of_waiting
+        ? `<div class="muted">leaving it open costs: ${mdi(d.cost_of_waiting)}</div>` : '') +
+      `</div>`).join('') +
+    (c.direction_change
+      ? `<div class="dchange"><b>It thinks the direction itself is wrong.</b>` +
+        `<div>${mdi(c.direction_change.what)}</div>` +
+        `<div class="muted">${mdi(c.direction_change.why)}</div>` +
+        `<div>Instead: ${mdi(c.direction_change.instead)}</div></div>` : '') +
+    (c.nothing_needed
+      ? `<div class="good">It says nothing is needed: ${mdi(c.why_nothing_needed)}</div>` : '') +
+    `</div>`;
+}
+
+/** The honest state of the direction, the two buttons that can change it, and
+    what the last attempt concluded. */
 function exploreBar(d) {
+  const s = d.state || {};
   const web = !!d.can_web;
-  return `<div class="dexp"><button id="btn-explore" class="primary">` +
+  const [cls, word] = VERDICT_LINE[s.verdict] || ['warn', 'unclear'];
+  const gates = (s.gates || []).map((g) =>
+    `<div class="dgate"><b>${esc(g.gate)}</b> at ${esc(g.at)}, your limit ${esc(g.limit)}` +
+    `<div class="muted">${mdi(g.why)}</div></div>`).join('');
+
+  return `<div class="dstate ${cls}">` +
+    `<div class="dverdict">${esc(word)}</div>` +
+    `<div class="dhead">${esc(s.headline || '')}</div>` +
+    (gates
+      ? `<div class="dgates"><div class="muted">and nothing starts by itself while these ` +
+        `stand${s.auto_adopt ? '' : ' — though adopt-automatically is off anyway'}:</div>` +
+        gates + `</div>`
+      : '') +
+    `<div class="dexp"><button id="btn-explore" class="primary">` +
     (web ? 'Look for more — search, cross-reference, brainstorm' : 'Look for more') +
-    `</button><span class="muted" id="explore-status">` +
-    `reads every lane at once and cross-references what each has reported` +
-    (web ? ', and searches the web'
-         : '. This architect backend cannot search the web, so nothing will be cited') +
-    `. A review needs a goal to have finished; this does not.</span></div>`;
+    `</button>` +
+    (s.case_worth_asking
+      ? `<button id="btn-case">Put the case to me</button>` : '') +
+    `<span class="muted" id="explore-status">` +
+    `looks across every lane at once${web ? ' and searches the web' : ''}` +
+    (s.case_worth_asking
+      ? '. The second writes up what is actually stopping this and which calls are yours, ' +
+        'into your thread.'
+      : '.') +
+    `</span></div>` +
+    lastExplore(s) + caseBlock(s.last_case) + `</div>`;
 }
 
 function renderDirection(d) {
@@ -1648,20 +1730,36 @@ function renderDirection(d) {
     ex.disabled = true;
     ex.textContent = d.can_web ? 'searching and cross-referencing…' : 'cross-referencing…';
     $('explore-status').textContent =
-      'one architect call across every lane. This takes a while.';
+      'one architect call across every lane. This takes a minute or two.';
     const r = await post('/api/direction/explore', { lane: state.sel || null });
     const rev = r.review || {};
     const n = (rev.proposals || []).length;
-    // Into the pane head, not the line above: loadDirection rebuilds this
-    // section and would throw the answer away with the button that asked for it.
+    // The result itself is rendered by the state block, which reads it back
+    // from the store - so it survives this reload and every one after it. This
+    // line is only the receipt for the click.
     $('dir-status').innerHTML = r.ok
       ? (n ? `${n} new ${n === 1 ? 'thing' : 'things'} to look at`
-           : 'nothing new worth proposing' +
-             (rev.why_exhausted ? ` — ${esc(rev.why_exhausted)}` : '')) +
+           : 'looked, found nothing worth proposing') +
         ((rev.misfiled || []).length
           ? ` · ${rev.misfiled.length} dropped for naming a lane that does not exist` : '')
       : `<span class="err">${esc(r.error || 'failed')}</span>`;
     loadDirection();
+  });
+
+  const cs = $('btn-case');
+  if (cs) cs.addEventListener('click', async () => {
+    cs.disabled = true; cs.textContent = 'writing it up…';
+    $('explore-status').textContent =
+      'working out what is actually stopping this, and which calls are yours.';
+    const r = await post('/api/direction/case', { lane: state.sel || null });
+    const c = r.case || {};
+    $('dir-status').innerHTML = r.ok
+      ? `the case is in your thread` +
+        ((c.decisions || []).length ? ` — ${c.decisions.length} decision(s) for you` : '') +
+        (c.direction_change ? ' · it thinks the direction itself is wrong' : '')
+      : `<span class="err">${esc(r.error || 'failed')}</span>`;
+    loadDirection();
+    if (typeof loadChat === 'function') loadChat();
   });
 
   el.querySelectorAll('.fi-x').forEach((b) =>

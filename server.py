@@ -907,6 +907,17 @@ def do_direction_explore(body: dict) -> dict:
     return {"ok": bool(rev.get("ok")), "review": rev, "error": rev.get("error")}
 
 
+def do_direction_case(body: dict) -> dict:
+    """Write up why the stack is stuck and put it in the orchestrator thread.
+
+    Offered when there is nowhere left to go, because "nowhere" is nearly always
+    a decision nobody has made rather than a shortage of ideas, and the harness
+    cannot make it. Produces no objective on purpose.
+    """
+    rev = amp.direction_case(body.get("lane") or None)
+    return {"ok": bool(rev.get("ok")), "case": rev, "error": rev.get("error")}
+
+
 def do_direction_proposal(body: dict) -> dict:
     """Adopt a proposed objective as a real goal, or turn it down.
 
@@ -1910,6 +1921,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_direction_review(body))
             if u.path == "/api/direction/explore":
                 return self._send(200, do_direction_explore(body))
+            if u.path == "/api/direction/case":
+                return self._send(200, do_direction_case(body))
             if u.path == "/api/direction/proposal":
                 return self._send(200, do_direction_proposal(body))
             if u.path == "/api/direction/auto":

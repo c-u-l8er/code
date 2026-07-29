@@ -975,12 +975,58 @@ pre.diff, .ruling {
    because "the architect can't move this" is not "this is dead". */
 .dp-s.dim { opacity: .55; }
 
-/* Going looking, rather than waiting for a goal to close. Sits at the top of
-   the section it fills, because when that section is empty it is the only thing
-   on the page that can do anything about it. */
-.dexp { display: flex; align-items: baseline; gap: 12px; margin: 0 0 12px; }
+/* The state of the direction itself, above the list it is about. "Nowhere left
+   to go" used to look exactly like "nothing has run yet", which is a different
+   situation with a different fix, so the verdict is said in words and coloured
+   by which one it is. */
+.dstate { border: 1px solid var(--line); border-left-width: 3px; border-radius: 6px;
+          padding: 10px 12px; margin: 0 0 14px; }
+.dstate.ok { border-left-color: var(--ok); }
+.dstate.warn { border-left-color: var(--warn); }
+.dstate.bad { border-left-color: var(--bad); }
+.dverdict { font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+.dstate.ok .dverdict { color: var(--ok); }
+.dstate.warn .dverdict { color: var(--warn); }
+.dstate.bad .dverdict { color: var(--bad); }
+.dhead { font-size: 12.5px; margin: 3px 0 8px; line-height: 1.6; }
+
+.dgates { margin: 0 0 10px; font-size: 11px; }
+.dgate { margin: 5px 0 0; padding-left: 10px; border-left: 2px solid var(--warn); }
+.dgate b { color: var(--warn); }
+
+/* Going looking, rather than waiting for a goal to close. When the list is
+   empty this is the only thing on the page that can do anything about it. */
+.dexp { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .dexp button { flex: 0 0 auto; }
-.dexp .muted { font-size: 11px; line-height: 1.6; }
+.dexp .muted { font-size: 11px; line-height: 1.6; flex: 1 1 220px; }
+
+.dnowhere { margin: 12px 0 0; padding: 9px 11px; border-radius: 5px;
+            background: rgba(248, 113, 113, .07); font-size: 12px; }
+.dnowhere .md { margin: 5px 0 0; font-size: 12px; line-height: 1.7; }
+.why-x { margin: 6px 0 0; color: var(--muted); font-size: 11.5px; line-height: 1.6; }
+.dlast { margin: 12px 0 0; font-size: 12px; }
+.dlast .md { margin: 4px 0 0; line-height: 1.7; }
+
+/* The case. Not a proposal - a decision put in front of the operator. */
+.dcase { margin: 12px 0 0; padding: 10px 12px; border: 1px solid var(--line);
+         border-radius: 5px; font-size: 12px; }
+.dcase .md { margin: 4px 0 8px; line-height: 1.7; }
+.dblock { margin: 5px 0; font-size: 11.5px; }
+.whose { display: inline-block; margin-right: 7px; padding: 0 6px; border-radius: 3px;
+         font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+         background: var(--line); color: var(--muted); }
+.whose.operator { background: rgba(251, 191, 36, .18); color: var(--warn); }
+.whose.world { background: rgba(248, 113, 113, .15); color: var(--bad); }
+.ddec { margin: 10px 0 0; padding: 8px 10px; border-radius: 5px;
+        background: rgba(251, 191, 36, .06); border: 1px solid rgba(251, 191, 36, .22); }
+.dopt { margin: 4px 0 0; padding-left: 14px; position: relative; line-height: 1.6; }
+.dopt::before { content: '—'; position: absolute; left: 0; color: var(--muted); }
+.dopt.rec { color: var(--fg); }
+.dopt.rec::before { content: '▸'; color: var(--warn); }
+.unlocks { margin: 4px 0 0; color: var(--ok); font-size: 11.5px; }
+.dchange { margin: 10px 0 0; padding: 8px 10px; border-radius: 5px;
+           border: 1px solid var(--bad); font-size: 12px; line-height: 1.6; }
+.dchange b { color: var(--bad); }
 
 /* Where an explored proposal came from, and what was actually read. */
 .dorigin { font-size: 11px; color: var(--muted); margin: 4px 0 0; }
