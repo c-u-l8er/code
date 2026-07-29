@@ -6771,6 +6771,11 @@ CHECK_WRITE_SYSTEM = (
     "- It has to be able to fail. `true`, `echo ...`, or anything that exits 0 whatever the "
     "repository contains will be rejected before it is stored, and it would be worse than "
     "nothing: it turns an honest gap into a green tick.\n"
+    "- Assume NOTHING about what interpreters are on PATH. On this machine bare `python3` hits a "
+    "version shim and refuses, so a `python3 -c ...` check fails without ever running - which "
+    "records the condition as NOT MET on the word of a command that never executed. If you need "
+    "an interpreter, invoke one the repository itself already invokes. A check that cannot run "
+    "is removed again after it is tried, and the condition goes back to being an open gap.\n"
     "- Prefer a command that already exists in the repository - the test runner, the benchmark, "
     "the conformance script - over a shell expression you invent. Ground it in the files listed "
     "below; a check naming a file nobody has is a check that fails for the wrong reason.\n"
@@ -6797,6 +6802,42 @@ def worthless_check(cmd: str) -> str | None:
     parts = [p.strip() for p in re.split(r"&&|\|\||;|\n", cmd) if p.strip()]
     if parts and all(_ALWAYS_TRUE.match(p) for p in parts):
         return "it exits 0 whatever the repository contains, so it cannot fail"
+    return None
+
+
+# What a shell says when the command itself was never there to run. Read from
+# OUTPUT and not from an exit code, because the codes collide: this machine's
+# version shim exits 126 for a missing interpreter and plenty of real test
+# runners exit 126 for their own reasons, so the number alone cannot tell a
+# broken check apart from a failing condition.
+_NEVER_RAN = (
+    "command not found",
+    "no such file or directory",
+    "no version is set for command",   # the version shim on this machine
+    "is not recognized as an internal or external command",
+)
+
+
+def did_not_run(exit_code: int | None, output: str) -> str | None:
+    """Why this check never actually executed, or None if it ran and judged.
+
+    The mirror of `worthless_check`, and it exists because of a live run: the
+    architect proposed two perfectly reasonable `python3 -c ...` checks, and on
+    this machine bare `python3` hits a version shim that refuses. Both would
+    have been stored, run, and recorded as FAILING - and a failing condition
+    reads as "the work is not done", so the operator is sent to fix code that
+    was never the problem, while the condition itself stays unproven forever.
+
+    It is the gentler of the two failures: a check that cannot fail turns a gap
+    into a green tick, one that cannot run turns a gap into a red cross. Neither
+    is evidence, and only the first was being caught.
+    """
+    if exit_code is None or exit_code == 0:
+        return None                    # a timeout already reports itself as unrun
+    low = (output or "").lower()
+    for m in _NEVER_RAN:
+        if m in low:
+            return f"the shell answered {m!r}, so the command never ran"
     return None
 
 
@@ -6909,6 +6950,41 @@ def write_checks(gid: str, *, apply: bool = False) -> dict:
         # Only the new ones. See `run_goal_checks`: re-running the forty that
         # already passed would cost minutes and answer nothing that was asked.
         out["results"] = run_goal_checks(gid, only={p["text"] for p in proposed if p["check"]})
+
+        # A written check that turns out not to RUN is taken straight back off
+        # the goal. `worthless_check` can only read the command; whether the
+        # thing it names exists on this machine is not knowable until it is
+        # tried, and trying it is what this run just did.
+        #
+        # Keeping it would be worse than the gap it filled: `run_goal_checks`
+        # has already set `met = False` on the condition, so a command that was
+        # never there to run now reads as proof the work is not done. Removing
+        # it restores the honest state - nobody has checked this - and it can be
+        # asked again, which is the same ending a refusal gets.
+        broke = []
+        for r in out["results"]:
+            why = did_not_run(r["exit"], r.get("output") or "")
+            if why:
+                broke.append({"text": r["text"], "check": r["check"], "why": why})
+        if broke:
+            bad = {b["text"] for b in broke}
+            with _GOAL_LOCK:
+                g = load_goal(gid)
+                for d in g.get("done") or []:
+                    if d["text"] in bad and d.get("check_by") == "architect":
+                        for k in ("check", "check_by", "check_written_at", "check_why",
+                                  "check_exit", "check_at"):
+                            d.pop(k, None)
+                        # `met` was forced to False by the run above, on the
+                        # word of a command that never executed. It has no
+                        # standing to say anything about this condition.
+                        d.pop("met", None)
+                save_goal(g)
+            wrote -= len(broke)
+            out["wrote"] = wrote
+            goal_log(gid, f"{len(broke)} of those check(s) never ran on this machine and "
+                          f"were taken back off the goal")
+        out["did_not_run"] = broke
         out["tally"] = condition_tally(load_goal(gid) or {})
     return out
 

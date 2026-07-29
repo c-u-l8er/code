@@ -2959,8 +2959,17 @@ async function writeChecks(gid) {
   const a = await post('/api/pr/write-checks', { goal_id: gid, apply: true });
   if (!a.ok) { setPrLog(gid, `<span class="err">${esc(a.error)}</span>`); return; }
   const res = (a.results || []).map((x) => `exit ${x.exit}  ${x.text}`).join('\n');
+  // Said out loud, because the alternative is a count that quietly does not add
+  // up: the architect answered for four conditions, three were stored, and the
+  // fourth named a program this machine does not have. It was tried, it never
+  // ran, and it was taken back off - so that condition is still an open gap.
+  const gone = (a.did_not_run || []).length
+    ? `<div class="warn">${a.did_not_run.length} of them never ran on this machine ` +
+      `and ${a.did_not_run.length === 1 ? 'was' : 'were'} taken back off &mdash; ` +
+      `${a.did_not_run.map((b) => esc(b.check)).join(', ')}</div>`
+    : '';
   setPrLog(gid, `<span class="ok">stored ${a.wrote}, ruled ${a.ruled_uncheckable} ` +
-    `undecidable</span><pre class="dep-tail">${esc(res)}</pre>`);
+    `undecidable</span>${gone}<pre class="dep-tail">${esc(res)}</pre>`);
   loadPrs();
 }
 
