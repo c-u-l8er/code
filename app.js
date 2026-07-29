@@ -1209,6 +1209,12 @@ async function settleFindings(btn) {
       msg:
         `${n} settled` +
         ((r.retractions || []).length ? `, ${r.retractions.length} rung(s) taken back` : '') +
+        // Named separately from a retraction, because it is a different outcome:
+        // a retraction moves a lane back down the ladder, a correction moves
+        // nothing. Folding the two together would report the ladder as having
+        // changed when it has not.
+        ((r.corrections || []).length
+          ? `, ${r.corrections.length} claim(s) corrected without moving a rung` : '') +
         ((r.proposals || []).length ? `, ${r.proposals.length} proposal(s) filed` : '') +
         (kept ? ` — ${kept} left for you to read` : ''),
     };
@@ -1925,6 +1931,21 @@ function renderDirection(d) {
     (f.read_at ? '' : `<button class="fi-x" data-id="${esc(f.id)}" title="You have read this">noted</button>`) +
     `</div>`).join('');
 
+  // Claims the stack made, acted on, and later disproved — which never earned a
+  // rung, so nothing on the ladder moved for them. That is exactly why they get
+  // their own block: every other record on this page is about something that
+  // moved, so a false claim that moved nothing has nowhere else to appear, and
+  // the failure it causes is a later call confidently repeating a sentence we
+  // have already disproved. No buttons: this is a record, not a task. The line
+  // about scoring is not reassurance — it names where the correction is read.
+  const fixes = (d.corrections || []).map((c) =>
+    `<div class="dfix"><span class="tag">${esc(c.lane || '')}</span>` +
+    `<b>${mdi(c.claim || '')}</b>` +
+    (c.why ? `<div class="muted">${mdi(c.why)}</div>` : '') +
+    `<div class="muted">found false ${esc((c.at || '').slice(0, 10))}` +
+    (c.finding_id ? ` · from finding ${esc(String(c.finding_id).slice(0, 8))}` : '') +
+    `</div></div>`).join('');
+
   // The architect's open questions and the doctrine's own open theses are shown
   // in one place because they are the same kind of thing - something believed
   // and not settled - but they are not merged: only Travis can move one of these
@@ -1979,6 +2000,13 @@ function renderDirection(d) {
     `<section class="dsec"><h4>What the work has said back</h4>` +
     (fi || '<div class="empty">nothing reported yet. Workers and the architect file these ' +
       'under DOCTRINE: at the end of every report.</div>') + `</section>` +
+    (fixes
+      ? `<section class="dsec"><h4>Claims already found false</h4>` +
+        `<div class="muted">None of these was ever a rung, so nothing on the ladder was ` +
+        `taken back for them — they were simply believed, and are not true. Each one is ` +
+        `injected into every proposal scored in its lane, so it stops being repeated.</div>` +
+        fixes + `</section>`
+      : '') +
     `<section class="dsec"><h4>What we still do not know</h4>` +
     (d.open_theses ? `<div class="md">${md(d.open_theses.body)}</div>` : '') +
     (qs ? `<div class="dqs"><div class="muted">Proposed by the work, not yet in the doctrine ` +

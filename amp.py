@@ -6495,6 +6495,66 @@ def retractions() -> dict[str, dict]:
             for r in direction_store().get("retractions", [])}
 
 
+def _claim_key(lane_name: str | None, claim: str) -> str:
+    """What makes two statements of a false claim the same correction.
+
+    A ladder entry is matched by quoting it, so `_rung_key` can take the text as
+    it stands. A correction is written in the architect's own words each time it
+    comes up, so the same claim comes back with a capital letter or a full stop
+    on the end - which is not a second claim, and recording it as one would fill
+    the scoring block with the same sentence.
+    """
+    return _rung_key(lane_name, (claim or "").strip().strip(".;,:—-").strip(), "")
+
+
+def corrections(lane_name: str | None = None) -> list[dict]:
+    """Claims that were made and are false, but were never counted as rungs."""
+    rows = direction_store().get("corrections") or []
+    return [c for c in rows if lane_name is None or c.get("lane") == lane_name]
+
+
+def record_correction(lane_name: str, claim: str, why: str, *,
+                      finding_id: str | None = None, goal_id: str | None = None,
+                      source: str = "settle") -> dict | None:
+    """Write down that a claim the stack acted on is false, and keep it in view.
+
+    The companion to `retract_rung`, for the case that stopped the settling loop
+    dead: most false claims are never ladder entries at all. They are sentences
+    in a worker's report, or a done-condition somebody wrote, and `retract_rung`
+    correctly refuses them - there is no entry to take back, and inventing one
+    would be a retraction that fabricated the claim it walked back.
+
+    But "nothing to retract" was then treated as "nothing can be done", so the
+    finding stayed open forever and went on blocking every proposal in every
+    lane. That is the wrong conclusion. A claim that was never counted still
+    needs to stop being repeated, and the consequence the harness can actually
+    perform is to put the correction where the next architect will read it -
+    `_need_block`, which is shown to every proposal scored anywhere on the
+    stack. A correction nothing reads would be decoration; this one is read on
+    every scoring call for the lane it names.
+
+    Deliberately NOT a rung movement. Nothing here moves a lane up or down: the
+    claim never earned a rung, so taking one away would be as false as the claim
+    was. Returns None on an empty claim - a correction with nothing in it is
+    exactly the settlement-by-assertion this whole path exists to prevent.
+    """
+    claim = (claim or "").strip()
+    if not claim or not lane_name:
+        return None
+    key = _claim_key(lane_name, claim)
+    for c in corrections():
+        if _claim_key(c.get("lane"), c.get("claim")) == key:
+            return c
+    rec = {"id": "c" + uuid.uuid4().hex[:9], "at": now(), "lane": lane_name,
+           "claim": claim[:1000], "why": (why or "")[:1000],
+           "finding_id": finding_id, "goal_id": goal_id, "source": source}
+    with _DIRECTION_LOCK:
+        store = direction_store()
+        store.setdefault("corrections", []).append(rec)
+        _save_direction(store)
+    return rec
+
+
 def retract_rung(lane_name: str, claim: str, to: str, why: str, *,
                  finding_id: str | None = None, source: str = "settle") -> dict | None:
     """Take back a rung a review recorded, because the evidence did not hold.
@@ -6568,19 +6628,41 @@ def _need_block(lane_name: str) -> str:
     say anything but "quite a lot".
     """
     top = lane_rungs()
-    if not top:
+    fixed: dict[str, list[dict]] = {}
+    for c in corrections():
+        fixed.setdefault(c.get("lane") or "", []).append(c)
+    # Not `if not top`. A stack with no rungs can still have corrections, and it
+    # is the case where they matter most - nothing has been earned, so the only
+    # thing this block has to say is which of the claims lying around is false.
+    if not top and not fixed:
         return ""
     rows = []
-    for name in sorted(set(top) | {lane_name}):
+    for name in sorted(set(top) | set(fixed) | {lane_name}):
         rung = top.get(name)
         rows.append(f"- **{name}**{' (the lane you are scoring)' if name == lane_name else ''}: "
                     + (f"evidence has reached `{rung}`" if rung
                        else "no claim has ever been judged past `spec`"))
-    return ("# How far each lane's evidence has actually got\n\n"
-            + "\n".join(rows)
-            + "\n\nThese are the rungs recorded by earlier reviews, so they are what the "
-              "stack has EARNED, not what it aims at. Score `need` against the distance "
-              "between this and the mission.")
+    out = ("# How far each lane's evidence has actually got\n\n"
+           + "\n".join(rows)
+           + "\n\nThese are the rungs recorded by earlier reviews, so they are what the "
+             "stack has EARNED, not what it aims at. Score `need` against the distance "
+             "between this and the mission.")
+    if fixed:
+        # The claims that were made, acted on, and turned out to be false without
+        # ever having been counted as a rung. They move nothing on the ladder,
+        # which is exactly why they need saying: nothing else in this block would
+        # show them, and the failure they cause is a later call confidently
+        # repeating a sentence the stack has already disproved.
+        lines = []
+        for name in sorted(fixed):
+            for c in fixed[name]:
+                lines.append(f"- **{name}**: {str(c.get('claim') or '')[:300]}"
+                             + (f" — {str(c.get('why') or '')[:220]}" if c.get("why") else ""))
+        out += ("\n\n# Claims already found false here — do not repeat them\n\n"
+                + "\n".join(lines)
+                + "\n\nThese were never rungs, so nothing above was inflated by them. "
+                  "They are listed because they were believed once and are not true.")
+    return out
 
 
 def goal_spend(gid: str) -> float:
@@ -9576,6 +9658,13 @@ def direction_view(lane: str | None = None) -> dict:
         "need_bar": need_bar(),
         "calibration": calibration(),
         "rungs": lane_rungs(),
+        # Sits with `rungs`, and is not lane-filtered for the same reason `rungs`
+        # is not: this pair is the whole-stack record of what the workspace
+        # believes. These are the claims that turned out to be false without ever
+        # having earned a rung, so nothing in `rungs` moved for them - which is
+        # exactly why they need showing. The ladder is the only place the console
+        # reports what was believed, and these were never on it.
+        "corrections": corrections(),
         "sharpen_cap": SHARPEN_HARD_CAP,
         "sharpen_gain_floor": SHARPEN_GAIN_FLOOR,
         "sharpen_floor": SHARPEN_FLOOR,
@@ -10229,6 +10318,11 @@ def report_headed() -> dict:
         "gates": escalations(),
         "supervisor": (supervisor_view() or {}).get("last"),
         "rungs": lane_rungs(), "ladder": list(LADDER_RUNGS),
+        # Claims found false that never earned a rung, so nothing above moves for
+        # them. Shown because they are otherwise invisible: the ladder is the
+        # only place the console reports what was believed, and these were never
+        # on it.
+        "corrections": corrections(),
         "theses": _section(sections, "open theses", "open questions"),
         "thesis": _section(sections, "thesis"),
         "auto_adopt": bool(direction_store().get("auto_adopt")),
@@ -12163,6 +12257,13 @@ SETTLE_SYSTEM = (
     "ladder entry VERBATIM from the list of recorded entries below - `claim` copied exactly, "
     "and `to` the rung it was wrongly moved to. The rung will be taken back. Use this "
     "whenever a finding disputes evidence rather than code.\n"
+    "- `correct`: the finding disproves a claim that was made and acted on, but which is NOT "
+    "on the recorded ladder - a sentence in a worker's report, or a done-condition. Give "
+    "`claim` as the false statement, in your own words, in one sentence. Nothing moves on the "
+    "ladder, because it never earned a rung; the correction is recorded against the lane and "
+    "shown to every architect scoring anything in it, so it stops being repeated. Use this "
+    "instead of `keep` whenever the only reason you cannot `retract` is that the claim was "
+    "never a rung.\n"
     "- `supersede`: a LATER finding in this list already refutes or replaces this one - it "
     "checked the same thing and got a different answer. Give `by` as that finding's id. It "
     "must be later than the one you are settling.\n"
@@ -12172,22 +12273,29 @@ SETTLE_SYSTEM = (
     "answer and it is better than a guess - the finding stays open and the operator reads it.\n\n"
     "Rules:\n"
     "- Do not invent a ladder entry. If the claim you want to retract is not in the recorded "
-    "list, the verdict is `keep`.\n"
+    "list, the verdict is `correct`, not `retract` and not `keep`.\n"
     "- Several findings often say the same thing about the same claim. Retract the entry once "
     "and `supersede` the rest onto the finding that made the point best.\n"
     "- A finding being old is not a reason to close it.\n"
-    "- Settling is not agreeing. If a finding is wrong, say so in `why` and `keep` it.\n\n"
+    "- Settling is not agreeing. If a finding is wrong, say so in `why` and `keep` it.\n"
+    "- Most findings carry TWO claims: one that later evidence resolves, and one that is left "
+    "over. Settle the first with your verdict and put the second in `residue` with an "
+    "`objective` - that files a proposal for the leftover. A finding is not `keep` just "
+    "because part of it is unfinished.\n\n"
     "Reply with one JSON object and nothing else:\n"
     "{\n"
     '  "reading": "what these contradictions add up to, in 3-6 sentences: what the stack '
     'has been getting wrong, not a list of the findings",\n'
-    '  "settle": [{"finding": "<id>", "verdict": "retract|supersede|work|keep", '
+    '  "settle": [{"finding": "<id>", "verdict": "retract|correct|supersede|work|keep", '
     '"why": "the reason, addressed to the operator",\n'
-    '      "claim": "(retract) the recorded ladder entry, copied exactly", '
-    '"to": "(retract) the rung it was wrongly moved to",\n'
+    '      "claim": "(retract) the recorded ladder entry, copied exactly — '
+    '(correct) the false statement, in one sentence",\n'
+    '      "to": "(retract) the rung it was wrongly moved to",\n'
     '      "by": "(supersede) the id of the later finding that settles it",\n'
     '      "objective": "(work) what to do about it", "lane": "(work) which lane", '
-    + _SCORE_FIELDS + "}]\n"
+    + _SCORE_FIELDS + ",\n"
+    '      "residue": {"objective": "what is LEFT OVER after that verdict, if anything", '
+    '"lane": "...", "why": "...", ' + _SCORE_FIELDS + "}}]\n"
     "}"
 )
 
@@ -12210,7 +12318,17 @@ def _settle_context(rows: list[dict]) -> str:
     if entries:
         out.append("# Every rung on record, and the claim it was moved for\n\n"
                    "To `retract` one, copy its claim text exactly and give its `to` rung. "
-                   "Anything not on this list cannot be retracted.\n\n" + "\n".join(entries))
+                   "Anything not on this list cannot be retracted - but note that this is "
+                   "the list of RUNGS, not the list of claims. Most of what the stack "
+                   "believes was never recorded here at all, and a finding that disproves "
+                   "one of those is `correct`, not `keep`.\n\n" + "\n".join(entries))
+    fixed = corrections()
+    if fixed:
+        out.append("# Claims already corrected\n\n"
+                   "Do not correct these again; if a finding only repeats one of them, it "
+                   "is `supersede` or `keep`.\n\n"
+                   + "\n".join(f"- **{c.get('lane')}**: {str(c.get('claim') or '')[:300]}"
+                               for c in fixed))
     out.append("# The highest rung each lane is currently credited with\n\n"
                + "\n".join(f"- {k}: `{v}`" for k, v in sorted(lane_rungs().items()))
                + "\n\nThese are what every proposal in every lane is currently scored "
@@ -12260,7 +12378,22 @@ def settle_findings(lane: str | None = None, limit: int = 24) -> dict:
     known = set(config().get("lanes") or {})
     seen = {_norm_prompt(p.get("text", "")) for p in direction_store().get("proposals", [])}
     rid = "d" + uuid.uuid4().hex[:9]
-    settled, kept, fresh, retracted = [], [], [], []
+    settled, kept, fresh, retracted, corrected = [], [], [], [], []
+
+    def file_proposal(spec: dict, want_lane: str | None, why_text: str, src: str,
+                      fid: str) -> dict | None:
+        """Put an objective into the ordinary queue, or refuse to. Nothing starts."""
+        obj = str((spec or {}).get("objective") or "").strip()
+        want = str((spec or {}).get("lane") or "").strip() or want_lane
+        if not obj or want not in known or _norm_prompt(obj) in seen:
+            return None
+        seen.add(_norm_prompt(obj))
+        p = {"id": "p" + uuid.uuid4().hex[:9], "at": now(), "kind": "goal",
+             "lane": want, "text": obj[:1000],
+             "why": (str(spec.get("why") or "") or why_text)[:1000], "state": "open",
+             "review_id": rid, "source": src, "from_finding": fid, **_scored(spec)}
+        fresh.append(p)
+        return p
 
     for v in (out.get("settle") or [])[:limit]:
         if not isinstance(v, dict):
@@ -12282,8 +12415,20 @@ def settle_findings(lane: str | None = None, limit: int = 24) -> dict:
                 done = {"how": "retract", "why": why, "retraction_id": r["id"],
                         "claim": r["claim"], "to": r["to"]}
             else:
-                why = ("no ladder entry matching that claim is on record, so there was "
-                       "nothing to retract — " + why)
+                # Falls through to `correct` rather than to `keep`. The claim is
+                # still false and still worth not repeating; the only thing that
+                # is missing is a rung to take away.
+                verdict = "correct"
+
+        if verdict == "correct":
+            c = record_correction(f.get("lane"), str(v.get("claim") or ""), why,
+                                  finding_id=f["id"], goal_id=f.get("goal_id"))
+            if c:
+                corrected.append(c)
+                done = {"how": "correct", "why": why,
+                        "correction_id": c["id"], "claim": c["claim"]}
+            else:
+                why = ("no claim was named, so there was nothing to correct — " + why)
 
         elif verdict == "supersede":
             later = by_id.get(str(v.get("by") or ""))
@@ -12296,18 +12441,24 @@ def settle_findings(lane: str | None = None, limit: int = 24) -> dict:
                        "record — " + why)
 
         elif verdict == "work":
-            obj = str(v.get("objective") or "").strip()
-            want = str(v.get("lane") or "").strip() or f.get("lane")
-            if obj and want in known and _norm_prompt(obj) not in seen:
-                seen.add(_norm_prompt(obj))
-                p = {"id": "p" + uuid.uuid4().hex[:9], "at": now(), "kind": "goal",
-                     "lane": want, "text": obj[:1000], "why": why, "state": "open",
-                     "review_id": rid, "source": "settle", "from_finding": f["id"],
-                     **_scored(v)}
-                fresh.append(p)
+            p = file_proposal(v, f.get("lane"), why, "settle", f["id"])
+            if p:
                 done = {"how": "work", "why": why, "proposal_id": p["id"]}
             else:
-                why = ("no proposal could be filed for it — " + why) if obj else why
+                why = (("no proposal could be filed for it — " + why)
+                       if str(v.get("objective") or "").strip() else why)
+
+        # Whatever the verdict was, what is LEFT of the finding after it. Most
+        # of these carry two claims - one that later evidence resolves and one
+        # that does not - and with no way to say that, a finding was kept whole
+        # because a fragment of it was unfinished. Three of them sat open for a
+        # day blocking every proposal on the stack for exactly that reason.
+        if done:
+            left = file_proposal(v.get("residue") or {}, f.get("lane"), why,
+                                 "settle-residue", f["id"])
+            if left:
+                done["residue_id"] = left["id"]
+                done["residue"] = left["text"][:300]
 
         if done:
             if settle_finding(f["id"], {**done, "at": now(), "review_id": rid}):
@@ -12321,6 +12472,7 @@ def settle_findings(lane: str | None = None, limit: int = 24) -> dict:
            "assessment": str(out.get("reading") or "")[:2000],
            "ladder": [], "goal_moves": [], "direction": [], "goal_setting": [],
            "settled": settled, "kept": kept, "retractions": retracted,
+           "corrections": corrected,
            "considered": [f["id"] for f in rows],
            "tokens": (resp.get("usage") or {}).get("total_tokens") or 0}
     with _DIRECTION_LOCK:
@@ -12331,6 +12483,7 @@ def settle_findings(lane: str | None = None, limit: int = 24) -> dict:
 
     add_note(f"settled {len(settled)} of {len(rows)} contradiction(s): " + rev["assessment"][:300]
              + (f" — {len(retracted)} rung(s) retracted" if retracted else "")
+             + (f", {len(corrected)} claim(s) corrected without moving a rung" if corrected else "")
              + (f", {len(fresh)} proposal(s) filed" if fresh else "")
              + (f", {len(kept)} left open for you" if kept else ""))
 

@@ -1347,6 +1347,15 @@ pre.diff, .ruling {
 }
 .dq-x:hover, .dp-x:hover { color: var(--fg); border-color: var(--muted); }
 
+/* A corrected claim gets the bad-news border and the claim itself struck
+   through: the sentence on the line is the thing that is NOT true, and it is
+   quoted here in full so it can be recognised when it turns up again. Without
+   the strike it reads as an assertion, which is the exact opposite of what the
+   block is for. Muted overall - nothing here is waiting on anybody. */
+.dfix { border-left: 2px solid var(--bad); padding: 6px 0 6px 10px; margin-bottom: 8px; font-size: 12px; }
+.dfix b { color: var(--fg); font-weight: 600; text-decoration: line-through; text-decoration-color: var(--bad); }
+.dfix .tag { margin-right: 6px; }
+
 .drev { border-left: 2px solid var(--line); padding: 6px 0 6px 10px; margin: 10px 0; font-size: 12px; }
 .drev .md { font-size: 12px; line-height: 1.6; }
 /* A rung move is the only claim on this page with a shape, so it gets one. */
