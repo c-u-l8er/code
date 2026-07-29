@@ -73,6 +73,7 @@
       <button class="tab" data-tab="ask">Ask GPT-5.6</button>
       <button class="tab" data-tab="history">History</button>
       <button class="tab" data-tab="rulings">Rulings</button>
+      <button class="tab" data-tab="settings">Settings</button>
     </nav>
 
     <div class="pane active" id="pane-dispatch">
@@ -260,6 +261,31 @@ If the architect asks for a file by name it is fetched and sent without another 
       <div class="pane-head"><h3>Saved rulings</h3></div>
       <div id="r-list" class="ruling-list"></div>
       <div id="r-out" class="ruling md"></div>
+    </div>
+
+    <!-- Per-lane, because "what may run unattended" is the one setting that is
+         genuinely different lane by lane - everything in the Settings sheet
+         (roles, models, bars, the database) is one answer for the whole
+         workspace, and mixing the two would make a per-lane switch look global
+         and a global one look per-lane. The sheet is reachable from here rather
+         than copied into here: two editors over one config is how they
+         disagree. -->
+    <div class="pane" id="pane-settings">
+      <div class="pane-head">
+        <h3>What each lane may start</h3>
+        <div class="row">
+          <button id="btn-set-open">Roles, models and bars&hellip;</button>
+          <button id="btn-lanes-reload">Reload</button>
+          <span class="muted" id="lm-status"></span>
+        </div>
+      </div>
+      <p class="muted">A mode is consulted where work <b>starts</b>, never where it
+      continues. Nothing here stops a worker that is already running: a goal mid-flight
+      is a commitment already made, and killing it leaves a worktree of uncommitted work
+      with nobody to review it. Reading, reviewing, findings and reports are never gated
+      &mdash; a lane that stops reporting has gone dark, which is much harder to notice
+      than one that is paused.</p>
+      <div id="lm-out" class="lanes">loading&hellip;</div>
     </div>
   </section>
 </main>

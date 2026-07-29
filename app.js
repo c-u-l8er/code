@@ -2674,6 +2674,89 @@ function wireSpecs() {
   $('btn-specs').onclick = loadSpec;
 }
 
+// ------------------------------------------------------------ lane modes
+//
+// One row per lane, and the row has to answer two questions the operator
+// otherwise has to take on trust: what is this lane allowed to start, and what
+// is that actually stopping right now. The second is the whole point. A mode is
+// a claim about what will NOT happen, and a claim like that is unfalsifiable
+// while nothing counts what it held - you set a lane to maintain and then have
+// no way to tell it apart from a lane that had nothing to do anyway.
+
+function renderLanes(v) {
+  const modes = v.modes || [];
+  const rows = (v.lanes || []).map((l) => {
+    const opts = modes.map((m) =>
+      `<option value="${esc(m)}"${m === l.mode ? ' selected' : ''}>${esc(m)}</option>`).join('');
+    // Named goals rather than a count. "2 will finish first" is a number the
+    // operator then has to go and look up; the objectives are what tells them
+    // whether waiting is fine or whether they wanted to intervene.
+    const flight = (l.running || []).length
+      ? `<div class="lm-flight"><b>${l.running.length} already running</b>, and ` +
+        `${l.running.length === 1 ? 'it will' : 'they will'} finish &mdash; the mode ` +
+        `applies to what starts next.<ul>` +
+        l.running.map((g) => `<li>${esc(g.objective)}</li>`).join('') + '</ul></div>'
+      : '';
+    // Only when it is holding something. A "held 0" on every building lane is
+    // noise on ten rows to be informative on one.
+    const held = l.held
+      ? `<span class="lm-held" title="proposals that are scored, past both bars, and waiting on this mode alone">` +
+        `holding ${l.held} proposal${l.held === 1 ? '' : 's'}</span>`
+      : '';
+    // Reported as held rather than as off, because they are different facts and
+    // the combined boolean tells the operator they switched the loop off when
+    // what is true is that they left it on and the mode is refusing it.
+    const spec = l.auto_spec_held
+      ? `<span class="lm-held">spec loop on, held by this mode</span>`
+      : (l.auto_spec ? `<span class="muted">spec loop on</span>` : '');
+    return `<div class="lm-row${l.mode === 'build' ? '' : ' lm-shut'}">` +
+      `<div class="lm-name"><b>${esc(l.name)}</b>` +
+      `<div class="muted">${esc(l.path || '')}` +
+      (l.rung ? ` &middot; evidence at <b>${esc(l.rung)}</b>` : ' &middot; nothing judged past spec') +
+      `</div></div>` +
+      `<div class="lm-set"><select class="lm-mode" data-lane="${esc(l.name)}">${opts}</select>` +
+      `<div class="muted">${esc(l.means || '')}</div></div>` +
+      `<div class="lm-state">${held}${spec}` +
+      `<span class="muted">${l.proposals} proposal${l.proposals === 1 ? '' : 's'} waiting</span>` +
+      `</div>${flight}</div>`;
+  }).join('');
+  $('lm-out').innerHTML = rows || '<span class="muted">no lanes yet</span>';
+  document.querySelectorAll('.lm-mode').forEach((s) => {
+    s.onchange = () => setLaneMode(s.dataset.lane, s.value);
+  });
+}
+
+async function loadLanes() {
+  try {
+    renderLanes(await api('/api/lanes'));
+  } catch (e) {
+    $('lm-out').innerHTML = `<span class="err">${esc(String(e.message || e))}</span>`;
+  }
+}
+
+/** The reply says what is still in flight, and that is said out loud at the
+ *  moment of the click. The one way this switch can lie is by looking
+ *  instantaneous - the row goes grey, and an hour later a worker is still
+ *  committing to that lane. */
+async function setLaneMode(lane, mode) {
+  $('lm-status').textContent = `setting ${lane}…`;
+  const r = await post('/api/lane/mode', { lane, mode });
+  if (!r.ok) {
+    $('lm-status').innerHTML = `<span class="err">${esc(r.error || 'could not set it')}</span>`;
+  } else {
+    $('lm-status').textContent = `${lane}: ${r.means}` +
+      ((r.in_flight || []).length && mode !== 'build'
+        ? ` — ${r.in_flight.length} goal(s) already running will finish first` : '');
+  }
+  loadLanes();
+  refresh();   // the board's own idea of the lanes is now one change behind
+}
+
+function wireLaneModes() {
+  $('btn-lanes-reload').onclick = loadLanes;
+  $('btn-set-open').onclick = openSettings;
+}
+
 function wireDirection() {
   $('dir-auto').onchange = async () => {
     const on = $('dir-auto').checked;
@@ -3819,6 +3902,9 @@ function showTab(name) {
   if (name === 'specs') loadSpec();
   if (name === 'history' && !state.history.length) loadHistory();
   if (name === 'preview' && state.sel) loadPreview();
+  // Every time, not once: the counts are the point, and a stale `holding 3` is
+  // worse than no number at all.
+  if (name === 'settings') loadLanes();
 }
 
 document.querySelectorAll('.tab').forEach((t) =>
@@ -3840,6 +3926,7 @@ wireLaneAdd();
 wireGoals();
 wireDirection();
 wireSpecs();
+wireLaneModes();
 wireMission();
 wireReports();
 refresh();

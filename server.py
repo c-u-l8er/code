@@ -1770,6 +1770,33 @@ def do_lane_add(body: dict) -> dict:
     return {"ok": True, "lane": lane}
 
 
+def do_lanes() -> dict:
+    """Every lane, its mode, and what that mode is currently holding.
+
+    A read, and deliberately a whole-stack one rather than per-lane: the question
+    Settings answers is "what is this workspace allowed to do", and that is not
+    answerable a lane at a time - a lane sitting at build looks identical whether
+    the rest of the stack is running or entirely frozen.
+    """
+    return amp.lanes_view()
+
+
+def do_set_lane_mode(body: dict) -> dict:
+    """Change what a lane may START. Never stops what it is already doing.
+
+    The reply carries `in_flight` straight back to the caller, because the one
+    way this switch can lie is by looking instantaneous: an operator freezes a
+    lane, sees the row go grey, and then finds a worker still committing to it an
+    hour later. Naming the goals here means the console can say so at the moment
+    of the click rather than the operator discovering it from the board.
+    """
+    try:
+        return {"ok": True, **amp.set_lane_mode(body.get("lane") or "",
+                                                body.get("mode") or "")}
+    except amp.LaneError as e:
+        return {"ok": False, "error": str(e)}
+
+
 def do_bind_env(body: dict) -> dict:
     cfg = amp.config()
     name, env_id = body.get("lane"), (body.get("env_id") or "").strip()
@@ -2351,6 +2378,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_spec_run((q.get("id") or [None])[0]))
             if u.path == "/api/spec/candidates":
                 return self._send(200, do_spec_candidates((q.get("lane") or [None])[0]))
+            if u.path == "/api/lanes":
+                return self._send(200, do_lanes())
             if u.path == "/api/workspaces":
                 return self._send(200, do_workspaces())
             if u.path == "/api/supervisor":
@@ -2540,6 +2569,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_bind_env(body))
             if u.path == "/api/lane/backend":
                 return self._send(200, do_set_backend(body))
+            if u.path == "/api/lane/mode":
+                return self._send(200, do_set_lane_mode(body))
             if u.path == "/api/auth/start":
                 return self._send(200, do_auth_start())
             if u.path == "/api/auth/code":

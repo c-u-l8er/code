@@ -1733,7 +1733,197 @@ def lane_or_die(cfg: dict, name: str) -> dict:
 
 
 class LaneError(ValueError):
-    """A lane could not be created. The message is meant for a person to read."""
+    """A lane could not be created or changed. The message is meant for a person."""
+
+
+# ---------------------------------------------------------------- lane modes
+#
+# How much of itself a lane is allowed to run unattended.
+#
+# The obvious design is a checkbox per lane, and it is wrong. Work starts in a
+# lane from six independent places - a waiting proposal being adopted, a review
+# adopting as a goal closes, the spec loop drafting, rating, or opening a
+# campaign, and a campaign stepping - so an `on/off` flag would have to be
+# re-tested at all six, and each site would decide for itself what off meant.
+# The result is a switch that stops some work and not other work, with no way to
+# predict which. That is worse than no switch: it reads as a halt and is not one.
+#
+# So a lane has one MODE, and the mode is consulted where work STARTS - never
+# where work continues. Reading, reviewing, checking and reporting are never
+# gated: a lane that stops reporting has gone dark, which is a different thing
+# from being paused and much harder to notice.
+#
+# The modes are ordered. Each admits strictly less than the one above it:
+#
+#   build      everything. What every lane does today.
+#   maintain   corrective work only - development is halted, fixes are not.
+#   frozen     nothing starts. Findings still file, reviews still run.
+#   archived   as frozen, and the lane stops being proposed into at all.
+#
+# What makes `maintain` implementable rather than a slogan is that the harness
+# already records where every piece of work CAME FROM, so "corrective" does not
+# need a label anybody types and cannot be gamed by whoever writes the proposal:
+# it is read off the origin that was recorded when the work was created.
+LANE_MODES = ("build", "maintain", "frozen", "archived")
+DEFAULT_LANE_MODE = "build"
+
+# A lane is doing one of two things, and the difference is where the work came
+# from. `explore` looks for somewhere new to go; the spec loop builds documents
+# that do not exist yet. Both are development. A settlement residue is what was
+# left over after a claim we acted on turned out to be false, and a `solve`
+# proposal comes from a gate that was raised against us - neither is a new
+# direction, both are the stack repairing something it already got wrong.
+WORK_KINDS = ("development", "corrective")
+_SOURCE_KIND = {
+    "explore": "development",
+    "spec": "development",
+    # What a finished goal's review proposes next. Development: a review asks
+    # what should happen now, which is a new direction even when the goal it
+    # reviewed was itself a repair. The follow-up repairs come back through
+    # `settle` and `solve`, which are where a lane on maintain picks them up.
+    "review": "development",
+    "settle": "corrective",
+    "settle-residue": "corrective",
+    "solve": "corrective",
+}
+_MODE_ADMITS = {
+    "build": ("development", "corrective"),
+    "maintain": ("corrective",),
+    "frozen": (),
+    "archived": (),
+}
+MODE_MEANS = {
+    "build": "everything runs",
+    "maintain": "fixes run, new development does not",
+    "frozen": "nothing starts; findings and reviews still run",
+    "archived": "nothing starts, and nothing is proposed into it",
+}
+
+
+def lane_mode(lane_name: str) -> str:
+    """What this lane is allowed to do. A lane nobody has set is building."""
+    m = ((config().get("lanes") or {}).get(lane_name) or {}).get("mode")
+    return m if m in LANE_MODES else DEFAULT_LANE_MODE
+
+
+def work_kind(source: str | None) -> str:
+    """Whether work from this origin is development or a repair.
+
+    Defaults to `development`, which is the strict reading: an origin this does
+    not recognise is one nobody has classified, and treating the unclassified as
+    corrective would let any new source of work walk straight through a lane that
+    was explicitly told to stop developing.
+    """
+    return _SOURCE_KIND.get(str(source or "").strip(), "development")
+
+
+def lane_admits(lane_name: str, kind: str) -> str | None:
+    """Why this lane may not start that kind of work unattended, or None.
+
+    The single place a mode is enforced. Both callers - `proposal_hold` and
+    `spec_auto_on` - answer with the string, so the reason a lane is quiet is
+    the same sentence wherever it is read, and the operator never has to work
+    out which of several switches is the one holding it.
+    """
+    mode = lane_mode(lane_name)
+    if kind in _MODE_ADMITS.get(mode, ()):
+        return None
+    if mode == "maintain":
+        return (f"{lane_name} is set to maintain, so it takes fixes but not new "
+                f"development - this is {kind}")
+    if mode == "archived":
+        return f"{lane_name} is archived"
+    if mode == "frozen":
+        return f"{lane_name} is frozen, so nothing starts in it unattended"
+    return None
+
+
+def set_lane_mode(lane_name: str, mode: str) -> dict:
+    """Change what a lane may do next. Never touches what it is doing now.
+
+    Deliberately not a stop button. Work already running is a commitment that was
+    already made, and killing a goal mid-flight leaves a worktree full of
+    uncommitted work with nobody to review it - strictly worse than the
+    development it was doing. So the mode takes effect at the next START, and the
+    return says how much is still in flight so that is visible rather than
+    discovered later as "I switched it off and it kept going".
+    """
+    mode = (mode or "").strip()
+    if mode not in LANE_MODES:
+        raise LaneError(f"mode must be one of {', '.join(LANE_MODES)}")
+    cfg = config()
+    if lane_name not in (cfg.get("lanes") or {}):
+        raise LaneError(f"unknown lane {lane_name!r}")
+    was = lane_mode(lane_name)
+    cfg["lanes"][lane_name]["mode"] = mode
+    save_json(CONFIG_PATH, cfg)
+    running = [g for g in goals(lane_name) if g.get("state") == "running"]
+    if was != mode:
+        add_note(f"{lane_name} set to {mode} — {MODE_MEANS[mode]}"
+                 + (f", and {len(running)} goal(s) already running will finish first"
+                    if running and mode != "build" else ""))
+    return {"lane": lane_name, "mode": mode, "was": was,
+            "means": MODE_MEANS[mode],
+            "in_flight": [{"id": g["id"], "objective": (g.get("objective") or "")[:120]}
+                          for g in running]}
+
+
+def lanes_view() -> dict:
+    """Every lane and what it is currently allowed to do.
+
+    `held` is the number that makes a mode honest. A mode is a claim about what
+    will not happen, and a claim like that is unfalsifiable while nothing counts
+    what it stopped: the operator sets a lane to maintain and then has to take it
+    on trust for the rest of the day. This counts the proposals sitting in
+    Direction that WOULD be adoptable and are held by this lane's mode and
+    nothing else - so the switch reports its own effect, and a mode holding
+    nothing is visibly holding nothing rather than looking the same as one doing
+    the whole job.
+    """
+    cfg = config().get("lanes") or {}
+    rungs = lane_rungs()
+    props = [p for p in open_proposals() if p.get("kind") == "goal"]
+    running = [g for g in goals() if g.get("state") == "running"]
+    out = []
+    for name in sorted(cfg):
+        lane = cfg[name] or {}
+        mode = lane_mode(name)
+        mine = [p for p in props if p.get("lane") == name]
+        # Held by the MODE specifically, not by a bar or a gate: re-asked with
+        # the lane treated as building, so a proposal that would be waiting on
+        # its odds anyway is not counted as something the mode is stopping.
+        held = [p for p in mine
+                if lane_admits(name, work_kind(p.get("source")))
+                and not _hold_but_for_mode(p)]
+        out.append({
+            "name": name, "mode": mode, "means": MODE_MEANS[mode],
+            "path": lane.get("path"), "repo": lane.get("repo"),
+            "branch": lane.get("branch"), "backend": lane_backend(lane),
+            "rung": rungs.get(name),
+            "auto_spec": bool(spec_auto(name).get("on")),
+            # Reported separately from `auto_spec` because they are two different
+            # facts: the switch is on, and the mode is refusing it anyway. One
+            # combined boolean would make the tab say the loop is off when what
+            # is true is that you left it on and something else is holding it.
+            "auto_spec_held": bool(spec_auto(name).get("on"))
+                              and lane_admits(name, "development") is not None,
+            "running": [{"id": g["id"], "objective": (g.get("objective") or "")[:120]}
+                        for g in running if g.get("lane") == name],
+            "proposals": len(mine),
+            "held": len(held),
+        })
+    return {"lanes": out, "modes": list(LANE_MODES), "means": MODE_MEANS,
+            "default": DEFAULT_LANE_MODE}
+
+
+def _hold_but_for_mode(p: dict) -> str | None:
+    """Why this proposal would wait even if its lane were building."""
+    c, need = p.get("confidence"), p.get("need")
+    if c is None or need is None:
+        return "not scored"
+    if c < adopt_bar() or need < need_bar():
+        return "under a bar"
+    return "a gate is up" if escalations(p.get("lane")) else None
 
 
 # A lane name becomes a git branch (`amp/<name>`) and a directory under
@@ -1814,8 +2004,14 @@ def add_lane(name: str, *, repo: str | None = None, path: str | None = None,
     if run(["git", "rev-parse", "--verify", "--quiet", branch], cwd=abs_path).returncode != 0:
         raise LaneError(f"{repo} has no branch {branch!r} to branch workers off")
 
+    # The mode survives a repoint. `replace` is for pointing a lane at a
+    # different checkout, and it rebuilds the record from scratch - which would
+    # silently put a lane you had frozen back to building, at the one moment you
+    # are least likely to look. Whether a lane may run is not a fact about where
+    # its code lives.
+    keep = lane_mode(name) if name in (cfg.get("lanes") or {}) else DEFAULT_LANE_MODE
     cfg["lanes"][name] = {"repo": repo, "path": rel, "branch": branch,
-                          "backend": backend, "env_id": env_id}
+                          "backend": backend, "env_id": env_id, "mode": keep}
     save_json(CONFIG_PATH, cfg)
     lane = dict(cfg["lanes"][name], name=name)
     # A codex lane without an env id is configured but cannot dispatch, and the
@@ -6428,6 +6624,14 @@ def proposal_hold(p: dict) -> str | None:
     proposal we badly need and are confident about gets refused for being big,
     which is a decision about what to spend and therefore the operator's.
     """
+    # The lane's mode, before anything about the proposal itself. Every path
+    # that adopts unattended comes through here, so this is the whole of the
+    # enforcement for goals - and because the answer is a hold reason rather
+    # than a filter, a proposal into a lane that is not building stays visible
+    # in Direction with the mode as its stated reason, instead of vanishing.
+    stopped = lane_admits(p.get("lane") or "", work_kind(p.get("source")))
+    if stopped:
+        return stopped
     c, need = p.get("confidence"), p.get("need")
     # Named separately rather than as one "unscored", because they are different
     # missing facts with different fixes, and a proposal scored under the old
@@ -6634,14 +6838,29 @@ def _need_block(lane_name: str) -> str:
     # Not `if not top`. A stack with no rungs can still have corrections, and it
     # is the case where they matter most - nothing has been earned, so the only
     # thing this block has to say is which of the claims lying around is false.
-    if not top and not fixed:
+    # Modes count for the same reason and were the second thing to fall through
+    # this hole: a lane can be frozen on a stack that has never recorded a rung,
+    # and staying silent there sends the architect to propose into it.
+    shut = {n for n in (config().get("lanes") or {}) if lane_mode(n) != DEFAULT_LANE_MODE}
+    if not top and not fixed and not shut:
         return ""
     rows = []
-    for name in sorted(set(top) | set(fixed) | {lane_name}):
+    for name in sorted(set(top) | set(fixed) | shut | {lane_name}):
         rung = top.get(name)
+        # The rung is stated for every lane including the shut ones, because a
+        # rung is a fact about what was earned and stays true whether or not
+        # anyone is still working there - blanking it would make the ladder lie
+        # about the stack. What is added is the mode, and only where it is not
+        # `build`: an architect that proposes into an archived lane is spending a
+        # call on work that `proposal_hold` is then going to refuse, and the only
+        # way it can know that is by being told here.
+        mode = lane_mode(name)
         rows.append(f"- **{name}**{' (the lane you are scoring)' if name == lane_name else ''}: "
                     + (f"evidence has reached `{rung}`" if rung
-                       else "no claim has ever been judged past `spec`"))
+                       else "no claim has ever been judged past `spec`")
+                    + (f" — **{mode}**: {MODE_MEANS[mode]}, so do not propose "
+                       f"{'anything' if mode in ('frozen', 'archived') else 'new development'} "
+                       f"here" if mode != DEFAULT_LANE_MODE else ""))
     out = ("# How far each lane's evidence has actually got\n\n"
            + "\n".join(rows)
            + "\n\nThese are the rungs recorded by earlier reviews, so they are what the "
@@ -8208,8 +8427,14 @@ def spec_auto_on(lane_name: str) -> bool:
     sends workers into worktrees, which is a different order of spending and a
     different blast radius. Somebody who wants the first does not automatically
     want the second, and a single switch would make that choice for them.
+
+    The lane's MODE outranks this switch rather than sitting beside it. Drafting
+    and sharpening documents is development, so a lane told to stop developing
+    has already answered this question - and two per-lane switches that can
+    disagree would leave the operator reading one of them and getting the other.
     """
-    return bool(spec_auto(lane_name).get("on"))
+    return (bool(spec_auto(lane_name).get("on"))
+            and lane_admits(lane_name, "development") is None)
 
 
 def set_auto_spec(lane_name: str, on: bool) -> bool:
@@ -8985,6 +9210,15 @@ def sharpen_proposal(pid: str) -> dict:
                    "lane": cur.get("lane"), "text": obj[:1000],
                    "why": str(src.get("why") or "")[:1000], "state": "open",
                    "from_goal": cur.get("from_goal"), "review_id": cur.get("review_id"),
+                   # Inherited, never re-derived. Sharpening rewrites an
+                   # objective; it does not change where the work came from, and
+                   # a sharpened repair is still a repair. Left off, this is a
+                   # laundry: a `settle-residue` proposal goes through one round
+                   # here and comes out classified as development, so a lane set
+                   # to maintain silently stops taking the fix it was left open
+                   # for. The origin is the whole basis of that decision, so it
+                   # travels with the objective.
+                   "source": cur.get("source"),
                    "sharpen_rounds": rounds, **_scored(src), **extra}
             store["proposals"].append(new)
             return new
@@ -9093,6 +9327,14 @@ def direction_review(gid: str, *, auto: bool = False) -> dict:
                       "lane": g.get("lane"), "text": obj[:1000],
                       "why": str(n.get("why") or "")[:1000], "state": "open",
                       "from_goal": gid, "review_id": rev["id"],
+                      # Stated, though it is also what an absent origin would
+                      # default to. The default is a safety net for origins
+                      # nobody has classified; leaning on it here would mean the
+                      # single biggest producer of proposals in the harness is
+                      # classified by silence, and the first time somebody
+                      # changed that default this path would change with it
+                      # without anyone deciding it should.
+                      "source": "review",
                       **_scored(n)})
     for r in (out.get("research") or []):
         qn = str((r or {}).get("question") or "").strip()

@@ -1015,6 +1015,31 @@ pre.diff, .ruling {
    The tab about what the work is for. Sections are separated by rule rather
    than boxed: this is a document to be read top to bottom, not a dashboard of
    independent widgets, and boxing each part would invite skimming one. */
+/* One row per lane. Three columns - who it is, what it may do, what that is
+   currently costing - so the eye can run down the middle column and read the
+   whole workspace's posture without reading a word of the rest. */
+.lanes { padding: 4px 2px 40px; overflow: auto; font-size: 12px; }
+.lm-row { display: grid; grid-template-columns: 1.4fr 1.2fr 1fr; gap: 12px;
+          align-items: start; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.lm-name b { font-size: 13px; }
+.lm-set select { width: 100%; }
+.lm-set .muted { padding-top: 3px; }
+.lm-state { display: flex; flex-direction: column; gap: 3px; align-items: flex-start; }
+/* A lane that is not building is dimmed but never hidden: the whole failure this
+   replaces is work quietly not happening, so a lane that has been switched off
+   has to stay as visible as one that has not. */
+.lm-shut .lm-name b { color: var(--muted); }
+/* The number that makes a mode honest - what it is stopping, right now. Warm
+   rather than red: nothing here is wrong, it is the switch doing its job. */
+.lm-held { color: var(--warn); font-size: 11.5px; }
+/* Spans all three columns, because it is not a property of the mode just
+   picked - it is what the mode does NOT apply to, and it has to read as an
+   exception to the whole row rather than a detail of one column. */
+.lm-flight { grid-column: 1 / -1; font-size: 11.5px; color: var(--muted);
+             border-left: 2px solid var(--line); padding: 2px 0 0 10px; margin-top: 6px; }
+.lm-flight b { color: var(--fg); }
+.lm-flight ul { margin: 4px 0 0; padding-left: 16px; }
+
 /* Specs. One lane's design documents and the loop that sharpens them. Plain on
    purpose: the interesting thing on this pane is an argument between two models,
    and styling it as a dashboard would make it look decided. */
