@@ -54,7 +54,6 @@ header {
 .health .h b { color: var(--fg); font-weight: 600; }
 
 .actions { display: flex; align-items: center; gap: 10px; }
-.credit { color: var(--muted); font-size: 11px; }
 
 /* Why the workspace select will not move, beside the select itself. */
 .ws-why { font-size: 11px; color: var(--muted); }
@@ -122,7 +121,13 @@ button.danger:hover:not(:disabled) { background: #450a0a; }
   flex: 0 0 auto;
 }
 .banner.bad { background: #3f1414; border-color: #7f1d1d; color: #fca5a5; }
-.hidden { display: none; }
+/* `!important` because this is a utility, not a component. Without it any later
+   rule that sets a `display` on the same element wins on source order alone -
+   `.lane-add { display: flex }` seventy lines down was holding the add-a-lane
+   form open permanently, and `.modal`, `.pairing`, `.dbreport` and `#p-frame`
+   each carry their own hand-written `.hidden` patch further down for exactly
+   the same reason. One rule here instead of one patch per component. */
+.hidden { display: none !important; }
 
 /* ---------- running work ---------- */
 
@@ -169,13 +174,26 @@ button.danger:hover:not(:disabled) { background: #450a0a; }
 
 main {
   display: grid;
-  grid-template-columns: 340px 1fr;
+  /* The lane column is set from --lane-w so one property moves it; the drag
+     handler writes that variable and nothing else. */
+  grid-template-columns: var(--lane-w, 340px) 6px 1fr;
   flex: 1 1 auto;
   min-height: 0;
 }
 
-.lanes {
+/* Sits in its own grid track rather than overlapping either neighbour, so a
+   drag can never start on top of a lane row's click target. */
+.lane-grip {
+  cursor: col-resize;
+  background: var(--panel);
   border-right: 1px solid var(--line);
+}
+.lane-grip:hover, body.resizing .lane-grip { background: var(--line); }
+/* While dragging, the pointer belongs to the grip - without this a fast drag
+   selects text across the whole page and the cursor flickers over each pane. */
+body.resizing { cursor: col-resize; user-select: none; }
+
+.lanes {
   background: var(--panel);
   display: flex;
   flex-direction: column;
@@ -220,8 +238,57 @@ main {
 .lane .n { display: flex; justify-content: space-between; align-items: baseline; }
 .lane .name { font-weight: 600; }
 .lane .repo { color: var(--muted); font-size: 11px; }
-.lane .tasks { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; }
-.lane .t { font-size: 11px; color: var(--muted); display: flex; gap: 6px; }
+
+/* The seven ratings. Narrower than the `.odds` meters on Direction on purpose -
+   these live in a 260px column, and the label column there (116px) would leave
+   the bar too short to read a difference off. */
+.lane .lrs { margin-top: 7px; display: flex; flex-direction: column; gap: 2px; }
+.lane .lr { display: flex; align-items: center; gap: 6px; font-size: 10px; }
+.lane .lr .ll { flex: 0 0 58px; color: var(--muted); }
+.lane .lr .lm {
+  flex: 1 1 auto;
+  position: relative;
+  height: 5px;
+  background: var(--panel2);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.lane .lr .lm i { position: absolute; inset: 0 auto 0 0; border-radius: 3px; background: var(--muted); }
+.lane .lr.good .lm i { background: var(--ok, #4ea); }
+.lane .lr.low .lm i { background: var(--warn, #d9a441); }
+.lane .lr.flat .lm i { background: var(--accent); }
+.lane .lr .lm u {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  width: 1px;
+  background: var(--fg, #ddd);
+  opacity: .55;
+}
+.lane .lr .lv {
+  flex: 0 0 30px;
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+/* Unmeasured, and it has to look unlike 0%: an em-dash where a bar would be,
+   and no bar at all, because there is nothing to draw. */
+.lane .lr.none .lv { color: var(--muted); opacity: .6; }
+.lane .lr.none .lm { opacity: .4; }
+
+/* The stage picker, sized to sit in the header row where the worker badge was
+   without pushing the lane name around. */
+.lane .stage-pick {
+  font-size: 10px;
+  padding: 1px 2px;
+  background: var(--panel2);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  max-width: 96px;
+}
+.lane .stage-pick:hover { color: var(--fg, #ddd); }
+.pill.mode { color: var(--warn); border-color: #6b4c12; }
 
 .pill {
   font-size: 10px;
@@ -235,11 +302,8 @@ main {
 .pill.completed, .pill.succeeded { color: var(--ok); border-color: #14532d; }
 .pill.failed, .pill.error, .pill.cancelled { color: var(--bad); border-color: #7f1d1d; }
 .pill.running, .pill.pending, .pill.queued { color: var(--accent); border-color: #1e3a8a; }
-.pill.be-claude { color: var(--amp); border-color: #7c4a12; }
-.pill.be-codex { color: var(--muted); }
 .lane .n { gap: 6px; }
 .lane .n .name { margin-right: auto; }
-.lane .t .cost { color: var(--muted); font-variant-numeric: tabular-nums; }
 
 /* ---------- detail ---------- */
 
@@ -247,7 +311,13 @@ main {
    shrink below its content, so one wide table widens the whole column. */
 .detail { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 
-.tabs { display: flex; gap: 2px; padding: 8px 14px 0; border-bottom: 1px solid var(--line); }
+/* Wraps. Fourteen tabs do not fit a laptop width, and a tab bar that does not
+   wrap does not clip - it widens the page, which puts a horizontal scrollbar
+   under everything else and pushes the panes' own right edge off-screen. */
+.tabs {
+  display: flex; flex-wrap: wrap; gap: 2px;
+  padding: 8px 14px 0; border-bottom: 1px solid var(--line);
+}
 .tab {
   background: none;
   border: 1px solid transparent;
@@ -522,6 +592,22 @@ pre.diff, .ruling {
 .dock-toggle { cursor: pointer; color: var(--muted); padding: 0 4px; }
 .dock-toggle:hover { color: var(--fg); }
 
+/* How the thread is being read. In the head with the collapse control, because
+   both answer the same question - how much of this do I want on screen - and
+   both have to be reachable when the dock is shut. */
+.dock-mode { flex: 0 0 auto; display: flex; border: 1px solid var(--line); border-radius: 4px; }
+.dock-mode button {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.dock-mode button:hover { color: var(--fg); }
+.dock-mode button.on { background: var(--panel2); color: var(--amp); }
+
 .dock-feed {
   /* This is the window everything is meant to be run from, so it gets real
      room to hold an answer rather than a ticker's worth. */
@@ -579,6 +665,30 @@ pre.diff, .ruling {
 .dm.amp .dm-body.md { padding: 8px 11px; }
 .dm.amp .spend { display: block; margin-top: 6px; font-size: 10px; }
 .dm.working .dm-body { color: var(--muted); }
+
+/* The briefer. Drawn as a message and not as a panel, because it is a turn in a
+   conversation - somebody told you a thing at a time, and what they told you
+   earlier stays where they said it. The earlier version of this was a card
+   pinned above the thread that rewrote itself, and no amount of styling makes
+   that read as a person: a correspondent remembers having spoken. */
+.dm.brief .dm-body {
+  background: #1a2430;
+  border-left: 3px solid var(--amp);
+}
+.dm.brief .dm-body.md { padding: 8px 11px; }
+.dm.brief .spend { display: block; margin-top: 6px; font-size: 10px; }
+.dm.brief.bad .dm-body { background: #2a1414; border-left-color: var(--bad); }
+/* The other side typing. Sits at the bottom where the next message will be,
+   rather than in the head as a status, because that is where you are looking. */
+.dm.brief.working .dm-body { background: transparent; border-left-color: var(--line); }
+.dm.brief.working .dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amp);
+  animation: pulse 1.1s infinite;
+}
 .dm.working .dot {
   display: inline-block;
   width: 6px;
@@ -780,22 +890,98 @@ pre.diff, .ruling {
 }
 .md th { background: var(--panel2); color: var(--muted); font-weight: 600; white-space: nowrap; }
 
+/* ------------------------------------------------------- notification panel
+   The three strips below used to stack under the header, permanently. They now
+   open from one button, over the board rather than pushing it down. */
+
+.nbadge {
+  display: none;
+  margin-left: 5px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 15px;
+}
+.nbadge.on { display: inline-block; }
+/* A contradiction is the one kind that is not a queue, so the count says which
+   it is before the panel is even open. */
+.nbadge.bad { background: #450a0a; border-color: #7f1d1d; color: #fca5a5; }
+#btn-notify.lit { border-color: var(--muted); }
+
+.notify {
+  position: fixed;
+  /* Set from the header's real height when it opens, not guessed here: this
+     bar wraps at narrow widths, and a panel that starts one pixel too high
+     covers the very button that closes it. Verified by asking the page what is
+     at the button's centre - it answered `notify-head`. */
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 520px;
+  max-width: 96vw;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  box-shadow: -6px 0 28px rgba(0, 0, 0, .5);
+  /* Above the orchestrator dock (5), below the modal sheets (10): the dock is
+     fixed over the right of the window and would otherwise swallow the clicks
+     in here, which is the same trap the strips' own buttons fell into. */
+  z-index: 8;
+}
+.notify-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.notify-head h3 { margin: 0; font-size: 13px; }
+.notify-head .muted { flex: 1 1 auto; font-size: 11px; }
+.notify-head button {
+  flex: none;
+  padding: 0 8px;
+  background: none;
+  border: 0;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+}
+.notify-head button:hover { color: var(--fg); }
+.notify-body { flex: 1 1 auto; overflow-y: auto; }
+.nsec { border-bottom: 1px solid var(--line); padding: 10px 0 4px; }
+.nsec h4 { margin: 0 0 3px; padding: 0 14px; font-size: 12px; }
+.nsec > .muted { margin: 0 0 6px; padding: 0 14px; font-size: 11px; }
+/* A section whose list rendered nothing is a heading over an empty box. It
+   hides itself off the list's own `hidden` class, so nothing has to remember
+   to keep a second flag in step with it. */
+.nsec:has(> .hidden) { display: none; }
+.notify-empty { padding: 16px 14px; color: var(--muted); font-size: 12px; }
+
 /* ---------------------------------------------------------------- findings
    What the work said about the doctrine. Deliberately not styled as an error:
    most of these are good news, and the one kind that is not says so in a word. */
 
-.findings {
-  border-bottom: 1px solid var(--line);
-  background: var(--panel);
-}
+.findings { background: var(--panel); }
 .fi {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: 7px;
+  gap: 4px 7px;
   padding: 7px 14px;
   font-size: 12px;
   border-left: 3px solid var(--amp);
 }
+/* The panel is a column, not the full width of the window these strips used to
+   have. The finding's own text is what you are here to read, so who said it and
+   the button drop to their own line rather than squeezing it into a third of
+   the width. (The text itself is a bare text node between the elements, so it
+   cannot be styled directly - only what surrounds it can be moved.) */
+.fi .muted { flex: 1 1 55%; }
 .fi.contradicted { border-left-color: var(--bad); }
 .fi.proposed { border-left-color: var(--warn); }
 .fi b { color: var(--amp); font-weight: 600; }
@@ -821,7 +1007,7 @@ pre.diff, .ruling {
 .fi-x:hover { color: var(--fg); border-color: var(--muted); }
 .fi.more { color: var(--muted); border-left-color: transparent; font-size: 11px; cursor: pointer; }
 .fi.more:hover { color: var(--fg); }
-.fi-settle { display: flex; align-items: center; gap: 8px; padding: 6px 0 2px; font-size: 11px; }
+.fi-settle { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 14px 4px; font-size: 11px; }
 .fi-settle button {
   padding: 2px 10px;
   border-radius: 10px;
@@ -837,14 +1023,12 @@ pre.diff, .ruling {
 /* ---------------------------------------------------------- obligations
    Standing chores whose check currently says no. Deliberately quieter than a
    finding: this is a queue, not an alarm. */
-.obligations {
-  border-bottom: 1px solid var(--line);
-  background: var(--panel);
-}
+.obligations { background: var(--panel); }
 .ob {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: 7px;
+  gap: 4px 7px;
   padding: 7px 14px;
   font-size: 12px;
   border-left: 3px solid var(--warn);
@@ -861,7 +1045,9 @@ pre.diff, .ruling {
   color: var(--warn);
 }
 .ob.broken .ob-tag { color: var(--muted); }
-.ob .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Was clipped to one line when this sat under the header and had the width for
+   it. In a 520px column the fix is the only part worth reading, so it wraps. */
+.ob .muted { flex: 1 1 100%; }
 /* No `margin-left: auto`. The dock is fixed over the right 460px of the window
    with a higher z-index, so anything flushed right in one of these strips is
    painted and then swallowed - it looks like a button and does nothing. */
@@ -882,14 +1068,12 @@ pre.diff, .ruling {
    What the harness can see is wrong. Above everything, because a problem you
    have to click to find is one you find late. */
 
-.watch {
-  border-bottom: 1px solid var(--line);
-  background: var(--panel);
-}
+.watch { background: var(--panel); }
 .ob {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: 7px;
+  gap: 4px 7px;
   padding: 7px 14px;
   font-size: 12px;
   border-left: 3px solid var(--muted);
@@ -1056,6 +1240,15 @@ pre.diff, .ruling {
             margin: 2px 0 16px; }
 .dep-toll b { color: var(--fg); }
 
+/* What this pane is currently about, and what that leaves out. Sits above the
+   tolls because it changes what every one of them counts, and is deliberately
+   not warm-coloured: narrowing is not a problem, it is just a fact the numbers
+   underneath depend on. */
+.dep-scope { font-size: 11.5px; line-height: 1.7; color: var(--muted);
+             border-left: 2px solid var(--line); padding: 2px 0 2px 12px;
+             margin: 2px 0 14px; }
+.dep-scope b { color: var(--fg); }
+
 /* One provider. Three columns: who it is and what it holds up, what it said
    when we asked, and the one thing that can be done about it. */
 .dep-id { display: grid; grid-template-columns: 1.1fr 1.6fr auto; gap: 12px;
@@ -1105,6 +1298,47 @@ pre.diff, .ruling {
 /* Deployable, and no lane owns it: no worker will ever be pointed at it. */
 .dep-orphan { color: var(--warn); }
 
+/* What is already live. A second heading inside the same pane, because the two
+   halves answer different questions and the second one has no buttons at all. */
+.dep-h { margin: 26px 0 0; padding-top: 18px; border-top: 1px solid var(--line);
+         font-size: 14px; }
+/* Serving something older than the tree. The same amber as a stranded service,
+   and for the same reason: finished work nobody outside this machine can see. */
+.dep-stale b { color: var(--warn); }
+/* The comparison did not happen - a sha this clone has never seen, or a project
+   that has never deployed. Deliberately NOT green and NOT amber: it is neither
+   agreement nor disagreement, and colouring it as either would be a claim. */
+.dep-unknown { color: var(--muted); font-size: 10.5px; }
+.dep-row code { font-size: 10.5px; color: var(--accent); }
+/* A build that did not finish. Red, and above the live line rather than in
+   place of it: the site is still up, serving the commit underneath. */
+.dep-broke { font-size: 11px; color: var(--bad); margin-top: 3px; }
+.dep-broke b { color: var(--bad); }
+/* Three columns, not four: with the rows grouped, the lane is a fact about the
+   repository and lives in the header above them. */
+.cf-list .dep-row { grid-template-columns: 2fr 1fr auto; }
+/* The repository a run of site rows belongs to. One repo often serves several
+   Pages projects, and this header is what carries the directory so the rows
+   underneath do not each repeat it. Sits ABOVE the row border, not in the grid,
+   because it is not a fourth column of anything. */
+.cf-repo { display: flex; align-items: baseline; gap: 10px; font-size: 11.5px;
+           padding: 14px 0 4px; }
+.cf-repo b { color: var(--fg); }
+/* Sites nobody here builds. Same shape, deliberately not alarming: they are
+   served and healthy, they are just not ours to push. */
+.cf-repo-out { border-top: 1px solid var(--line); margin-top: 8px; }
+.cf-repo-out b { color: var(--muted); }
+/* The count that is the whole reason for grouping. */
+.cf-many { color: var(--accent); }
+/* A repository found by the commit the site is serving rather than by its
+   name - the only join on this pane that something outside the harness
+   checked, so it is the one that gets to look like a fact. */
+.cf-proved { color: var(--ok); font-size: 11px; }
+/* A name that matched and a commit that refused. Warn, not bad: nothing is
+   broken, a guess was declined. */
+.cf-refused { font-size: 11px; color: var(--warn); margin-top: 3px; }
+.dep-alarm { border-left: 2px solid var(--bad); padding-left: 8px; }
+
 /* Pull requests. Two lists, and the visual weight is deliberately on the second
    one: what is open on GitHub is already visible on GitHub, and what is finished
    here and has never left the machine is visible nowhere else. */
@@ -1112,9 +1346,64 @@ pre.diff, .ruling {
 .prs h4 { margin: 20px 0 8px; font-size: 12px; color: var(--muted);
           font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
 .pr-who { padding-bottom: 10px; }
-.pr-row { display: grid; grid-template-columns: 2.2fr 1fr 1fr; gap: 12px;
+
+/* The unattended handoff. Boxed rather than a line, because everything else in
+   this pane reports and this one thing ACTS - it opens pull requests and merges
+   them - and it must not read as another status strip. Deliberately not green:
+   nothing here has gone right yet, it is a switch. */
+.pr-auto { border: 1px solid var(--line); border-left: 2px solid var(--warn);
+           border-radius: 3px; padding: 10px 12px; margin: 2px 0 16px;
+           font-size: 11.5px; line-height: 1.7; }
+.pr-auto label { display: flex; align-items: center; gap: 7px; font-size: 12.5px;
+                 cursor: pointer; padding-bottom: 4px; }
+.pr-auto .muted { display: block; padding-top: 3px; }
+.pr-auto .warn { display: block; padding-top: 5px; }
+/* Nothing is switched on anywhere, so there is nothing to warn about. */
+.pr-auto-off { border-left-color: var(--line); }
+.pr-auto-act { padding-top: 8px; display: flex; align-items: center; gap: 10px; }
+/* A step under way. Written to the state file rather than held in the page, so
+   this is still here in a second tab and after a restart. */
+.pr-auto-busy { color: var(--warn); padding-top: 6px; }
+.pr-auto-log { padding-top: 8px; margin-top: 8px; border-top: 1px solid var(--line);
+               font-size: 11px; }
+.pr-auto-line { padding: 1px 0; }
+
+.pr-row { display: grid; grid-template-columns: 2.2fr 1fr 1fr auto; gap: 12px;
           padding: 9px 0; border-top: 1px solid var(--line); line-height: 1.6; }
 .pr-row a { color: #8ab4d8; }
+/* Anything that has to say more than fits in a cell: the reasons a merge was
+   refused, and what came back from trying to unstick it. */
+.pr-span { grid-column: 1 / -1; }
+.pr-act { display: flex; align-items: flex-start; gap: 6px; }
+/* The only green button in the console. It can only be drawn on a row GitHub
+   has already passed, so the colour is reporting a fact rather than inviting. */
+.pr-accept {
+  background: #1c2f22; color: #b7e0c2; border: 1px solid #2e5d3a;
+  border-radius: 6px; padding: 4px 10px; font-size: 11px; cursor: pointer;
+}
+.pr-accept:hover { background: #26402e; }
+.pr-resolve {
+  background: #2a2118; color: #d8c39a; border: 1px solid #5c4a2e;
+  border-radius: 6px; padding: 4px 10px; font-size: 11px; cursor: pointer;
+}
+.pr-resolve:hover { background: #3a2e20; }
+.pr-open {
+  background: #1e2b38; color: #cfe2f5; border: 1px solid #35506b;
+  border-radius: 6px; padding: 4px 10px; font-size: 11px; cursor: pointer;
+}
+.pr-open:hover { background: #2c3d51; }
+/* Deliberately NOT styled like the buttons beside it. Opening a page and
+   merging a branch must not look like the same kind of press. */
+.pr-btn { color: #8ab4d8; font-size: 11px; text-decoration: underline;
+          padding: 4px 2px; white-space: nowrap; }
+.pr-tier { display: inline-block; background: #23303f; border: 1px solid #3a5570;
+           border-radius: 10px; padding: 1px 8px; font-size: 10.5px;
+           color: #cfe2f5; margin-right: 6px; }
+/* A reading, not a result. Bordered rather than boxed-in colour, because
+   nothing in it was stored or run. */
+.pr-read { border-left: 2px solid var(--line); padding: 4px 0 4px 10px;
+           margin-top: 6px; font-size: 11px; line-height: 1.7;
+           white-space: pre-wrap; color: var(--muted); }
 /* A repository with nothing open, and one nobody could ask - same row, and the
    colour is the only thing that separates them. See the `why` in the markup. */
 .pr-quiets { padding-top: 8px; }
@@ -1176,6 +1465,28 @@ pre.diff, .ruling {
 .sp-plan .muted { font-size: 11px; }
 .sp-plan .sp-stop { margin-left: auto; }
 
+/* Why this document cannot be sharpened at all. Not a warning about a score -
+   the loop is structurally unable to move it - so it gets a full line rather
+   than a title on a chip nobody hovers. */
+.sp-blocked {
+  font-size: 11px; line-height: 1.6; color: var(--warn, #d9a441);
+  border-left: 2px solid var(--warn, #d9a441); padding: 2px 0 2px 8px; margin: 6px 0 0;
+}
+
+/* The half of the remedy that is a button. Inline in the sentence rather than
+   up on the row's button strip, because it fixes the thing the sentence just
+   described and belongs next to it. */
+.sp-blocked .sp-refresh {
+  font-size: 10px; padding: 1px 6px; margin-left: 6px; vertical-align: baseline;
+}
+
+/* A recorded reason that is not what happened. The run is over and nothing is
+   going wrong now - what is being corrected is what the line above it means. */
+.sp-misread {
+  color: var(--warn, #d9a441); font-size: 11px; line-height: 1.6;
+  border-left: 2px solid var(--warn, #d9a441); padding-left: 8px;
+}
+
 /* One rated number. The sentence behind it is on the title, because on the
    surface the numbers have to sit on one line together or they stop being
    comparable, which is the only thing they are for. */
@@ -1185,24 +1496,6 @@ pre.diff, .ruling {
 .sp-n b { color: var(--fg); font-weight: 500; }
 .sp-n.ok b { color: var(--ok); }
 .sp-n.warn { color: var(--warn); }
-/* What is already live. A second heading inside the same pane, because the two
-   halves answer different questions and the second one has no buttons at all. */
-.dep-h { margin: 26px 0 0; padding-top: 18px; border-top: 1px solid var(--line);
-         font-size: 14px; }
-/* Serving something older than the tree. The same amber as a stranded service,
-   and for the same reason: finished work nobody outside this machine can see. */
-.dep-stale b { color: var(--warn); }
-/* The comparison did not happen - a sha this clone has never seen, or a project
-   that has never deployed. Deliberately NOT green and NOT amber: it is neither
-   agreement nor disagreement, and colouring it as either would be a claim. */
-.dep-unknown { color: var(--muted); font-size: 10.5px; }
-.dep-row code { font-size: 10.5px; color: var(--accent); }
-/* A build that did not finish. Red, and above the live line rather than in
-   place of it: the site is still up, serving the commit underneath. */
-.dep-broke { font-size: 11px; color: var(--bad); margin-top: 3px; }
-.dep-broke b { color: var(--bad); }
-.dep-alarm { border-left: 2px solid var(--bad); padding-left: 8px; }
-
 .sp-n.live { color: #cfe2f5; }
 /* The one number that decides anything. */
 .sp-n.worth b { color: #cfe2f5; }
@@ -1307,6 +1600,10 @@ pre.diff, .ruling {
 .sp-v.bad { color: var(--warn); }
 .sp-defects { margin: 6px 0 0; padding: 0 0 0 20px; font-size: 11.5px; line-height: 1.65; }
 .sp-defects li { margin: 0 0 4px; }
+/* One review per document inside a round. Separated, because a round over eleven
+   documents is eleven verdicts and reading them as one block is how a demand
+   about one file gets attributed to another. */
+.sp-review + .sp-review { margin-top: 8px; padding-top: 7px; border-top: 1px dashed var(--line); }
 /* The writer's reply, set apart from the demands it is answering - reading them
    as one block is how you end up believing whichever spoke last. */
 .sp-reply { margin: 8px 0 0; border-left: 2px solid var(--line); padding: 0 0 0 9px; }
@@ -1379,8 +1676,122 @@ pre.diff, .ruling {
 .odds .on { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .odds.none .on { font-style: italic; }
 
+/* ---------- blockers: the flow ---------- */
+
+.flowpane { padding: 4px 2px 40px; overflow: auto; }
+
+.flow-head {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding: 2px 0 10px; border-bottom: 1px solid var(--line); font-size: 12px;
+}
+.flow-head .fh-l { color: var(--muted); min-width: 0; }
+.flow-head .fh-r { margin-left: auto; display: flex; gap: 8px; flex: 0 0 auto; }
+.flow-head .ac { font-size: 11px; color: var(--muted); }
+.flow-head .ac.on { color: var(--ok, #4ea); }
+.flow-head .ac.warn { color: var(--warn, #d9a441); }
+.flow-head .ac.offr { color: var(--line); }
+
+.flow-gates {
+  padding: 8px 0; font-size: 11px; color: var(--warn, #d9a441);
+  border-bottom: 1px solid var(--line);
+}
+
+.flow { padding: 12px 0 0; }
+
+/* One rung. The left stripe carries the state, because the state is the thing
+   you scan for and reading seven words to find it is not scanning. */
+.frung {
+  border: 1px solid var(--line); border-left: 3px solid var(--line);
+  border-radius: 6px; padding: 9px 12px; margin-bottom: 2px;
+  background: var(--panel2);
+}
+.frung.bad { border-left-color: var(--bad, #f87171); }
+.frung.gap { border-left-color: var(--accent); }
+.frung.off { border-left-color: var(--line); opacity: .6; }
+.frung.run { border-left-color: var(--amp, #d98a2b); }
+.frung.ready { border-left-color: var(--ok, #4ea); }
+.frung.ok { border-left-color: #2a3550; }
+/* The rung the lane is set to stop at. Everything below it is in reach and
+   everything above is switched off, so the line has to be visible. */
+.frung.ceiling { border-bottom-style: dashed; }
+
+.frung .fr-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.frung .fst { font-weight: 600; font-size: 13px; }
+.frung .fstate { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.frung.bad .fstate { color: var(--bad, #f87171); }
+.frung.gap .fstate { color: var(--accent); }
+.frung.ready .fstate { color: var(--ok, #4ea); }
+.frung.run .fstate { color: var(--amp, #d98a2b); }
+.frung.off .fstate, .frung.ok .fstate { color: var(--muted); }
+.frung .fmeans { font-size: 11px; color: var(--muted); }
+.frung .fceil {
+  margin-left: auto; font-size: 10px; color: var(--warn, #d9a441);
+  border: 1px solid #6b4c12; border-radius: 8px; padding: 1px 6px;
+}
+.frung .fruns { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.45; }
+.frung .fat { font-size: 11px; margin-top: 3px; font-variant-numeric: tabular-nums; }
+
+/* Who is on the hook. Colour by actor, not by severity: the useful split on
+   this screen is "the harness would do this" versus "only you can". */
+.who {
+  font-size: 10px; padding: 1px 6px; border-radius: 8px;
+  border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+}
+.who.operator { color: var(--warn, #d9a441); border-color: #6b4c12; }
+.who.architect { color: var(--accent); border-color: #1e3a8a; }
+.who.worker { color: var(--amp, #d98a2b); border-color: #7c4a12; }
+.who.supervisor { color: var(--ok, #4ea); border-color: #14532d; }
+
+.frung .fbs { margin-top: 7px; display: flex; flex-direction: column; gap: 4px; }
+.frung .fb { display: flex; align-items: baseline; gap: 8px; font-size: 11px; flex-wrap: wrap; }
+.frung .fb .what { color: var(--fg); flex: 0 0 auto; }
+/* `flex: 1 1 240px` and not `1 1 auto`: the reason is the longest thing on the
+   row, so it has to be allowed to take its own line rather than push the row
+   past the edge of the pane. */
+.fwhy { color: var(--muted); font-size: 11px; flex: 1 1 240px; min-width: 0; }
+
+.frung .facts { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+.frung .facts button { font-size: 11px; padding: 3px 9px; }
+/* A button that only opens a pane is drawn quieter than one that does the
+   thing: the difference between "this acts" and "this navigates" is the only
+   thing you need to know before pressing one. */
+.frung .facts button.goes { color: var(--muted); }
+/* Still the one to press on this rung, but outlined rather than filled: a solid
+   button that only changes tab promises to do something it does not do. */
+.frung .facts button.goes.primary {
+  background: transparent; border-color: #2563eb; color: #93b4fd;
+}
+.frung .facts button.goes.primary:hover:not(:disabled) { background: #16233f; }
+
+/* The join, drawn between the rungs it joins. Without these the panel is seven
+   cards and the thing it exists to show - that they are one pipeline - is the
+   one thing missing. */
+.fedge {
+  font-size: 11px; color: var(--muted);
+  padding: 4px 0 4px 14px; display: flex; align-items: baseline; gap: 6px;
+  flex-wrap: wrap;
+}
+.fedge .who { flex: 0 0 auto; }
+
+.flow-back { padding: 4px 0 40px; border-top: 1px solid var(--line); }
+.flow-back h4 { margin: 12px 0 6px; font-size: 12px; color: var(--muted); font-weight: 600; }
+.fbk {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 11px; margin-bottom: 5px; flex-wrap: wrap;
+}
+.fbk .fbe { flex: 0 0 150px; color: var(--fg); }
+.fbk .who { flex: 0 0 auto; }
+
 .dprop .hold { color: var(--warn, #d9a441); font-size: 11px; }
+/* Held on the harness rather than on the operator. The amber that means
+   "somebody has to do something" would be a lie about a queue already draining. */
+.dprop .hold.sharpening { color: var(--muted); font-style: italic; }
+/* Nor on the operator to decide again - they already decided, in Settings. Read
+   as a statement of the lane's setting, not as a task. */
+.dprop .hold.policy { color: var(--fg); font-weight: 600; }
 .dprop .auto-ok { color: var(--ok, #4ea); font-size: 11px; }
+/* Only ever reached by a button the server has already refused once. */
+.dprop .dp-go.warn { border-color: var(--warn, #d9a441); color: var(--warn, #d9a441); }
 .dprop .changed { color: var(--muted); font-size: 11px; margin: 3px 0; font-style: italic; }
 /* What it needs and nobody has. This is the list the sharpener attacks, so it
    is worth reading before deciding the odds are wrong. */
@@ -1391,6 +1802,68 @@ pre.diff, .ruling {
 /* A proposal the architect says it cannot move any further. Still pressable,
    because "the architect can't move this" is not "this is dead". */
 .dp-s.dim { opacity: .55; }
+
+/* What the selected lane is for. Collapsed by default: it is the standard the
+   list below is proposed against, so it belongs on this tab, but it is edited
+   rarely and read constantly, and open by default it would push the thing the
+   tab is named for off the screen. */
+.lanedir { border: 1px solid var(--line); border-radius: 6px; margin: 0 0 14px;
+           background: var(--panel2); }
+.lanedir > summary { padding: 9px 12px; cursor: pointer; user-select: none; }
+.lanedir[open] > summary { border-bottom: 1px solid var(--line); }
+/* Both accordion bodies, and they must stay one rule. The doctrine panel was
+   added with its own markup and no layout at all: block flow, no padding, so
+   every control sat flush against the panel border with nothing between it and
+   the next. Two panels that look the same and are styled apart drift the moment
+   one of them is touched. */
+#ld-body, #dc-body { padding: 12px; display: grid; gap: 12px; }
+.ld-f { display: grid; gap: 4px; }
+.ld-f > b { font-weight: 600; }
+.ld-f > .muted { font-size: 11px; }
+.ld-f textarea, .ld-f input, .ld-f select {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 4px; padding: 6px 8px; font: 12px/1.5 var(--mono); resize: vertical; }
+.ld-f textarea:focus, .ld-f input:focus { outline: none; border-color: var(--accent); }
+.ld-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* The judged rung next to the written claim. Muted when a review has recorded
+   one, warned when none has - because a lane with no reviews is the one where a
+   confident claim below is least likely to have been earned. */
+.ld-rung { color: var(--muted); }
+.ld-rung.none { color: var(--warn); }
+.ld-why { border-left: 2px solid var(--line); padding-left: 10px; margin-top: 8px; }
+.ld-why > b { display: block; margin-bottom: 4px; }
+
+/* The lane's own direction, read. Left-ruled in the accent so it cannot be
+   skimmed as part of the workspace sections below it - those answer the same
+   questions at a wider scope and share two of their headings word for word. */
+.ldread .dsec { border-top: none; padding-top: 0; }
+.ldread .dsec > .muted { font-size: 11px; margin-bottom: 10px; }
+.ldr { border-left: 2px solid var(--accent); padding: 0 0 0 11px; margin: 12px 0; }
+.ldr h5 { margin: 0 0 4px; font-size: 11px; color: var(--muted); font-weight: 600; }
+.ldr .md { font-size: 12.5px; line-height: 1.7; }
+
+/* The workspace doctrine's own numbers. Counted off disk, never scored - a cell
+   warns when it is reporting a shortfall somebody can act on (a lane with no
+   direction, a finding calling this file false), and stays plain when it is
+   only reporting a size. */
+/* No bottom margins on these three: #dc-body is a grid and its 12px gap owns the
+   spacing between them. Carrying both gave an uneven 24/20/24/12/12 rhythm. */
+.dc-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px; }
+.dcs { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+  display: grid; gap: 2px; }
+.dcs > b { font-size: 16px; font-weight: 600; }
+.dcs > span { font-size: 11px; color: var(--muted); line-height: 1.4; }
+.dcs.warn { border-color: var(--warn); }
+.dc-pin { font-size: 11px; }
+.dc-pin code { font-size: 10.5px; }
+.dc-secs { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; }
+/* One item from a reading of the doctrine. Ruled by what it is claiming: a
+   contradiction is a different thing from a section that has gone stale. */
+.dcq { border-left: 2px solid var(--line); padding-left: 10px; margin: 8px 0; }
+.dcq.bad { border-left-color: var(--bad); }
+.dcq.warn { border-left-color: var(--warn); }
+.dcq blockquote { margin: 0 0 4px; color: var(--muted); font-style: italic; }
 
 /* The state of the direction itself, above the list it is about. "Nowhere left
    to go" used to look exactly like "nothing has run yet", which is a different
@@ -1581,3 +2054,321 @@ pre.diff, .ruling {
   color: var(--ok); border-left: 2px solid var(--ok);
   padding: 4px 0 4px 8px;
 }
+
+/* ---------- blueprint ----------
+   Takes the whole page under the header instead of floating over it, so it gets
+   `main`'s flex slot rather than a z-index. Opening it puts `.hidden` on `main`,
+   which is what makes this a swap rather than an overlay: both cannot be on
+   screen at once. */
+
+.blueprint {
+  flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg);
+}
+
+.bp-tabs {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 14px; background: var(--panel);
+  border-bottom: 1px solid var(--line); flex: 0 0 auto;
+}
+.bp-tab {
+  padding: 5px 14px; border-radius: 14px; font-size: 12px;
+  background: transparent; border: 1px solid var(--line); color: var(--muted);
+}
+.bp-tab:hover { color: var(--fg); }
+.bp-tab.active { color: var(--bg); background: var(--amp); border-color: var(--amp); font-weight: 600; }
+.bp-note { flex: 1 1 auto; font-size: 11px; color: var(--muted); padding-left: 10px; }
+
+.bp-pane { display: none; flex: 1 1 auto; min-height: 0; overflow: auto; padding: 14px; }
+.bp-pane.active { display: block; }
+
+.bp-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding-bottom: 10px; margin-bottom: 10px; border-bottom: 1px solid var(--line);
+}
+.bp-bar .muted { flex: 1 1 320px; font-size: 11px; }
+
+/* --- flow ---
+   The one pane that does not scroll: cytoscape draws into whatever box it is
+   given, and a box with no height of its own draws nothing at all. So this pane
+   is a flex column and the canvas takes what is left. */
+
+#bp-pane-flow.active {
+  display: flex; flex-direction: column; overflow: hidden; position: relative;
+}
+.bp-flow { flex: 1 1 auto; min-height: 320px; position: relative; }
+.bp-flow-none {
+  display: flex; align-items: center; justify-content: center; height: 100%;
+  padding: 0 40px; text-align: center; color: var(--muted); font-size: 13px;
+}
+
+.bp-lens { display: inline-flex; gap: 4px; }
+.bp-lensb {
+  padding: 3px 11px; border-radius: 12px; font-size: 11px;
+  background: transparent; border: 1px solid var(--line); color: var(--muted);
+}
+.bp-lensb:hover { color: var(--fg); }
+.bp-lensb.active { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+.bp-flow-args { display: inline-flex; gap: 10px; align-items: center; font-size: 11px; }
+.bp-flow-args label { display: flex; align-items: center; gap: 5px; color: var(--muted); }
+.bp-flow-args.hidden { display: none; }
+
+.bp-legend { display: flex; flex-wrap: wrap; gap: 12px; padding-top: 8px; flex: 0 0 auto; }
+.bp-leg { font-size: 11px; color: var(--fg); }
+.bp-leg::before {
+  content: ''; display: inline-block; width: 9px; height: 9px; margin-right: 5px;
+  border-radius: 2px; background: var(--muted); vertical-align: middle;
+}
+.bp-leg-armed::before { background: var(--ok); }
+.bp-leg-off::before { background: var(--muted); }
+.bp-leg-broken::before, .bp-leg-empty::before { background: var(--bad); }
+.bp-leg-port::before { background: var(--accent); border-radius: 50%; }
+.bp-leg-unjudged::before { background: var(--warn); }
+.bp-leg-actor::before { background: var(--accent); }
+.bp-leg-ceiling::before { background: var(--warn); }
+.bp-leg-out::before { background: var(--muted); opacity: .45; }
+.bp-leg-feedback::before { background: #6a5a8a; }
+/* The levels above one lane. `advises` and `draft` are both hollow on purpose:
+   the two of them are the claim this screen is most able to overstate, and an
+   outline says `nothing has happened yet` before the words are read. */
+.bp-leg-measure::before { background: #5f7d3f; }
+.bp-leg-call::before { background: #41607e; }
+.bp-leg-written::before { background: #3b4756; border-radius: 0; }
+.bp-leg-current::before { background: var(--amp); }
+.bp-leg-waiting::before { background: transparent; border: 1px dashed #a0761f; }
+.bp-leg-advises::before { background: transparent; border: 1px dashed #8a7ab0; }
+.bp-leg-draft::before { background: transparent; border: 1px dashed #a0761f; }
+/* A sentence, not a key. It has no swatch because it is not naming anything on
+   the canvas - it is naming what is deliberately NOT on it. */
+.bp-leg-note::before { display: none; }
+
+/* Floated over the canvas, because a panel that pushes the graph shorter
+   re-lays-out the thing you just clicked out from under the pointer. */
+.bp-tip {
+  position: absolute; right: 16px; bottom: 54px; width: 320px;
+  max-height: 70%; overflow: auto;
+  padding: 10px 12px; border-radius: 8px; font-size: 12px;
+  background: var(--panel); border: 1px solid var(--accent);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .45);
+}
+.bp-tip .muted { font-size: 11px; margin-top: 3px; }
+
+/* One control per row, with what it does underneath it. The Agents lens is the
+   one place in this screen that writes, so every switch says what it changes
+   without being hovered. */
+.bp-row { padding: 7px 0; border-top: 1px solid var(--line); }
+.bp-row:first-of-type { border-top: 0; }
+.bp-row label { display: flex; align-items: center; gap: 6px; }
+.bp-row select { max-width: 190px; }
+
+/* A jump reads as a link rather than as a switch, because it changes nothing.
+   It only moves you to where what this node does can actually be read. */
+.bp-gotob {
+  background: transparent; border: 0; padding: 0; text-align: left;
+  color: var(--accent); font: inherit; cursor: pointer; text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.bp-gotob:hover { color: var(--fg); }
+
+/* --- map --- */
+
+.bp-grid { border-collapse: collapse; width: 100%; }
+.bp-grid th, .bp-grid td {
+  border: 1px solid var(--line); vertical-align: top; padding: 8px;
+}
+.bp-grid thead th {
+  background: var(--panel); color: var(--amp); font-size: 12px;
+  text-align: left; position: sticky; top: -14px;
+}
+/* The rung column is the claim this screen makes, so it reads as a label with a
+   sentence under it rather than a bare word somebody could take for a setting. */
+.bp-grid th.bp-rung {
+  width: 150px; background: var(--panel2); color: var(--fg);
+  font-size: 12px; text-align: left; font-weight: 600;
+}
+.bp-why { display: block; font-weight: 400; font-size: 10px; color: var(--muted); margin-top: 2px; }
+.bp-none { color: #2c333d; }
+
+.bp-lane {
+  display: inline-block; margin: 0 4px 4px 0; padding: 4px 8px;
+  border-radius: 5px; background: var(--panel2); border: 1px solid var(--line);
+  color: var(--fg); font-size: 12px; cursor: pointer;
+}
+.bp-lane:hover { border-color: var(--accent); }
+.bp-lane.bad { border-color: var(--bad); }
+.bp-flag { display: block; font-size: 10px; color: var(--muted); }
+.bp-lane.bad .bp-flag { color: var(--bad); }
+
+.bp-x {
+  margin-left: 6px; padding: 0 5px; border-radius: 8px; font-size: 11px;
+  background: transparent; border: 1px solid var(--line); color: var(--muted);
+}
+.bp-x:hover { color: var(--bad); border-color: var(--bad); }
+
+.bp-h { margin: 18px 0 6px; font-size: 12px; color: var(--amp); }
+.bp-edges { margin: 0; padding-left: 18px; font-size: 12px; }
+.bp-edges li { padding: 2px 0; }
+.bp-kind { color: var(--accent); }
+
+.bp-node {
+  margin-top: 16px; padding: 12px 14px; border-radius: 8px;
+  background: var(--panel); border: 1px solid var(--line);
+}
+.bp-node-head { display: flex; align-items: baseline; gap: 10px; }
+.bp-node-head h3 { margin: 0; font-size: 14px; color: var(--amp); }
+.bp-node-head .muted { flex: 1 1 auto; font-size: 11px; }
+.bp-node-head button {
+  background: transparent; border: 1px solid var(--line); color: var(--muted);
+  border-radius: 10px; padding: 0 8px;
+}
+.bp-place { display: flex; align-items: center; gap: 12px; margin: 10px 0; font-size: 12px; }
+.bp-place .muted { font-size: 11px; }
+.bp-field { margin: 8px 0; font-size: 12px; }
+.bp-field b { color: var(--accent); font-weight: 600; }
+.bp-field p { margin: 2px 0 0; color: var(--fg); }
+.bp-counts { margin: 10px 0; font-size: 11px; color: var(--muted); }
+
+/* --- the layer draft --- */
+
+.bp-draft {
+  padding: 12px 14px; margin-bottom: 14px; border-radius: 8px;
+  background: var(--panel); border: 1px solid var(--accent); font-size: 12px;
+}
+.bp-draft-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.bp-draft-head h4 { margin: 0; font-size: 13px; color: var(--amp); }
+.bp-draft-head .muted, .bp-draft-head .warn { flex: 1 1 auto; font-size: 11px; }
+.bp-draft-layer {
+  padding: 8px 10px; margin-bottom: 8px; border-radius: 6px;
+  background: var(--panel2); border: 1px solid var(--line);
+}
+/* Left out is drawn dimmer but not smaller: it is a real answer, and on a first
+   draft it is often the most informative row on the screen. */
+.bp-draft-layer.out { border-style: dashed; }
+.bp-draft-top { display: flex; align-items: center; gap: 8px; }
+.bp-draft-top input { flex: 0 1 220px; font-weight: 600; }
+.bp-draft-top .muted { flex: 1 1 auto; font-size: 11px; }
+.bp-draft-note { width: 100%; margin-top: 6px; color: var(--muted); }
+.bp-draft-lanes { list-style: none; margin: 8px 0 0; padding: 0; }
+.bp-draft-lanes li {
+  display: flex; align-items: center; gap: 8px; padding: 3px 0;
+}
+.bp-draft-lanes b { flex: 0 0 auto; color: var(--fg); }
+.bp-draft-lanes .muted, .bp-draft-lanes .warn { flex: 1 1 auto; font-size: 11px; }
+.bp-draft-lanes select { flex: 0 0 auto; font-size: 11px; }
+.bp-draft-act { margin-top: 10px; }
+.bp-draft-act .muted { flex: 1 1 240px; font-size: 11px; }
+.bp-raw {
+  max-height: 220px; overflow: auto; font-size: 11px; color: var(--muted);
+  white-space: pre-wrap; margin: 8px 0;
+}
+
+/* --- triggers --- */
+
+.bp-form {
+  padding: 12px 14px; margin-bottom: 12px; border-radius: 8px;
+  background: var(--panel); border: 1px solid var(--accent);
+  display: flex; flex-direction: column; gap: 8px; font-size: 12px;
+}
+.bp-form .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.bp-form label { display: flex; align-items: center; gap: 6px; }
+.bp-form textarea, .bp-form input { width: 100%; }
+.bp-form > label { flex-direction: column; align-items: stretch; gap: 3px; color: var(--muted); }
+
+.bp-trig {
+  padding: 10px 12px; margin-bottom: 10px; border-radius: 8px;
+  background: var(--panel); border: 1px solid var(--line); font-size: 12px;
+}
+/* An unarmed trigger is dimmed, not hidden: what it WOULD do is the reason to
+   arm it, and you cannot read that off a list it has been dropped from. */
+.bp-trig.off { opacity: .62; }
+.bp-trig.broken { border-color: var(--bad); }
+.bp-trig-head { display: flex; align-items: center; gap: 10px; }
+.bp-arm { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11px; }
+.bp-when { flex: 1 1 auto; }
+.bp-when b { color: var(--amp); }
+.bp-trig-body { padding-left: 4px; margin-top: 6px; }
+.bp-arrow { color: var(--accent); margin: 6px 0 4px; }
+.bp-arrow b { color: var(--amp); }
+.bp-obj {
+  margin: 0; padding: 8px 10px; border-radius: 6px; white-space: pre-wrap;
+  background: var(--bg); border: 1px solid var(--line); color: var(--fg);
+}
+.bp-trig-foot { margin-top: 6px; font-size: 11px; color: var(--muted); }
+.bp-trig-foot b { color: var(--warn); }
+.bp-hist { margin-top: 6px; font-size: 11px; color: var(--muted); }
+.bp-hist ul { margin: 4px 0 0; padding-left: 18px; }
+
+/* A port reads differently from a lane on purpose: crossing a workspace is the
+   one thing on this screen that does not take effect where you pressed it. */
+.bp-port {
+  padding: 1px 6px; border-radius: 10px; font-size: 11px;
+  background: var(--bg); border: 1px solid var(--accent); color: var(--accent);
+}
+.bp-inbox { margin-bottom: 12px; border-left: 2px solid var(--accent); padding-left: 8px; }
+
+/* --- context --- */
+
+.bp-ctx-head h3 { margin: 0 0 2px; font-size: 14px; color: var(--amp); }
+.bp-ctx-head .muted { font-size: 11px; }
+.bp-ctx-sum { margin-top: 6px; font-size: 12px; color: var(--fg); }
+.bp-ctx-sum b { color: var(--accent); }
+
+.bp-nosubject {
+  padding: 14px; border-radius: 8px; font-size: 12px;
+  background: var(--panel); border: 1px solid var(--line); color: var(--muted);
+}
+
+/* A block that was built and came back empty. Amber rather than red - it is
+   usually correct and always worth reading, because it is the one part of the
+   prompt you cannot see by scrolling the prompt. */
+.bp-empty-blocks {
+  margin: 12px 0; padding: 10px 12px; border-radius: 8px; font-size: 12px;
+  background: #22201a; border: 1px solid #3f3826; color: #d8cba6;
+}
+.bp-empty-blocks ul { margin: 6px 0 0; padding-left: 18px; }
+.bp-empty-blocks code { color: var(--amp); }
+
+.bp-blocks { margin-top: 12px; }
+.bp-block {
+  margin-bottom: 8px; padding: 8px 10px; border-radius: 8px;
+  background: var(--panel); border: 1px solid var(--line);
+}
+.bp-block-head { display: flex; align-items: center; gap: 8px; }
+.bp-block-name { flex: 1 1 auto; color: var(--fg); font-weight: 600; }
+.bp-sub { font-size: 10px; color: var(--warn); }
+/* The share of the prompt, drawn as the number and as the bar it fills. Two
+   blocks that both say "8%" are hard to compare; two bars are not. */
+.bp-size {
+  position: relative; font-size: 10px; color: var(--muted);
+  padding: 2px 6px; border-radius: 4px; background: var(--bg); min-width: 190px;
+  text-align: right; overflow: hidden;
+}
+.bp-size::before {
+  content: ''; position: absolute; inset: 0 auto 0 0; width: var(--w);
+  background: #1d2a3a;
+}
+.bp-block-from { margin-top: 4px; font-size: 11px; }
+.bp-block-from code { color: var(--accent); }
+.bp-shared {
+  margin-left: 6px; padding: 0 5px; border-radius: 8px; font-size: 10px;
+  background: #1b2530; color: var(--accent);
+}
+.bp-reads { margin-top: 3px; font-size: 11px; color: var(--muted); }
+.bp-reads code { color: #9fb4cc; }
+.bp-body { margin-top: 6px; }
+.bp-body summary { cursor: pointer; color: var(--muted); font-size: 11px; }
+.bp-body pre {
+  margin: 6px 0 0; padding: 10px; max-height: 460px; overflow: auto;
+  white-space: pre-wrap; border-radius: 6px;
+  background: var(--bg); border: 1px solid var(--line); font-size: 11px;
+}
+
+.bp-drill {
+  position: sticky; bottom: 0; margin-top: 12px;
+  padding: 10px 12px; border-radius: 8px; font-size: 12px;
+  background: var(--panel2); border: 1px solid var(--accent);
+}
+.bp-drill textarea { width: 100%; margin: 6px 0; }
+.bp-drill .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.bp-drill .muted { flex: 1 1 260px; font-size: 10px; }

@@ -10,5 +10,9 @@ config.json
 packets/
 rulings/
 
-# Server log from a locally launched console.
+# Throwaway state for a preview-launched console (see .claude/launch.json).
+.amp-preview/
+
+# Server logs from a locally launched console.
 .amp-server.log
+.server-*.log

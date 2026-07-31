@@ -7,8 +7,25 @@ const state = {
   goals: [], goal: null, observations: [], dismissed: new Set(), resumeOf: null,
   findings: [], findingsAll: false, findingsSeen: -1, direction: null,
   obligations: [], obligationsSeen: -1, workspace: null, supervisor: null,
-  settings: null, preview: null, pstamp: null,
+  settings: null, preview: null, pstamp: null, depAll: false, prAll: false,
   specBusy: null, specPoll: null, specWork: null,
+  // How the thread is being read: `feed` is every line in the order it
+  // happened, `brief` is a second model's read of the same thing. Kept in the
+  // browser rather than in the harness's state, because it is what this person
+  // wants to look at right now and not a fact about the workspace - but kept
+  // ACROSS reloads, because a preference the console forgets every time you
+  // press F5 is one you end up setting instead of using.
+  dock: localStorage.getItem('amp.dock') === 'brief' ? 'brief' : 'feed',
+  // Which spec runs the operator has folded open or shut, by row. The Specs pane
+  // rewrites itself every four seconds while anything is live, so without this
+  // the fold is recomputed from a default on every tick and the operator's press
+  // is undone. Kept out of the render path deliberately: this is what the person
+  // did, and it outranks what the row would have opened as.
+  specOpen: {},
+  // Transcripts of older runs, by run id, once fetched. An older run is finished,
+  // so its rounds do not change - and without this the repaint would drop back to
+  // the placeholder and ask the server for the same bytes every four seconds.
+  specRounds: {},
 };
 
 async function api(path, opts) {
@@ -385,6 +402,12 @@ function renderSettings(s) {
   if (document.activeElement !== nb) nb.value = Math.round((s.adopt_need ?? 0.5) * 100);
   $('set-need-out').textContent = nb.value + '%';
   $('set-cal').innerHTML = calBlock(s.calibration, (s.adopt_confidence ?? 0.6));
+  // Same rule as the sliders: never write a value back under a field the
+  // operator is still typing in. The ceiling comes from the server rather than
+  // the HTML so the box cannot offer a number the server will refuse.
+  const sr = $('set-spec-rounds');
+  if (s.spec_max_rounds_limit) sr.max = s.spec_max_rounds_limit;
+  if (document.activeElement !== sr && s.spec_max_rounds) sr.value = s.spec_max_rounds;
   renderSpend(s);
 }
 
@@ -410,6 +433,9 @@ async function setFlag(key, value) {
       : key === 'adopt_need'
       ? `only goals the mission wants ${Math.round(value * 100)}% or more start on their ` +
         'own. Everything already waiting was just re-judged against it.'
+      : key === 'spec_max_rounds'
+      ? `spec runs get ${value} review rounds per document before they cap. ` +
+        'Runs already stopped stay stopped.'
       : 'saved.';
   st.className = 'good';
   await refresh();
@@ -611,6 +637,68 @@ async function cxDone(msg) {
 // slowly than the poll. So the cheap fix and the correct one are the same:
 // don't touch the DOM unless the output differs. Same rule the obligations and
 // findings lists already follow.
+// What each lane is rated on, in the order the work actually travels: is there
+// somewhere to go, is it designed, did the goals land, did the workers, how far
+// up the evidence ladder a review has judged it, what is still holding, and how
+// much of what came back has been settled.
+//
+// This list used to be the last five tasks the lane ran. That is a log, and a
+// log answers "what happened" - which is the one question the panes behind it
+// already answer, eleven times over. It never answered "which lane is the one
+// holding this up", and that is the only question a sidebar is any good at.
+//
+// Every number here is measured off a record already on disk (see
+// `amp.lane_ratings`), carries the counts it was computed from in its tooltip,
+// and reads `unscored` rather than 0% when nothing has been measured - because
+// the fix for unmeasured is to measure and the fix for low is to work, and a
+// zero that means both is worse than no number.
+const LANE_RATINGS = [
+  ['direction', 'direction'],
+  ['spec', 'spec'],
+  ['goals', 'goals'],
+  ['workers', 'workers'],
+  ['evidence', 'evidence'],
+  ['standing', 'standing'],
+  ['settled', 'settled'],
+];
+
+/** One lane rating as a narrow bar. Same shape as `meter`, sized for the
+ *  sidebar, and titled with the counts rather than an adjective. */
+function laneMeter(label, r) {
+  if (!r) return '';
+  const why = esc(r.why || '');
+  // The empty track is drawn even with nothing in it, so the seven rows line up
+  // in one column. Without it an unmeasured rating collapses to a dash beside
+  // its label and reads as a missing row rather than a missing measurement.
+  if (r.value === null || r.value === undefined)
+    return `<div class="lr none" title="${why}"><span class="ll">${label}</span>` +
+      `<span class="lm"></span><span class="lv">&mdash;</span></div>`;
+  const pc = Math.round(r.value * 100);
+  const bar = r.bar === null || r.bar === undefined ? null : r.bar;
+  const tone = bar === null ? 'flat' : r.value >= bar ? 'good' : 'low';
+  return `<div class="lr ${tone}" title="${why}"><span class="ll">${label}</span>` +
+    `<span class="lm"><i style="width:${pc}%"></i>` +
+    (bar === null ? '' : `<u style="left:${Math.round(bar * 100)}%"></u>`) +
+    `</span><span class="lv">${pc}%</span></div>`;
+}
+
+/** The automation stage picker. Not a badge: the badge said which worker binary
+ *  would run, which is on the Dispatch pane anyway. This says how far work is
+ *  allowed to be carried in this lane unattended, and it is enforced - see
+ *  `amp.stage_admits`, called from proposal_hold, spec_auto_on and
+ *  goal_dispatch. A rung the harness cannot drive on its own is marked, so the
+ *  dropdown never implies an automation that does not exist. */
+function stagePick(l) {
+  const opts = (state.stages || []).map((s) => {
+    const mark = s.automated ? '' : ' \u00b7 by hand';
+    return `<option value="${esc(s.key)}"${s.key === l.stage ? ' selected' : ''} ` +
+      `title="${esc(s.means)} (${esc(s.who)})">${esc(s.key)}${mark}</option>`;
+  }).join('');
+  if (!opts) return `<span class="pill">${esc(l.stage || '')}</span>`;
+  return `<select class="stage-pick" data-lane="${esc(l.name)}" ` +
+    `title="how far work is carried in this lane without you">${opts}</select>`;
+}
+
 function renderLanes() {
   const el = $('lane-list');
   if (!state.lanes.length) {
@@ -619,21 +707,16 @@ function renderLanes() {
   }
   const html = state.lanes
     .map((l) => {
-      const tasks = (l.tasks || [])
-        .map(
-          (t) =>
-            `<div class="t"><span class="pill ${esc((t.status || '').toLowerCase())}">${esc(t.status)}</span>` +
-            (t.cost_usd ? `<span class="cost">$${t.cost_usd.toFixed(3)}</span>` : '') +
-            `<span>${esc((t.title || '').replace(/\n/g, ' ').slice(0, 30))}</span></div>`
-        )
-        .join('');
+      const rt = l.ratings || {};
+      const rows = LANE_RATINGS.map(([k, label]) => laneMeter(label, rt[k])).join('');
       return (
         `<div class="lane ${state.sel === l.name ? 'sel' : ''}" data-lane="${esc(l.name)}">` +
         `<div class="n"><span class="name">${esc(l.name)}</span>` +
-        `<span class="pill be-${esc(l.backend)}">${esc(l.backend)}</span>` +
+        (l.mode && l.mode !== 'build' ? `<span class="pill mode">${esc(l.mode)}</span>` : '') +
         (l.bound ? '' : '<span class="pill unbound">no env</span>') +
+        stagePick(l) +
         `</div><div class="repo">${esc(l.repo)} &middot; ${esc(l.branch)}</div>` +
-        `<div class="tasks">${tasks}</div></div>`
+        `<div class="lrs">${rows}</div></div>`
       );
     })
     .join('');
@@ -643,11 +726,28 @@ function renderLanes() {
   el.querySelectorAll('.lane').forEach((n) =>
     n.addEventListener('click', () => select(n.dataset.lane))
   );
+  // A click on the dropdown is not a click on the lane: picking a stage for a
+  // lane you are not in is a thing you should be able to do without moving.
+  el.querySelectorAll('.stage-pick').forEach((s) => {
+    s.addEventListener('click', (e) => e.stopPropagation());
+    s.addEventListener('change', async (e) => {
+      e.stopPropagation();
+      const r = await post('/api/lane/stage', { lane: s.dataset.lane, stage: s.value });
+      if (r && r.ok === false) alert(r.error || 'could not set the stage');
+      refresh();
+      if ($('pane-blockers').classList.contains('active')) loadBlockers();
+    });
+  });
 }
 
 /** Write `html` into `el` only if it differs. Returns whether it wrote. */
 function paintLanes(el, html) {
   if (el.dataset.painted === html) return false;
+  // The list now contains a control. Rebuilding it while someone has that
+  // control open closes their dropdown mid-choice - and the poll runs every 3s,
+  // so it would happen most times they tried. Leave it alone until they are
+  // done; the next tick paints it.
+  if (el.contains(document.activeElement) && document.activeElement !== el) return false;
   const top = el.scrollTop;
   el.innerHTML = html;
   el.dataset.painted = html;
@@ -660,7 +760,7 @@ function select(name) {
   const changed = state.sel !== name;
   state.sel = name;
   const lane = state.lanes.find((l) => l.name === name);
-  ['d-lane', 'f-lane', 'a-lane', 'l-lane', 'p-lane'].forEach((id) => ($(id).textContent = name || '—'));
+  ['d-lane', 'f-lane', 'a-lane', 'l-lane', 'p-lane', 'b-lane'].forEach((id) => ($(id).textContent = name || '—'));
   fillSessions(name);
   if (lane) {
     $('d-branch').value = lane.branch || 'main';
@@ -679,11 +779,33 @@ function select(name) {
     $('p-frame').classList.add('hidden');
     $('p-frame').removeAttribute('src');
     $('p-empty').classList.remove('hidden');
+    // Same rule for every other pane that holds one lane's output: the heading
+    // now says the new lane, so anything still on screen underneath it is the
+    // old lane's work wearing the new lane's name. Drop it, then reload
+    // whichever pane is actually being looked at.
+    state.log = null;
+    $('l-out').innerHTML = '<div class="empty">Pick a session, then Load.</div>';
+    $('l-live').classList.add('hidden');
+    $('f-out').textContent = 'Poll a lane, then Load.';
+    // A goal id belongs to the lane it was opened in, so it cannot stay open
+    // across the change.
+    state.goal = null;
+    renderGoals();
+    if ($('pane-log').classList.contains('active')) loadLog();
     if ($('pane-ask').classList.contains('active')) loadConsults(name);
     if ($('pane-direction').classList.contains('active')) loadDirection();
+    // Always - every rung of this diagram is one lane's rung, so a lane change
+    // makes all of it somebody else's.
+    state.flow = null;
+    if ($('pane-blockers').classList.contains('active')) loadBlockers();
     // Always - the tab shows one lane's documents now, so a lane change is a
     // change of everything on it.
     if ($('pane-specs').classList.contains('active')) loadSpec();
+    // Only when it is narrowed. Widened, this pane is not about the selected
+    // lane at all, so nothing on it went stale - and reloading it anyway would
+    // spend a wrangler start-up per site to redraw the same screen.
+    if ($('pane-publish').classList.contains('active') && !state.depAll) loadDeploy();
+    if ($('pane-prs').classList.contains('active') && !state.prAll) loadPrs();
     if (previewActive()) loadPreview();
   }
 }
@@ -872,15 +994,18 @@ function md(src) {
 
 const TURN_LABEL = { text: '', thinking: 'thinking', tool: '', result: '' };
 
+// Units spelled out rather than abbreviated: "5 min ago" is read at a glance,
+// "5m ago" is read as a minute or a month depending on who is reading it.
 function timeAgo(iso) {
   const t = Date.parse(iso || '');
   if (!t) return '';
   const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  const plural = (v, unit) => `${v} ${unit}${v === 1 ? '' : 's'} ago`;
   if (s < 10) return 'just now';
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-  return `${Math.floor(s / 86400)}d ago`;
+  if (s < 60) return `${s} sec ago`;
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return plural(Math.floor(s / 3600), 'hour');
+  return plural(Math.floor(s / 86400), 'day');
 }
 
 // The stamp carries its own instant, so it can be re-read later without
@@ -1019,9 +1144,19 @@ function dockLine(m) {
            `<ul class="qs">${(m.questions || []).map((q) => `<li>${esc(q)}</li>`).join('')}</ul>` +
            `</span><button class="dm-open" data-goal="${esc(m.goal_id)}" ` +
            `data-lane="${esc(m.lane)}">answer</button></div>`;
-  // The orchestrator's own conversation, rendered in full: this one is not a
-  // summary of something you can open elsewhere, it IS the thing.
-  if (m.kind === 'you')
+  // The briefer's side, and yours to it. Drawn as ordinary messages and not as
+  // a panel: it is a conversation with someone watching the board, and the one
+  // thing it must not look like is the dashboard it exists to replace. Your
+  // line to it uses the same bubble as your line to the orchestrator, because
+  // it is the same person talking - and the two can never appear together,
+  // since each mode only ever shows one of them.
+  if (m.kind === 'brief') {
+    const spend = m.cost_usd ? ` $${m.cost_usd.toFixed(3)}` : '';
+    return `<div class="dm brief"><span class="dm-at">${at}</span>` +
+           `<span class="dm-body md">${md(m.text)}` +
+           (spend ? `<span class="muted spend">${spend}</span>` : '') + `</span></div>`;
+  }
+  if (m.kind === 'brief-you' || m.kind === 'you')
     return `<div class="dm said"><span class="dm-at">${at}</span>` +
            `<span class="dm-body">${esc(m.text)}</span></div>`;
   // The harness asking on its own initiative. Marked, and never drawn as `you`:
@@ -1066,18 +1201,71 @@ function dockLine(m) {
          `<br>${esc(m.text)}</span>${open}</div>`;
 }
 
+// In briefing mode the brief stands in for everything the board DID - the
+// dispatches, the results, the rulings, the asides. What survives the filter is
+// what a summary cannot stand in for: the operator's own lines, the
+// orchestrator answering them, a goal that has stopped and cannot go on without
+// a decision, and work that is running RIGHT NOW. Summarising a question you
+// are expected to answer, or hiding the reply to what you just typed, would
+// make the mode unusable.
+//
+// A FINISHED worker run is the one case worth spelling out. It reads like it
+// belongs - it is addressed to you - but it is precisely what the brief is a
+// summary OF, and this board holds 54 of them: keeping them showed the thread
+// and its summary at the same time, which is the noise the mode exists to drop.
+// A run still going is different: no summary written a minute ago can tell you
+// that something is happening now.
+const DOCK_LIVE = new Set(['you', 'harness', 'question']);
+const dockLive = (m) => DOCK_LIVE.has(m.kind)
+  || (m.kind === 'amp' && m.status === 'running');
+
+// The briefer's side of the conversation, and yours to it, as messages rather
+// than a panel. They carry their own `at`, so they merge into the thread by time
+// like everything else and read as one exchange instead of a summary sitting on
+// top of a list.
+function briefTurns(b) {
+  if (!b || !b.turns) return [];
+  return b.turns.map((t) => ({
+    kind: t.role === 'you' ? 'brief-you' : 'brief',
+    at: t.at, text: t.text, cost_usd: t.cost_usd,
+  }));
+}
+
 async function loadChat() {
-  const r = await api('/api/chat');
+  const brief = state.dock === 'brief';
+  // Asked for in the same call as the messages, not a second one: what the
+  // briefer is told has to be the thread being drawn beside it, and two walks
+  // of the board can disagree by whatever landed between them.
+  const r = await api(`/api/chat${brief ? '?brief=1' : ''}`);
   const feed = $('dock-feed');
   const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
-  feed.innerHTML = r.messages.length
-    ? r.messages.map(dockLine).join('')
-    : '<div class="empty">Ask the orchestrator anything about this workspace, ' +
-      'or tell it what you want done.</div>';
+  const msgs = brief
+    ? [...r.messages.filter(dockLive), ...briefTurns(r.brief)]
+        .sort((a, b2) => (a.at || '').localeCompare(b2.at || ''))
+    : r.messages;
+  const err = brief && r.brief && r.brief.error
+    ? `<div class="dm brief bad"><span class="dm-body">${esc(r.brief.error)}</span></div>`
+    : '';
+  // Drawn at the bottom rather than as a message, because it is not one yet:
+  // it is the other side typing, and it belongs where the next line will be.
+  const typing = brief && r.brief && r.brief.working
+    ? '<div class="dm brief working"><span class="dm-body"><span class="dot"></span>' +
+      ' typing…</span></div>'
+    : '';
+  feed.innerHTML = (
+    msgs.length
+      ? msgs.map(dockLine).join('')
+      : brief
+      ? '<div class="empty">Nothing to report yet. Say something and I&rsquo;ll ' +
+        'answer from the thread.</div>'
+      : '<div class="empty">Ask the orchestrator anything about this workspace, ' +
+        'or tell it what you want done.</div>') + err + typing;
   // A turn takes as long as it takes. Keep looking until it lands, then stop:
-  // the rest of the feed is derived from the board and refreshes with it.
+  // the rest of the feed is derived from the board and refreshes with it. The
+  // briefer mid-sentence is the same kind of wait, and needs the same poll.
   clearTimeout(loadChat.timer);
-  if (r.messages.some((m) => m.kind === 'amp' && m.status === 'running'))
+  if (r.messages.some((m) => m.kind === 'amp' && m.status === 'running')
+      || (r.brief && r.brief.working))
     loadChat.timer = setTimeout(loadChat, 2000);
   feed.querySelectorAll('.dm-open').forEach((b) =>
     b.addEventListener('click', () =>
@@ -1129,6 +1317,46 @@ function renderSummary(s) {
   $('dock-sub').innerHTML = bits.length ? bits.join(' · ') : 'all quiet';
 }
 
+// ---------------------------------------------------------- notifications
+//
+// The three lists below used to stack under the header and push the board off
+// the screen. They are the same three lists, kept apart for the same reasons,
+// now behind one button. The button carries a count because a strip that is
+// always visible is one you stop reading, and a panel you have to remember to
+// open is one you never do - the count is the part that has to stay in sight.
+//
+// Nothing here decides what is in the lists. Each renderer records its own
+// total on its container, because each applies a different filter - only the
+// failing obligations, only the watch items you have not dismissed - and a
+// second copy of those filters here is a second thing to keep in step. Counting
+// the rows in the DOM would be wrong for the same reason: "3 shown, 60 more"
+// and the settle button are rows too.
+
+function syncNotify() {
+  const secs = [$('findings'), $('obligations'), $('watch')];
+  const rows = secs.reduce((n, el) => n + Number(el.dataset.n || 0), 0);
+  // A contradiction is the one kind that is not a queue, so it colours the
+  // count rather than just adding to it.
+  const bad = (state.findings || []).some((f) => f.bearing === 'contradicted');
+  const badge = $('notify-count');
+  badge.textContent = rows ? String(rows) : '';
+  badge.classList.toggle('on', !!rows);
+  badge.classList.toggle('bad', !!rows && bad);
+  $('btn-notify').classList.toggle('lit', !!rows);
+  $('notify-empty').classList.toggle('hidden', !!rows);
+  $('notify-sub').textContent = rows ? '' : 'nothing needs you';
+}
+
+function toggleNotify(open) {
+  const el = $('notify');
+  const on = open === undefined ? el.classList.contains('hidden') : open;
+  // Measured, not guessed. The header wraps at narrow widths, and the panel is
+  // fixed over the right of the window - so a top of 0 puts it on top of the
+  // button that opened it, which then cannot be clicked again to close it.
+  if (on) el.style.top = document.querySelector('header').offsetHeight + 'px';
+  el.classList.toggle('hidden', !on);
+}
+
 // ---------------------------------------------------------------- findings
 //
 // What the work has said about the doctrine, and nobody has told you yet.
@@ -1146,7 +1374,9 @@ const BEARING_WORD = {
 function renderFindings(list) {
   const el = $('findings');
   const all = list || [];
+  el.dataset.n = all.length;
   el.classList.toggle('hidden', !all.length);
+  syncNotify();
   if (!all.length) return;
   const shown = state.findingsAll ? all : all.slice(0, 3);
   const hidden = all.length - shown.length;
@@ -1248,7 +1478,9 @@ function renderObligations(list) {
   // Only the ones that need something. An obligation quietly holding is the
   // normal case and does not deserve a line on the board.
   const bad = all.filter((o) => o.state === 'drifted' || o.state === 'broken');
+  el.dataset.n = bad.length;
   el.classList.toggle('hidden', !bad.length);
+  syncNotify();
   if (!bad.length) return;
   el.innerHTML = bad
     .map((o) =>
@@ -1295,7 +1527,9 @@ async function loadObligations() {
 function renderWatch(list) {
   const el = $('watch');
   const all = (list || []).filter((o) => !state.dismissed.has(o.kind + '|' + (o.lane || '')));
+  el.dataset.n = all.length;
   el.classList.toggle('hidden', !all.length);
+  syncNotify();
   if (!all.length) return;
   // A banner that fills the window is a banner you scroll past. Only what is
   // actually urgent stays up; the rest is one line you can open.
@@ -1391,9 +1625,18 @@ function renderGoals() {
   $('g-lane').textContent = state.sel || '—';
   const mine = (state.goals || []).filter((g) => g.lane === state.sel);
   if (!mine.length) {
-    el.innerHTML = '<div class="empty">No goals in this lane. A goal is an objective with a ' +
+    // Through the same cache as every other paint. Writing here and leaving
+    // `_html` describing the last lane that HAD goals is what made those goals
+    // fail to come back: returning to that lane computed html equal to a
+    // signature for a pane that had since been painted empty, the write below
+    // was skipped as a no-op, and the empty message stayed on screen.
+    const empty = '<div class="empty">No goals in this lane. A goal is an objective with a ' +
       'definition of done — the architect plans it, workers carry it out one task at a time, ' +
       'and it runs itself until it is finished or it needs you.</div>';
+    if (el._html !== empty) {
+      el._html = empty;
+      el.innerHTML = empty;
+    }
     return;
   }
   // This runs on every poll tick, so a blind rebuild is destructive twice over.
@@ -1491,7 +1734,16 @@ async function loadGoal(gid) {
   const qs = (g.questions || []).length
     ? `<div class="gq"><b>It needs a decision from you</b>` +
       (g.questions || []).map((q) => `<div>${esc(q)}</div>`).join('') +
-      `<div class="row"><input id="ga-text" placeholder="Answer it, and it carries on"><button id="ga-go" class="primary">Answer</button></div></div>`
+      `<div class="row"><input id="ga-text" placeholder="Answer it, and it carries on"><button id="ga-go" class="primary">Answer</button></div>` +
+      // The other way out of this card. The harness triages a stopped goal on
+      // its own, but only when the doctrine or a recorded decision has moved
+      // since it last looked - so a question can sit here, already read once,
+      // with nothing due to make it read again. This is that: read it again
+      // now, against the mission, the doctrine and every decision on record.
+      // It settles what the record settles and hands back what is genuinely
+      // his, which is the same discipline the heartbeat runs under.
+      `<div class="row"><button id="gt-go" title="Have the orchestrator try to settle this from the mission, the doctrine and what you have already decided. Anything only you can answer comes back here.">Try to settle it</button>` +
+      `<span id="gt-out" class="muted"></span></div></div>`
     : '';
   // Everything after the first paragraph of the objective: why this goal exists,
   // which file the gap was read out of, what the architect was told not to do.
@@ -1508,8 +1760,12 @@ async function loadGoal(gid) {
     '<h4>Tasks</h4>' + (tasks || '<div class="empty">none</div>') +
     '<h4>What it has been doing</h4>' + (log || '<div class="empty">nothing yet</div>') +
     `<div class="row goal-acts">` +
-    (g.state === 'blocked' && !(g.questions || []).length
-      ? `<button id="gp-go">Carry on anyway</button>` : '') +
+    // Only offered for the two stops it can actually answer. It used to appear
+    // on every blocked goal and zero the round count regardless of what the
+    // goal had stopped on, which made "carry on anyway" true of stops it had no
+    // remedy for.
+    (g.state === 'blocked' && ['rounds', 'tokens'].includes(g.stopped_on)
+      ? `<button id="gp-go" title="Grant it more of the budget it ran out of. The spend already recorded stands.">Extend budget</button>` : '') +
     // A goal that is still live can be re-planned against the repo as it is now,
     // or aimed somewhere else. A done goal cannot: its evidence is what it is.
     (g.state !== 'done'
@@ -1536,9 +1792,24 @@ async function loadGoal(gid) {
     await post('/api/goal/answer', { goal_id: gid, text: t });
     await refresh(); loadGoal(gid);
   };
+  const gt = $('gt-go');
+  if (gt) gt.onclick = async () => {
+    gt.disabled = true; gt.textContent = 'reading the record…';
+    const r = await post('/api/goal/triage', { goal_id: gid });
+    if (!r.ok) {
+      // Left enabled on a refusal: "the orchestrator is mid-turn" is a reason to
+      // press it again in a minute, not a reason to lose the button.
+      gt.disabled = false; gt.textContent = 'Try to settle it';
+      const o = $('gt-out'); if (o) o.textContent = r.error || 'it would not go';
+      return;
+    }
+    const o = $('gt-out');
+    if (o) o.textContent = 'the orchestrator is on it — watch the thread';
+    await refresh();
+  };
   const gp = $('gp-go');
   if (gp) gp.onclick = async () => {
-    gp.disabled = true; gp.textContent = 'going…';
+    gp.disabled = true; gp.textContent = 'extending…';
     await post('/api/goal/push', { goal_id: gid });
     await refresh(); loadGoal(gid);
   };
@@ -1978,8 +2249,23 @@ function renderDirection(d) {
     `<div class="row"><span class="tag">${esc(p.lane || '')}</span>` +
     // The one thing this panel has to make unmissable: whether this gets
     // started without anyone deciding, and if not, what is stopping it.
+    // One hold does not wait for a person: an objective over the bars but still
+    // carrying room to improve is queued for a sharpening round the harness
+    // makes itself. Calling that "waits for you" sends the operator to look at
+    // a queue that is already draining, so it says which it is - and only while
+    // automation is actually on, because with it off nobody is sharpening
+    // anything and the objective really is waiting for a hand.
+    // A third case, and the one that was reading as its opposite: a mode or a
+    // stage is not the objective waiting for a person, it is a person having
+    // already answered about the whole lane. "waits for you" invited a click
+    // that silently overruled the switch. This says who is holding it, and the
+    // button below makes the overrule deliberate.
     (p.hold
-      ? `<span class="hold">waits for you — ${esc(p.hold)}</span>`
+      ? (p.hold_is_policy
+          ? `<span class="hold policy">you set this lane to stop — ${esc(p.hold)}</span>`
+          : p.hold_is_sharpen && d.auto_adopt
+            ? `<span class="hold sharpening">${esc(p.hold)}</span>`
+            : `<span class="hold">waits for you — ${esc(p.hold)}</span>`)
       : `<span class="auto-ok">will start on its own</span>`) +
     `<button class="dp-go primary" data-id="${esc(p.id)}">Adopt as a goal</button>` +
     sharpenBtn(p, d) +
@@ -2067,12 +2353,30 @@ function renderDirection(d) {
       await post('/api/findings/ack', { ids: [b.dataset.id] });
       loadFindings(); loadDirection();
     }));
+  // Adopting asks once, plainly, and only sends `override` after the server has
+  // said what would be overridden. The rule itself is deliberately NOT written
+  // here: a copy of the lane's mode and stage living in the browser would be a
+  // second gate that can disagree with the first one, and it is the first one
+  // that actually stops anything. So this arms on the refusal it is given and
+  // quotes it back - which also means a hold added later needs no change here.
   el.querySelectorAll('.dp-go').forEach((b) =>
     b.addEventListener('click', async () => {
+      const armed = b.dataset.armed === '1';
       b.disabled = true; b.textContent = 'planning…';
-      const r = await post('/api/direction/proposal', { id: b.dataset.id, action: 'adopt' });
+      const r = await post('/api/direction/proposal',
+                           { id: b.dataset.id, action: 'adopt', override: armed });
+      if (!r.ok && r.needs_override) {
+        b.disabled = false; b.dataset.armed = '1';
+        b.textContent = 'Adopt anyway';
+        b.classList.add('warn');
+        $('dir-status').innerHTML =
+          `<span class="err">${esc(r.hold)}</span> — click again to start it here anyway, ` +
+          `or change the lane in Settings.`;
+        return;
+      }
       $('dir-status').innerHTML = r.ok
-        ? `opened goal ${esc(r.goal.id)}`
+        ? `opened goal ${esc(r.goal.id)}` +
+          (r.overrode ? ` — overrode: ${esc(r.overrode)}` : '')
         : `<span class="err">${esc(r.error)}</span>`;
       await refresh(); loadDirection();
     }));
@@ -2103,6 +2407,370 @@ async function loadDirection() {
   } catch {
     $('dir-out').innerHTML = '<span class="err">could not read the direction</span>';
   }
+  loadLaneDirection();
+  loadDoctrine();
+}
+
+/* ------------------------------------------------- what one lane is for
+ *
+ * Six free-text fields, one choice and one lane reference. They are drawn as
+ * separate boxes rather than one document because they answer separate
+ * questions and are read separately - `direction_block()` quotes each under its
+ * own heading, and a single textarea would let a rewrite of one silently carry
+ * a stale sentence from another into every proposal in the lane.
+ *
+ * `represents` is drawn but never drafted. See `draft_lane_direction`.
+ */
+const LD_FIELDS = [
+  ['for', 'What it is for',
+   'One sentence, true of this lane and no other.'],
+  ['thesis', 'The bet it makes',
+   'Stated so it could turn out to be FALSE. No evidence, no rung, no hedging — ' +
+   'that is the next box.'],
+  ['claim', 'Where that stands today',
+   'The rung and the actual numbers. `unrecorded` is a real answer.'],
+  ['bar', 'What would clear it',
+   'A test somebody could run, not an aspiration.'],
+  ['unknown', 'What we do not know',
+   'Upstream of the bar: the bar is a test already designed, this is what is ' +
+   'still open about the shape of the answer. Empty beats padded.'],
+  ['not_for', 'Not this lane\u2019s job',
+   'The useful ones name a real temptation — usually work another lane owns.'],
+];
+
+/** The judged rung beside the written claim. The whole reason it is here is that
+ *  a direction can claim more than any review ever recorded, and while the two
+ *  facts live on different pages nobody finds out. */
+function ldRung(rung) {
+  return rung
+    ? `<span class="ld-rung">reviews have it at <b>${esc(rung)}</b></span>`
+    : `<span class="ld-rung none">no review has ever moved a claim in this lane — ` +
+      `a rung written below is not one it has earned</span>`;
+}
+
+/** The lane's own direction, read rather than edited.
+ *
+ *  This is the half the operator actually looks at. Everything below it on the
+ *  page is the workspace's mission and DOCTRINE.md, which is identical in every
+ *  lane by design - so with the lane's record hidden inside a closed accordion,
+ *  changing lanes changed nothing visible and the screen read as broken.
+ *
+ *  Headed with the lane name on every block. The workspace calls its own
+ *  sections "The thesis" and "What we still do not know", and those are
+ *  different claims about a different scope; two unlabelled headings with the
+ *  same words is how somebody ends up holding a lane to the stack's bet. */
+function ldReadBlock(lane, dir, rung) {
+  const el = $('ld-read');
+  if (!el) return;
+  const said = LD_FIELDS.filter(([k]) => dir[k]);
+  if (!said.length) {
+    el.innerHTML = `<section class="dsec"><h4>What ${esc(lane)} is for</h4>` +
+      `<div class="empty">Nothing recorded for this lane. Everything below is the ` +
+      `workspace direction, which is the same in every lane. Open the panel above ` +
+      `to write this one, or let it draft from the lane's own evidence.</div></section>`;
+    return;
+  }
+  el.innerHTML = `<section class="dsec"><h4>What ${esc(lane)} is for</h4>` +
+    `<div class="muted">This lane only. It is injected into every proposal, every ` +
+    `score and every review in this lane, and it is what the work below gets held ` +
+    `to. ${ldRung(rung)}</div>` +
+    said.map(([k, label]) =>
+      `<div class="ldr"><h5>${esc(label)}</h5><div class="md">${md(dir[k])}</div></div>`).join('') +
+    (dir.represents ? `<div class="ldr muted">presents <b>${esc(dir.represents)}</b>` +
+      ` — that lane's work is what this one has to show</div>` : '') +
+    `</section>`;
+}
+
+function renderLaneDirection(d) {
+  const body = $('ld-body');
+  const sum = $('ld-sum');
+  if (!state.sel) {
+    sum.textContent = '';
+    body.textContent = 'select a lane on the left';
+    if ($('ld-read')) $('ld-read').innerHTML = '';
+    return;
+  }
+  const row = (d.lanes || []).find((l) => l.name === state.sel);
+  if (!row) {
+    sum.textContent = '';
+    body.innerHTML = `<span class="err">${esc(state.sel)} is not a lane in this workspace</span>`;
+    if ($('ld-read')) $('ld-read').innerHTML = '';
+    return;
+  }
+  ldReadBlock(row.name, row.direction || {}, row.rung);
+  state.laneDir = d;
+  const dir = row.direction || {};
+  const n = Object.keys(dir).length;
+  sum.innerHTML = `· ${esc(state.sel)} — ` +
+    (n ? `${n} of ${(d.fields || []).length} recorded` : 'nothing recorded') +
+    ' ' + ldRung(row.rung);
+
+  const boxes = LD_FIELDS.map(([k, label, hint]) =>
+    `<label class="ld-f"><b>${esc(label)}</b>` +
+    `<span class="muted">${mdi(hint)}</span>` +
+    `<textarea id="ld-${k}" rows="3" placeholder="not recorded">${esc(dir[k] || '')}</textarea>` +
+    `</label>`).join('');
+
+  const ab = dir.after_bar || d.default_after_bar;
+  const opts = Object.entries(d.after_bar || {}).map(([k, v]) =>
+    `<option value="${esc(k)}"${k === ab ? ' selected' : ''}>${esc(k)} — ${esc(v)}</option>`).join('');
+
+  body.innerHTML = boxes +
+    `<label class="ld-f"><b>When the bar clears</b>` +
+    `<span class="muted">Only worth saying when it is not the default. Write it ` +
+    `BEFORE the bar clears — afterwards there is a finished thing and an obvious ` +
+    `momentum to keep going.</span>` +
+    `<select id="ld-after_bar">${opts}</select></label>` +
+    `<label class="ld-f"><b>Presents another lane</b>` +
+    `<span class="muted">Only for a presentation surface. A commit here moves no ` +
+    `rung on the lane named. A lane cannot present itself, and this is never ` +
+    `drafted for you.</span>` +
+    `<input id="ld-represents" value="${esc(dir.represents || '')}" placeholder="none">` +
+    `</label>` +
+    `<div class="ld-bar">` +
+    `<button id="ld-save" class="primary">Save</button>` +
+    `<button id="ld-draft"${d.architect ? '' : ' disabled'}>Draft from this lane\u2019s evidence</button>` +
+    `<span class="muted" id="ld-status">${d.architect ? '' : esc(d.architect_off || '')}</span>` +
+    `</div><div id="ld-why"></div>`;
+
+  $('ld-save').addEventListener('click', saveLaneDirection);
+  $('ld-draft').addEventListener('click', draftLaneDirection);
+}
+
+/** Read the boxes back. Empty fields are dropped rather than saved blank, which
+ *  is what makes clearing one a real act: `lane_direction` renders an absent
+ *  field as silence, and silence is honest where an empty string is a claim that
+ *  somebody wrote nothing on purpose. */
+function ldRead() {
+  const out = {};
+  for (const [k] of LD_FIELDS) {
+    const v = ($(`ld-${k}`).value || '').trim();
+    if (v) out[k] = v;
+  }
+  const ab = $('ld-after_bar').value;
+  if (ab && ab !== (state.laneDir || {}).default_after_bar) out.after_bar = ab;
+  const rp = ($('ld-represents').value || '').trim();
+  if (rp) out.represents = rp;
+  return out;
+}
+
+async function saveLaneDirection() {
+  const st = $('ld-status');
+  st.textContent = 'saving…';
+  const r = await post('/api/lane/direction', { lane: state.sel, direction: ldRead() });
+  if (!r.ok) { st.innerHTML = `<span class="err">${esc(r.error || 'refused')}</span>`; return; }
+  // Reload first, then report. The reload rebuilds `ld-body`, so `st` is a
+  // detached node by the time it returns and writing to it says nothing to
+  // anyone - a save that worked read as a save that did nothing at all.
+  await loadLaneDirection();
+  $('ld-status').textContent = 'saved';
+}
+
+/** Fills the boxes in and saves nothing. The status line says so, because a
+ *  button that rewrites what is on screen reads like a button that committed. */
+async function draftLaneDirection() {
+  const st = $('ld-status');
+  st.textContent = 'reading this lane\u2019s spec, reviews, record and findings…';
+  const r = await post('/api/lane/direction/draft', { lane: state.sel });
+  if (!r.ok) { st.innerHTML = `<span class="err">${esc(r.error || 'failed')}</span>`; return; }
+
+  const dr = r.draft || {};
+  for (const [k] of LD_FIELDS) $(`ld-${k}`).value = dr[k] || '';
+  if (dr.after_bar) $('ld-after_bar').value = dr.after_bar;
+
+  st.innerHTML = `<b>${esc(r.note || 'drafted, not saved')}</b>` +
+    ((r.moved || []).length
+      ? ` — it changed ${esc((r.moved || []).join(', '))}`
+      : ' — it changed nothing');
+  $('ld-why').innerHTML =
+    ((r.why || []).length
+      ? `<div class="ld-why"><b>Why</b>` +
+        (r.why || []).map((w) => `<div>${mdi(w)}</div>`).join('') + `</div>` : '') +
+    ((r.kept || []).length
+      ? `<div class="muted">left alone: ${esc((r.kept || []).join(', '))}</div>` : '');
+}
+
+async function loadLaneDirection() {
+  try {
+    renderLaneDirection(await api('/api/lane/directions'));
+  } catch {
+    $('ld-body').innerHTML = '<span class="err">could not read the lane directions</span>';
+  }
+}
+
+/* --------------------------------------- what the whole workspace is held to
+ *
+ * DOCTRINE.md, editable. The lane block above is one lane; this is the file
+ * every lane is judged against, and it is injected verbatim into every plan,
+ * every review and every worker prompt.
+ *
+ * Three buttons and they are not the same kind of thing. Save writes the file.
+ * Draft and Review are architect calls that write nothing. Ratify is the
+ * operator saying the current core is the one that stands — and nothing else in
+ * the system can do it, which is why a save deliberately leaves the change
+ * unratified rather than pinning its own write.
+ */
+
+/** The numbers, which are the part that was missing entirely. Every one is
+ *  counted off disk. There is no score: what a doctrine is worth is a
+ *  judgement, and rule 6 says whose. */
+function dcStats(s) {
+  const pin = s.drifted
+    ? `<span class="ld-rung none">the core has changed since you ratified it</span>`
+    : s.unratified
+      ? `<span class="ld-rung none">never ratified — nobody has said this core stands</span>`
+      : s.ratified
+        ? `<span class="ld-rung">ratified ${esc((s.ratified_at || '').slice(0, 10))}</span>`
+        : `<span class="ld-rung none">no core is being injected at all</span>`;
+
+  const cell = (n, label, warn) =>
+    `<div class="dcs${warn ? ' warn' : ''}"><b>${esc(String(n))}</b>` +
+    `<span>${esc(label)}</span></div>`;
+
+  return `<div class="dc-stats">` +
+    // Reach first: the file's own text cannot tell you how far it travels, and
+    // a lane with no direction of its own is a lane this file is the only
+    // standard for.
+    cell(`${s.lanes_with_direction}/${s.lanes}`, 'lanes with a direction',
+         s.lanes_with_direction < s.lanes) +
+    cell(`${s.lanes_with_thesis}/${s.lanes}`, 'with a stated bet',
+         s.lanes_with_thesis < s.lanes) +
+    cell(`${s.lanes_with_unknown}/${s.lanes}`, 'that say what they do not know',
+         s.lanes_with_unknown < s.lanes) +
+    // The split that matters: the core is what every prompt carries, the rest
+    // is commentary no model ever sees.
+    cell(s.core_words, 'words injected into every prompt') +
+    cell(s.bytes - s.core_bytes, 'bytes of commentary nothing reads') +
+    cell(s.contradicted, 'findings that say something here is false', s.contradicted > 0) +
+    cell(s.corrections, 'claims already found false') +
+    cell(s.unread, 'findings you have not read', s.unread > 0) +
+    `</div>` +
+    `<div class="muted dc-pin">${pin} · core digest <code>` +
+    `${esc(s.digest || '—')}</code> · <code>${esc(s.path || '')}</code></div>` +
+    ((s.sections || []).length
+      ? `<div class="muted dc-secs">` + s.sections.map((x) =>
+          `<span>${esc(x.title)} <b>${x.words}</b>w</span>`).join('') + `</div>`
+      : '');
+}
+
+function renderDoctrine(d) {
+  state.doctrine = d;
+  const s = d.stats || {};
+  $('dc-sum').innerHTML = `· ${esc(d.workspace || '')} — ${s.core_words || 0} words ` +
+    `in every prompt ` + (s.drifted || s.unratified
+      ? `<span class="ld-rung none">unratified</span>`
+      : `<span class="ld-rung">ratified</span>`);
+
+  $('dc-body').innerHTML =
+    dcStats(s) +
+    `<label class="ld-f"><b>The file</b>` +
+    `<span class="muted">Everything between <code>${esc(d.begin)}</code> and ` +
+    `<code>${esc(d.end)}</code> is injected verbatim into every plan, every review ` +
+    `and every worker prompt. The rest is commentary shown here and read by ` +
+    `nobody else. Saving without those markers is refused — a file that lost them ` +
+    `would inject nothing and nothing anywhere would report it.</span>` +
+    `<textarea id="dc-text" rows="22" spellcheck="false">${esc(d.text || '')}</textarea>` +
+    `</label>` +
+    `<div class="ld-bar">` +
+    `<button id="dc-save" class="primary">Save</button>` +
+    `<button id="dc-ratify">It was me — this core stands</button>` +
+    `<button id="dc-review"${d.architect ? '' : ' disabled'}>Review it against the evidence</button>` +
+    `<button id="dc-draft"${d.architect ? '' : ' disabled'}>Redraft from the evidence</button>` +
+    `<span class="muted" id="dc-status">${d.architect ? '' : esc(d.architect_off || '')}</span>` +
+    `</div><div id="dc-out"></div>`;
+
+  $('dc-save').addEventListener('click', saveDoctrine);
+  $('dc-ratify').addEventListener('click', ratifyDoctrine);
+  $('dc-review').addEventListener('click', reviewDoctrine);
+  $('dc-draft').addEventListener('click', draftDoctrine);
+}
+
+async function saveDoctrine() {
+  const st = $('dc-status');
+  st.textContent = 'saving…';
+  const r = await post('/api/doctrine/save', { text: $('dc-text').value });
+  if (!r.ok) { st.innerHTML = `<span class="err">${esc(r.error || 'refused')}</span>`; return; }
+  const text = r.note;
+  await loadDoctrine();
+  $('dc-status').textContent = text;
+}
+
+async function ratifyDoctrine() {
+  const st = $('dc-status');
+  st.textContent = 'pinning…';
+  const r = await post('/api/doctrine/ratify', {});
+  if (!r.ok) { st.innerHTML = `<span class="err">${esc(r.error || 'failed')}</span>`; return; }
+  await loadDoctrine();
+  $('dc-status').textContent = 'ratified — this core is the one that stands';
+  loadBlockers && loadBlockers();
+}
+
+/** A reading, not a ruling. Quotes are checked against the file here as well as
+ *  on the server, because the failure this call has is an entry that reads
+ *  perfectly and is about a sentence nobody wrote. */
+function dcItems(title, rows, cls) {
+  if (!rows || !rows.length) return '';
+  return `<h5>${esc(title)}</h5>` + rows.map((it) =>
+    `<div class="dcq ${cls}">` +
+    `<blockquote>${mdi(it.quote)}</blockquote>` +
+    (it.in_file === false
+      ? `<div class="err">this sentence is not in the file — the reviewer quoted ` +
+        `something nobody wrote, so treat the item with suspicion</div>` : '') +
+    (it.why ? `<div>${mdi(it.why)}</div>` : '') +
+    (it.evidence ? `<div class="muted">cites: ${mdi(it.evidence)}</div>` : '') +
+    `</div>`).join('');
+}
+
+async function reviewDoctrine() {
+  const st = $('dc-status');
+  st.textContent = 'reading it against every lane, finding and correction…';
+  const r = await post('/api/doctrine/review', {});
+  if (!r.ok) { st.innerHTML = `<span class="err">${esc(r.error || 'failed')}</span>`; return; }
+  st.innerHTML = `<b>${esc(r.note || '')}</b>`;
+
+  const word = { holds: 'it holds', stale: 'it is out of date',
+                 contradicted: 'something in it is false' }[r.verdict] || 'no verdict';
+  $('dc-out').innerHTML =
+    `<div class="ld-why"><b>${esc(word)}</b>` +
+    (r.summary ? `<div>${mdi(r.summary)}</div>` : '') +
+    dcItems('Contradicted by the work', r.contradicted, 'bad') +
+    dcItems('Claims a rung no review recorded', r.unearned, 'bad') +
+    dcItems('Out of date', r.stale, 'warn') +
+    dcItems('Believed by the work and not written down', r.missing, '') +
+    ((r.well_earned || []).length
+      ? `<h5>Actively supported by the evidence</h5>` +
+        r.well_earned.map((w) => `<div class="dcq">${mdi(w)}</div>`).join('') : '') +
+    `</div>`;
+}
+
+async function draftDoctrine() {
+  const st = $('dc-status');
+  st.textContent = 'redrafting against every lane, finding and correction…';
+  const r = await post('/api/doctrine/draft', {});
+  if (!r.ok) { st.innerHTML = `<span class="err">${esc(r.error || 'failed')}</span>`; return; }
+
+  $('dc-text').value = r.draft || '';
+  st.innerHTML = `<b>${esc(r.note || 'drafted, not saved')}</b>` +
+    (r.same ? ' — it changed nothing' : '');
+  $('dc-out').innerHTML =
+    (r.markers_ok ? ''
+      : `<div class="err">This draft is missing the core markers. Saving it is ` +
+        `refused, and it is shown so you can see what it did rather than have ` +
+        `it silently discarded.</div>`) +
+    ((r.why || []).length
+      ? `<div class="ld-why"><b>What it changed</b>` +
+        r.why.map((w) => `<div>${mdi(w)}</div>`).join('') + `</div>` : '') +
+    ((r.kept || []).length
+      ? `<div class="ld-why"><b>What it left alone</b>` +
+        r.kept.map((w) => `<div>${mdi(w)}</div>`).join('') + `</div>` : '');
+}
+
+async function loadDoctrine() {
+  try {
+    renderDoctrine(await api('/api/doctrine'));
+  } catch {
+    $('dc-body').innerHTML = '<span class="err">could not read the doctrine</span>';
+  }
 }
 
 /** One spec run: what the reviewer asked for, what the writer did about it.
@@ -2111,28 +2779,59 @@ async function loadDirection() {
  *  side gets to be the only voice. A reviewer's demand that the writer refused
  *  and explained is a different situation from one it satisfied, and a run that
  *  ended `stalled` is telling you the two of them could not settle it. */
-function specRound(rd) {
+function specRound(rd, many, mine) {
   const w = rd.worker || {};
-  const verdict = rd.verdict === 'SOLID'
-    ? `<span class="sp-v ok">solid</span>`
-    : `<span class="sp-v bad">needs work</span>`;
-  const defects = (rd.defects || []).length
-    ? `<ol class="sp-defects">` + rd.defects.map((d) => `<li>${esc(d)}</li>`).join('') + `</ol>`
-    : '';
-  // "changed" is the fact the stop rule turns on, so it is stated rather than
-  // left to be inferred from a diff nobody opened.
-  const moved = rd.changed === null || rd.changed === undefined ? ''
-    : rd.changed ? `<span class="sp-v ok">the file changed</span>`
-                 : `<span class="sp-v bad">the file did not change</span>`;
+  const all = rd.reviews || [];
+  // Only this row's document, when the run is drawn under a document. A run over
+  // a set is drawn on every row it covers, so showing all of its reviews on each
+  // of them prints the same round once per document - eleven documents would be
+  // a hundred and twenty-one review blocks, and a demand about one file would
+  // appear on ten rows it is not about.
+  const shown = mine ? all.filter((rv) => rv.rel === mine) : all;
+  const others = all.length - shown.length;
+  // One review per document, because one reviewer cannot see all of several
+  // documents in one call. The document's path is only printed when the run
+  // covers more than one - on a single-document run it is the heading above.
+  const reviews = shown.map((rv) => {
+    const verdict = rv.verdict === 'SOLID'
+      ? `<span class="sp-v ok">solid</span>`
+      : `<span class="sp-v bad">needs work</span>`;
+    // Per document, and only for the ones this round asked to move. A file with
+    // no items was not asked for anything, so "did not change" would be a
+    // complaint about obedience.
+    const moved = rv.changed === null || rv.changed === undefined ? ''
+      : rv.changed ? `<span class="sp-v ok">the file changed</span>`
+                   : `<span class="sp-v bad">the file did not change</span>`;
+    const defects = (rv.defects || []).length
+      ? `<ol class="sp-defects">` + rv.defects.map((d) => `<li>${esc(d)}</li>`).join('') + `</ol>`
+      : '';
+    return `<div class="sp-review"><div class="sp-who">` +
+      (many && !mine && rv.rel ? `<code>${esc(rv.rel)}</code> · ` : '') +
+      `the reviewer ${verdict}` + (rv.why ? ` — ${esc(rv.why)}` : '') +
+      ` ${moved}</div>` + defects + `</div>`;
+  }).join('')
+    // A document with no review in this round was already settled, or the round
+    // never reached it. Said, rather than left as a gap under a writer reply
+    // that would then read as an answer to nothing.
+    || (mine ? `<div class="sp-review muted">this document was not reviewed ` +
+               `in this round</div>` : '');
+  // ONE writer for the whole round, so its reply sits under all of the reviews
+  // rather than inside any one of them. It was given every item at once and
+  // answers for every file it was given.
   const reply = w.text
     ? `<div class="sp-reply"><div class="sp-who">the writer` +
-      (w.agreed === true ? ' — says it is already solid'
-        : w.agreed === false ? ' — revised it' : '') +
-      ` ${moved}</div><pre>${esc(w.text)}</pre></div>`
+      (w.agreed === true ? ' — says they are already solid'
+        : w.agreed === false ? ' — revised them' : '') +
+      `</div><pre>${esc(w.text)}</pre></div>`
     : (rd.task_id ? `<div class="sp-reply muted">a writer is out on this round…</div>` : '');
 
-  return `<div class="sp-round"><div class="sp-who">round ${rd.n} · the reviewer ${verdict}` +
-    (rd.why ? ` — ${esc(rd.why)}` : '') + `</div>` + defects + reply + `</div>`;
+  // The others are counted, not drawn: what they cost is part of what this round
+  // was, and the writer's reply below covers all of them at once.
+  return `<div class="sp-round"><div class="sp-who">round ${rd.n}` +
+    (!many ? ''
+      : mine ? (others ? ` · and ${others} other document(s) in the same round` : '')
+             : ` · ${all.length} document(s) reviewed`) +
+    `</div>` + reviews + reply + `</div>`;
 }
 
 const SP_STATE = {
@@ -2146,21 +2845,76 @@ const SP_STATE = {
 
 /** One run, folded. `r.rounds` is an array on the newest run and a count on the
  *  older ones - the server sends the transcript only for the one that renders
- *  open, and the rest are fetched by id the first time they are unfolded. */
-function specRun(r, open) {
+ *  open, and the rest are fetched by id the first time they are unfolded.
+ *
+ *  `mine` is the document whose row this is drawn on, and the reviews are
+ *  narrowed to it: one run covers a set and appears on every row in the set.
+ *
+ *  `open` is only a DEFAULT. This pane redraws itself every four seconds while
+ *  anything is live, and the default said "the newest run is open" every time -
+ *  so folding it away lasted until the next tick and read as a button that does
+ *  not work. What the operator did to a row outranks what the row opened as. */
+function specRun(r, open, mine) {
+  // Keyed on the row rather than on the run, because one run is drawn on every
+  // document in its set - closing it on one row must not close the others.
+  const key = `${r.id}|${mine || ''}`;
+  if (key in state.specOpen) open = state.specOpen[key];
   const [cls, blurb] = SP_STATE[r.state] || ['muted', r.state];
-  const full = Array.isArray(r.rounds);
-  const n = full ? r.rounds.length : (r.rounds || 0);
+  const rels = r.rels || [];
+  const many = rels.length > 1;
+  // Either the server sent the transcript, or this row was unfolded once before
+  // and it was fetched then. The second case is why a repaint no longer drops an
+  // open older run back to the placeholder.
+  const rounds = Array.isArray(r.rounds) ? r.rounds : state.specRounds[r.id];
+  const full = Array.isArray(rounds);
+  const n = Array.isArray(r.rounds) ? r.rounds.length : (r.rounds || 0);
   const body = full
-    ? r.rounds.map(specRound).join('')
+    ? rounds.map((rd) => specRound(rd, many, mine)).join('')
     : `<div class="sp-round muted">…</div>`;
+  // A run over a set is drawn on every document's row, so the row on its own
+  // does not say how much of the lane this run was about - and "6 rounds" over
+  // eleven documents is a very different purchase from six rounds over one.
+  const covers = many
+    ? `<span class="sp-badge muted" title="${esc(rels.join('\n'))}">` +
+      `${rels.length} documents</span> ` : '';
+  // Documents the run had to set aside: the writer's worktree cannot reach them,
+  // so reviewing them further would be buying rounds with no possible outcome.
+  const dropped = Object.keys(r.dropped || {}).length
+    ? `<span class="sp-badge warn" title="${esc(Object.entries(r.dropped)
+        .map(([rel, why]) => `${rel} — ${why}`).join('\n'))}">` +
+      `${Object.keys(r.dropped).length} unreachable</span> ` : '';
+  // A run nobody is coming back to looks exactly like a live one from here -
+  // same state, same badge - and it is the only thing on this tab that can hold
+  // a whole campaign still. Named on the row, because the operator's next move
+  // depends on knowing that waiting is not going to work.
+  const stranded = r.stranded
+    ? `<span class="sp-badge warn" title="${esc(r.stranded)}">abandoned</span> `
+    : '';
+  // The run's own reason, kept, and the correction under it. A stall says the
+  // two sides disagree, and that reading needs the writer to have had the file;
+  // when it did not, the sentence sends you to arbitrate a dispute that never
+  // took place. Both are shown rather than one replacing the other, because
+  // what the run recorded is the evidence for the correction.
+  const misread = r.misread
+    ? `<div class="sp-round sp-misread">${esc(r.misread)}</div>` : '';
   return `<details class="sp-run"${open ? ' open' : ''} data-id="${esc(r.id)}"` +
+    ` data-key="${esc(key)}"` +
+    // Carried on the element because the transcript of an older run is fetched
+    // when it is unfolded, and by then the only thing that says which row it was
+    // drawn on is the row itself.
+    (mine ? ` data-mine="${esc(mine)}"` : '') +
     `${full ? '' : ' data-fetch="1"'}><summary>` +
-    `<span class="sp-badge ${cls}">${esc(r.state)}</span> ` +
+    `<span class="sp-badge ${stranded || r.misread ? 'muted' : cls}">${esc(r.state)}</span> ` +
+    stranded + covers + dropped +
+    (r.misread ? `<span class="sp-badge warn" title="${esc(r.misread)}">not a stall</span> ` : '') +
     `${n} round${n === 1 ? '' : 's'} · ` +
-    `${esc(r.why || blurb)}</summary>` + body +
+    `${esc(r.stranded || r.why || blurb)}</summary>` + misread + body +
     (r.state === 'running'
-      ? `<div class="sp-act"><button class="sp-stop" data-id="${esc(r.id)}">Stop this run</button></div>`
+      ? `<div class="sp-act">` +
+        (r.stranded
+          ? `<span class="muted">the heartbeat picks this back up on its own — ` +
+            `stop it only if you want it dropped</span> ` : '') +
+        `<button class="sp-stop" data-id="${esc(r.id)}">Stop this run</button></div>`
       : '') +
     `</details>`;
 }
@@ -2202,13 +2956,13 @@ function specRating(f) {
 function specFile(f, s) {
   const live = (f.runs || []).find((r) => r.state === 'running');
   const busy = state.specBusy === f.rel;
-  const queued = ((s.plan || {}).queue || []).includes(f.rel);
   const label = live ? `${live.waiting_on === 'worker' ? 'writer' : 'reviewer'} is working…`
-    : busy ? 'starting…' : queued ? 'queued' : 'Sharpen until solid';
+    : busy ? 'starting…' : 'Sharpen until solid';
   const rating = f.rating && !f.rating.error;
   return `<section class="sp-file">` +
     `<div class="sp-file-head">` +
-    (f.rank ? `<span class="sp-rank" title="where this sits in the sharpen queue">${f.rank}</span>` : '') +
+    (f.rank ? `<span class="sp-rank" title="where this sits in the sharpen order — ` +
+      `the order the reviewer is asked in">${f.rank}</span>` : '') +
     `<code>${esc(f.rel)}</code>` +
     `<span class="muted">${f.lines} lines · ${Math.round(f.bytes / 100) / 10}k</span>` +
     // A document that only exists in the worktree is not in your repository
@@ -2221,14 +2975,41 @@ function specFile(f, s) {
     ` title="one architect call: how solid it is, how much the mission needs it, ` +
     `and whether sharpening would move it">${rating ? 'Re-rate' : 'Rate'}</button>` +
     `<button class="sp-go" data-rel="${esc(f.rel)}"` +
-    `${live || busy || !s.architect ? ' disabled' : ''}` +
-    ` title="${esc(s.architect ? 'Codex reviews it, a Claude worker rewrites it in the worktree, until both agree' : s.architect_why || '')}">` +
-    `${esc(label)}</button></div>` +
+    `${live || busy || f.blocked || !s.architect ? ' disabled' : ''}` +
+    ` title="${esc(f.blocked || (s.architect ? 'Codex reviews it, a Claude worker rewrites it in the worktree, until both agree' : s.architect_why || ''))}">` +
+    `${esc(f.blocked ? 'no writer can reach it' : label)}</button></div>` +
+    // Said on the row, not discovered by pressing the button. A document the
+    // writer's worktree does not have cannot be sharpened at all: the reviewer
+    // reads your checkout, the writer edits a tree without the file in it, and
+    // every round comes back byte-identical until the run stalls.
+    //
+    // The remedy comes with it, and only half of it is a button. A worktree that
+    // already exists never follows its branch, so committing the document is
+    // necessary and not sufficient - and offering only the button would send
+    // somebody to press it over and over on a file that is not committed yet.
+    (f.blocked
+      ? `<div class="sp-blocked">${esc(f.blocked)}` +
+        (f.blocked_fix === 'refresh' || f.blocked_fix === 'commit+refresh'
+          ? ` <button class="sp-refresh" data-lane="${esc(s.lane)}"` +
+            `${state.specWork ? ' disabled' : ''}` +
+            // `ahead` is null when git could not answer, and `|| 0` would read
+            // that as "there is nothing in there to lose" - the one thing this
+            // tooltip must not get wrong, since it is the reassurance the
+            // button is asking to be trusted on.
+            ` title="merge ${esc((s.worktree || {}).branch || 'the branch')} into ` +
+            `amp/${esc(s.lane)} — a merge, never a reset, so ` +
+            `${typeof (s.worktree || {}).ahead === 'number'
+              ? `the ${s.worktree.ahead} unmerged worker commit(s) in there survive`
+              : 'anything unmerged in there survives'}">` +
+            `Refresh the worktree</button>`
+          : '') +
+        `</div>`
+      : '') +
     specRating(f) +
     // Newest run open, the rest folded. Runs come back newest-first, so the one
     // worth reading is always the first one - and if it is live, the rounds
     // appearing under it are what "still going" looks like.
-    ((f.runs || []).map((r, i) => specRun(r, i === 0)).join('')) +
+    ((f.runs || []).map((r, i) => specRun(r, i === 0, f.rel)).join('')) +
     `</section>`;
 }
 
@@ -2238,32 +3019,45 @@ const SP_PLAN = {
   stopped: 'bad',
 };
 
-/** The campaign strip: what is queued, what is out, what was skipped and why. */
+/** The selection strip: what was chosen, what was skipped and why.
+ *
+ *  Not a queue any more. It chose a set of documents and opened ONE run over all
+ *  of them, so there is no "next" and nothing to wait for - the run below is the
+ *  whole of it, and its state is this strip's state. */
 function specPlan(p) {
   if (!p) return '';
-  const cur = p.current
-    ? `<span class="sp-n live">sharpening <code>${esc(p.current.rel)}</code></span>`
-    : '';
-  const done = (p.done || []).length
-    ? `<span class="sp-n" title="${esc((p.done || []).map((d) => `${d.rel} — ${d.state}`).join('\n'))}">` +
-      `${p.done.length} done</span>`
-    : '';
-  const queued = (p.queue || []).length
-    ? `<span class="sp-n" title="${esc((p.queue || []).join('\n'))}">${p.queue.length} queued</span>`
+  const chose = (p.chose || []).length
+    ? `<span class="sp-n ${p.state === 'running' ? 'live' : ''}" ` +
+      `title="${esc((p.chose || []).join('\n'))}">` +
+      `${p.chose.length} document(s) in one run</span>`
     : '';
   // Skipped is not the same as finished and is the number most likely to be
-  // surprising - a campaign that "did nothing" usually means the bar held
+  // surprising - a selection that "did nothing" usually means the bar held
   // everything back, and that is a setting, not a fault.
-  const skipped = (p.skipped || []).length
-    ? `<span class="sp-n warn" title="${esc(p.skipped.map((x) => `${x.rel} — ${x.why}`).join('\n'))}">` +
-      `${p.skipped.length} under the ${p.bar} bar</span>`
-    : '';
+  //
+  // Split by reason, because the two answers are opposite: one is "raise the
+  // bar", the other is "go and commit your specs", and one count covering both
+  // sends people to change a setting that was never the problem.
+  const skips = (kind, text) => {
+    const xs = (p.skipped || []).filter((x) =>
+      kind === 'bar' ? x.kind !== 'unreachable' : x.kind === 'unreachable');
+    return xs.length
+      ? `<span class="sp-n warn" title="${esc(xs.map((x) => `${x.rel} — ${x.why}`).join('\n'))}">` +
+        `${xs.length} ${text}</span>`
+      : '';
+  };
+  const skipped = skips('bar', `under the ${p.bar} bar`) +
+                  skips('unreachable', 'no writer can reach');
   return `<div class="sp-plan">` +
     `<span class="sp-badge ${SP_PLAN[p.state] || 'muted'}">${esc(p.state)}</span> ` +
-    cur + queued + done + skipped +
+    chose + skipped +
     (p.why ? `<span class="muted">${esc(p.why)}</span>` : '') +
+    // Stops the run, which is the only thing there is to stop. The old queue
+    // could be halted without touching the run it had already started; there is
+    // no "next" left for a button to be about.
     (p.state === 'running'
-      ? `<button class="sp-stop" id="sp-plan-stop">Stop the queue</button>` : '') +
+      ? `<button class="sp-stop" id="sp-plan-stop" title="closes the run this ` +
+        `started — the same thing the run's own Stop button does">Stop this run</button>` : '') +
     `</div>`;
 }
 
@@ -2453,10 +3247,12 @@ function renderSpec(s) {
       `rated. Already-rated documents are skipped.">` +
       `${state.specWork === 'audit' ? 'rating…' : 'Rate every document'}</button>` +
       `<button id="sp-all"${state.specWork || !s.architect ? ' disabled' : ''}` +
-      ` title="queue every document, best first, and sharpen them one at a time — ` +
-      `a lane runs one worker at a time, so this is a queue rather than ${(s.files || []).length} runs at once">` +
+      ` title="one run over every document at once: each one is reviewed on its own ` +
+      `— a reviewer has to see all of a document — and then a single writer is sent ` +
+      `everything they asked for. Slow to come back: it is ${(s.files || []).length} ` +
+      `architect calls before the first writer goes out.">` +
       `${state.specWork === 'all' ? 'starting…' : 'Sharpen every document'}</button>` +
-      `<span class="muted">a campaign skips anything whose worth is under ${s.worth_bar}</span>` +
+      `<span class="muted">skips anything whose worth is under ${s.worth_bar}</span>` +
       `</div>` + specPlan(s.plan)
     : '';
   // The loop, and where this lane stands against its threshold. Rendered above
@@ -2476,7 +3272,8 @@ function renderSpec(s) {
   const orphans = (s.orphans || []).length
     ? `<section class="sp-file"><div class="sp-file-head">` +
       `<code class="muted">documents that are no longer there</code></div>` +
-      s.orphans.map((r) => specRun({ ...r, why: `${r.rel} — ${r.why || ''}` }, false)).join('') +
+      s.orphans.map((r) => specRun(
+        { ...r, why: `${(r.rels || []).join(', ')} — ${r.why || ''}` }, false)).join('') +
       `</section>`
     : '';
   $('sp-out').innerHTML = head + auto + bar + body + orphans;
@@ -2516,6 +3313,10 @@ function renderSpec(s) {
   $('sp-out').querySelectorAll('.sp-watch').forEach((b) => {
     b.onclick = () => openWorkerLog(state.sel, b.dataset.task);
   });
+  $('sp-out').querySelectorAll('.sp-refresh').forEach((b) => {
+    b.onclick = () => specWork('refresh', '/api/lane/refresh', { lane: b.dataset.lane },
+                               `bringing amp/${b.dataset.lane} forward…`);
+  });
   $('sp-out').querySelectorAll('.sp-rate-go').forEach((b) => {
     b.onclick = () => specWork('rate', '/api/spec/rate',
                               { lane: state.sel, rel: b.dataset.rel },
@@ -2527,12 +3328,12 @@ function renderSpec(s) {
   }
   if ($('sp-all')) {
     $('sp-all').onclick = () => specWork('all', '/api/spec/campaign', { lane: state.sel },
-                                         'queueing every document…');
+                                         'reviewing every document…');
   }
   if ($('sp-plan-stop')) {
     $('sp-plan-stop').onclick = () =>
       specWork('all', '/api/spec/campaign/stop', { lane: state.sel },
-               'stopping the queue…');
+               'stopping the run…');
   }
   if ($('sp-draft')) {
     $('sp-draft').onclick = () => specWork('draft', '/api/spec/draft', { lane: state.sel },
@@ -2545,20 +3346,39 @@ function renderSpec(s) {
       loadSpec();
     };
   });
+  // Every run row, not only the ones with a transcript still to fetch: the first
+  // thing this does is record the fold, and a run whose transcript is already
+  // here can be folded shut just the same.
+  //
   // Older runs arrive as a summary. Their transcript is fetched the first time
   // they are unfolded, and replaces the placeholder in place - not by redrawing
   // the pane, which would close the thing that was just opened.
-  $('sp-out').querySelectorAll('.sp-run[data-fetch]').forEach((d) => {
-    d.ontoggle = async () => {
-      if (!d.open || d.dataset.fetch !== '1') return;
-      d.dataset.fetch = '0';
-      const got = await api('/api/spec/run?id=' + encodeURIComponent(d.dataset.id));
-      const ph = d.querySelector('.sp-round');
-      if (!ph) return;
-      ph.outerHTML = got.ok
-        ? ((got.run.rounds || []).map(specRound).join('') || '<div class="sp-round muted">no rounds</div>')
-        : `<div class="sp-round"><span class="err">${esc(got.error)}</span></div>`;
+  const spFill = async (d) => {
+    if (!d.open || d.dataset.fetch !== '1') return;
+    d.dataset.fetch = '0';
+    const got = await api('/api/spec/run?id=' + encodeURIComponent(d.dataset.id));
+    // Kept so the next repaint draws it from here rather than asking again. Only
+    // on success: caching an error would make one bad moment permanent.
+    if (got.ok) state.specRounds[d.dataset.id] = got.run.rounds || [];
+    const ph = d.querySelector('.sp-round');
+    if (!ph) return;
+    const many = ((got.run || {}).rels || []).length > 1;
+    ph.outerHTML = got.ok
+      ? ((got.run.rounds || []).map((rd) => specRound(rd, many, d.dataset.mine)).join('')
+         || '<div class="sp-round muted">no rounds</div>')
+      : `<div class="sp-round"><span class="err">${esc(got.error)}</span></div>`;
+  };
+  $('sp-out').querySelectorAll('.sp-run').forEach((d) => {
+    d.ontoggle = () => {
+      // Recorded before anything else, so that a fetch that fails still leaves
+      // the fold where the operator put it.
+      state.specOpen[d.dataset.key] = d.open;
+      spFill(d);
     };
+    // A row remembered as open is DRAWN open, and `toggle` does not fire for
+    // something that was never closed - so a run unfolded before a repaint would
+    // otherwise come back showing the placeholder and never fill it in.
+    spFill(d);
   });
 
   // A run advances without anyone clicking: a writer finishes, the settle hook
@@ -2567,9 +3387,6 @@ function renderSpec(s) {
   // old tab did not poll is that reading every spec on disk each tick is a cost
   // for nothing, and that is still true when nothing is running.
   clearTimeout(state.specPoll);
-  // A running campaign counts as live even with nothing out right now: it is
-  // waiting on the ticker to start the next document, and a pane that stopped
-  // polling in that gap would sit on `0 queued` until somebody clicked.
   // A draft worker is live too, and it is the one case where nothing on this
   // tab changes until it finishes - so without it the pane would show a running
   // worker forever and never notice the document it wrote.
@@ -2683,7 +3500,12 @@ function wireSpecs() {
 // while nothing counts what it held - you set a lane to maintain and then have
 // no way to tell it apart from a lane that had nothing to do anyway.
 
-function renderLanes(v) {
+// Not `renderLanes`. That name already belongs to the lane list in the sidebar,
+// and a second function declaration with the same name silently replaces the
+// first - so every `renderLanes()` in `refresh()` reached this one instead,
+// threw on `undefined.modes`, and left the sidebar empty with no lanes and no
+// error anyone would see.
+function renderLaneModes(v) {
   const modes = v.modes || [];
   const rows = (v.lanes || []).map((l) => {
     const opts = modes.map((m) =>
@@ -2728,7 +3550,7 @@ function renderLanes(v) {
 
 async function loadLanes() {
   try {
-    renderLanes(await api('/api/lanes'));
+    renderLaneModes(await api('/api/lanes'));
   } catch (e) {
     $('lm-out').innerHTML = `<span class="err">${esc(String(e.message || e))}</span>`;
   }
@@ -2806,6 +3628,65 @@ function prTally(t) {
   return `<span class="pr-tally">${bits.join(' &middot; ')} of ${t.total}</span>`;
 }
 
+/** The one switch that runs the whole handoff without being pressed.
+ *
+ *  Per lane, and drawn only when a lane is on screen: this loop opens pull
+ *  requests and merges them, and a control that sat over "all lanes" would be
+ *  eleven of those decisions taken by one click on an unlabelled box.
+ *
+ *  `on` and `running` are drawn separately on purpose. The lane's mode and its
+ *  stage ceiling both outrank this switch, so a ticked box next to a lane that
+ *  stops at `code` would be reporting something that is not going to happen -
+ *  and the sentence that says why is the useful half. */
+function prAuto(v) {
+  if (!v.lane) {
+    const order = (v.order || []).filter((r) => r.on);
+    return `<div class="pr-auto pr-auto-off"><span class="muted">` +
+      `The unattended handoff is set per lane &mdash; stand on one to switch it ` +
+      `on or off. ` +
+      (order.length
+        ? `It is running on <b>${order.map((r) => esc(r.lane)).join('</b>, <b>')}</b>.`
+        : `It is not running on any lane.`) +
+      `</span></div>`;
+  }
+  const a = v.auto || {};
+  const log = (a.log || []).slice(0, 4).map((e) =>
+    `<div class="pr-auto-line"><span class="muted">${esc((e.at || '').slice(0, 16))}</span> ` +
+    `<b>${esc(e.what || '')}</b> ${esc(e.why || '')}</div>`).join('');
+  const rank = (v.order || []).findIndex((r) => r.lane === v.lane);
+  const mine = (v.order || [])[rank] || {};
+  return `<div class="pr-auto">` +
+    `<label><input type="checkbox" id="pr-auto-on"${a.on ? ' checked' : ''}> ` +
+    `<b>Hand this lane over on its own</b></label>` +
+    `<div class="muted">Takes the lanes fewest-blockers first, writes the checks that ` +
+    `are missing, waives only what the architect ruled no command can decide, opens the ` +
+    `pull request, and merges it once GitHub&rsquo;s own checks pass. A conflict sends a ` +
+    `worker to merge the base branch in &mdash; never a force-push.</div>` +
+    // Said plainly rather than implied by a greyed box. GitHub's rollup is the
+    // gate, and it is not ours to write, which is the whole reason this is
+    // allowed to run unattended at all.
+    `<div class="muted">Our checks decide whether work may be OFFERED. GitHub&rsquo;s ` +
+    `check rollup decides whether it may be MERGED, and a repository with no checks ` +
+    `can never be merged into from here.</div>` +
+    (a.on && !a.running
+      ? `<div class="warn">Switched on, but nothing will run: ` +
+        `${esc(a.why || 'the lane\u2019s mode or stage stops at an earlier rung')}.</div>`
+      : '') +
+    (a.busy
+      ? `<div class="pr-auto-busy">working: ${esc(a.busy.what || '')} ` +
+        `<span class="muted">since ${esc((a.busy.at || '').slice(0, 16))}</span></div>`
+      : '') +
+    `<div class="pr-auto-act">` +
+    `<button id="pr-auto-step"${a.running ? '' : ' disabled'}>Run one step now</button> ` +
+    `<span class="muted">${rank >= 0
+      ? `${esc(v.lane)} has ${mine.blockers} blocker${mine.blockers === 1 ? '' : 's'} &mdash; ` +
+        `${rank === 0 ? 'first' : `number ${rank + 1}`} of ${(v.order || []).length} ` +
+        `in the order the loop takes them`
+      : ''}</span></div>` +
+    (log ? `<div class="pr-auto-log">${log}</div>` : '') +
+    `</div>`;
+}
+
 function renderPrs(v) {
   const gh = v.github || {};
   const who = gh.ok
@@ -2821,7 +3702,12 @@ function renderPrs(v) {
     `<div class="dep-toll"><b>${v.finished_unshipped} finished ` +
     `goal${v.finished_unshipped === 1 ? '' : 's'} ${v.finished_unshipped === 1 ? 'has' : 'have'} ` +
     `never been handed to anyone.</b> ` +
-    (v.handoff_ready
+    // Nothing to say about how many of none could go. Narrowed to a lane this
+    // is the ordinary case, and "None of them can go as things stand" read as
+    // a report of trouble where there was none.
+    (!v.finished_unshipped
+      ? ''
+      : v.handoff_ready
       ? `${v.handoff_ready} of them could go right now.`
       : `None of them can go as things stand &mdash; each row says what stops it.`) +
     (v.gaps
@@ -2837,19 +3723,42 @@ function renderPrs(v) {
         `exists was skipped. A merge from here is a merge on somebody's word.</div>`
       : '');
 
-  const open = (v.open || []).map((p) =>
-    `<div class="pr-row">` +
-    `<div><a href="${esc(p.url)}" target="_blank">#${esc(String(p.number))}</a> ` +
-    `<b>${esc(p.title || '')}</b>${p.draft ? ' <span class="muted">(draft)</span>' : ''}` +
-    `<div class="muted">${esc(p.repo)} &middot; ${esc(p.head || '?')} &rarr; ` +
-    `${esc(p.base || '?')} &middot; opened ${esc((p.at || '').slice(0, 10))}</div></div>` +
-    // A pull request with no goal behind it is listed, and said out loud. It is
-    // not ours to explain, but it is on a repository a lane owns, and leaving
-    // it out would make this list look like the whole truth when it is not.
-    `<div>${p.goal_id
-      ? `<span class="muted">from ${esc(p.lane || '')} &middot; ${esc(p.goal_id)}</span>`
-      : `<span class="muted">nothing here opened this</span>`}</div>` +
-    `<div>${prChecks(p.checks)}</div></div>`).join('');
+  const open = (v.open || []).map((p) => {
+    // The two actions are mutually exclusive by construction, because they are
+    // answers to opposite states. `blocked` is computed on the server by the
+    // same function the merge itself runs, so a row can never offer an Accept
+    // that would be refused, and never hide one that would go through.
+    const stuck = (p.blocked || []).length;
+    const act =
+      `<a class="pr-btn" href="${esc(p.url)}" target="_blank" rel="noreferrer">` +
+      `View on GitHub</a>` +
+      (stuck
+        ? `<button class="pr-resolve" data-repo="${esc(p.repo)}" ` +
+          `data-number="${esc(String(p.number))}">Resolve</button>`
+        : `<button class="pr-accept" data-repo="${esc(p.repo)}" ` +
+          `data-number="${esc(String(p.number))}">Accept</button>`);
+    return `<div class="pr-row">` +
+      `<div><a href="${esc(p.url)}" target="_blank">#${esc(String(p.number))}</a> ` +
+      `<b>${esc(p.title || '')}</b>${p.draft ? ' <span class="muted">(draft)</span>' : ''}` +
+      `<div class="muted">${esc(p.repo)} &middot; ${esc(p.head || '?')} &rarr; ` +
+      `${esc(p.base || '?')} &middot; opened ${esc((p.at || '').slice(0, 10))}</div></div>` +
+      // A pull request with no goal behind it is listed, and said out loud. It is
+      // not ours to explain, but it is on a repository a lane owns, and leaving
+      // it out would make this list look like the whole truth when it is not.
+      `<div>${p.goal_id
+        ? `<span class="muted">from ${esc(p.lane || '')} &middot; ${esc(p.goal_id)}</span>`
+        : `<span class="muted">nothing here opened this</span>`}</div>` +
+      `<div>${prChecks(p.checks)}</div>` +
+      `<div class="pr-act">${act}</div>` +
+      // Every sentence that stops the merge, on the row, before anybody presses
+      // anything. The confirm quotes these too - this is so the operator does
+      // not have to press a button to find out why they cannot.
+      (stuck
+        ? `<div class="pr-span pr-blocked">${p.blocked.map(esc).join('<br>')}</div>`
+        : '') +
+      `<div class="pr-span pr-log" data-prlog="${esc(prKey(p))}"></div>` +
+      `</div>`;
+  }).join('');
 
   // A repository GitHub would not answer about must never render like one with
   // nothing open. Same shape, opposite meaning.
@@ -2888,11 +3797,21 @@ function renderPrs(v) {
       `<div>${prTally(r.tally)}</div></div>` +
       `<div class="pr-goal-act">` +
       (r.pr_url
-        ? `<a href="${esc(r.pr_url)}" target="_blank">already handed over</a>`
+        ? `<a class="pr-btn" href="${esc(r.pr_url)}" target="_blank" rel="noreferrer">` +
+          `View on GitHub</a>` +
+          `<span class="muted">already handed over</span>`
         : (r.tally && r.tally.unchecked
             ? `<button class="pr-write" data-goal="${esc(r.goal_id)}">` +
               `Write the ${r.tally.unchecked} missing check${r.tally.unchecked === 1 ? '' : 's'}</button>`
-            : '')) +
+            : '') +
+          // Offered on every unshipped goal and not only the clear ones. The
+          // press re-runs every done-condition for real before it pushes - so
+          // a row whose stored exit codes say it is blocked can still turn out
+          // to be ready, and one that looks ready can turn out not to be. A
+          // button shown only on the green rows would be a button gated on the
+          // stale numbers this row already warns about.
+          `<button class="pr-open" data-goal="${esc(r.goal_id)}">` +
+          `Open pull request</button>`) +
       `</div></div>` +
       (r.blocked && r.blocked.length
         ? `<div class="pr-blocked">${r.blocked.map((b) => esc(b)).join('<br>')}</div>`
@@ -2903,14 +3822,48 @@ function renderPrs(v) {
   }).join('');
 
   $('pr-out').innerHTML =
-    `<div class="pr-who">${who}</div>` + toll +
+    `<div class="pr-who">${who}</div>` + prScope(v) + prAuto(v) + toll +
     `<h4>Open on GitHub</h4>` +
     (open ? `<div class="pr-list">${open}</div>`
-          : `<span class="muted">nothing is open on any repository a lane points at</span>`) +
+          : `<span class="muted">${v.lane
+              ? `nothing open belongs to ${esc(v.lane)}`
+              : 'nothing is open on any repository a lane points at'}</span>`) +
     (quiet ? `<div class="pr-quiets">${quiet}</div>` : '') +
     `<h4>Finished here</h4>` +
-    (ready ? ready : `<span class="muted">no goal has reached done</span>`);
+    (ready ? ready
+           : `<span class="muted">${v.lane
+               ? `no ${esc(v.lane)} goal has reached done`
+               : 'no goal has reached done'}</span>`);
 
+  if ($('pr-auto-on')) {
+    $('pr-auto-on').onchange = async (e) => {
+      const r = await post('/api/pr/auto', { lane: v.lane, on: e.target.checked });
+      // Reloaded rather than patched in place: the switch is not the only thing
+      // that decides whether this runs, and the sentence saying so comes from
+      // the server.
+      const said = r.ok ? '' : (r.error || 'that did not take');
+      // `loadPrs` clears `pr-status` when it finishes, so anything written
+      // before it is wiped by the reload that was meant to confirm it. Said
+      // after, or not said at all.
+      await loadPrs();
+      if (said) $('pr-status').textContent = said;
+    };
+  }
+  if ($('pr-auto-step')) {
+    $('pr-auto-step').onclick = async () => {
+      $('pr-auto-step').disabled = true;
+      $('pr-status').textContent = `running one handoff step on ${v.lane}…`;
+      const r = await post('/api/pr/auto/step', { lane: v.lane });
+      const said = r.ok
+        ? (r.did ? `${r.did}${r.goal_id ? ` on ${r.goal_id}` : ''}`
+                 : (r.note || 'nothing was waiting'))
+        : (r.error || 'that step did not run');
+      // After the reload, for the same reason as above. A step that did nothing
+      // leaves no log line, so this sentence is the ONLY report there is.
+      await loadPrs();
+      $('pr-status').textContent = said;
+    };
+  }
   document.querySelectorAll('.dep-login').forEach((b) => {
     b.onclick = () => providerLogin(b.dataset.provider);
   });
@@ -2923,7 +3876,20 @@ function renderPrs(v) {
   document.querySelectorAll('.pr-unwaive').forEach((b) => {
     b.onclick = () => waiveCondition(b.dataset.goal, b.dataset.text, true);
   });
+  document.querySelectorAll('.pr-open').forEach((b) => {
+    b.onclick = () => openPullRequest(b.dataset.goal);
+  });
+  document.querySelectorAll('.pr-accept').forEach((b) => {
+    b.onclick = () => acceptPr(b.dataset.repo, Number(b.dataset.number));
+  });
+  document.querySelectorAll('.pr-resolve').forEach((b) => {
+    b.onclick = () => resolvePr(b.dataset.repo, Number(b.dataset.number));
+  });
 }
+
+/** What names one pull request's log line. Not the number on its own: two
+ *  repositories both have a #1, and one of them would write into the other. */
+const prKey = (p) => `${p.repo}#${p.number}`;
 
 function setPrLog(gid, html) {
   const el = document.querySelector(`[data-prlog="${CSS.escape(gid)}"]`);
@@ -2996,12 +3962,172 @@ async function waiveCondition(gid, text, undo) {
   loadPrs();
 }
 
+/** Hand one finished goal over: re-run every condition, then push and open it.
+ *
+ *  Two round trips, and the first one is not a formality. Every number on this
+ *  row is a stored exit code from whenever the check last ran, which the row
+ *  says out loud; the report call runs them all again in the worktree, so what
+ *  gates the push is evidence from a minute ago rather than from a week ago. */
+async function openPullRequest(gid) {
+  setPrLog(gid, 're-running every done-condition before anything is pushed…');
+  const r = await post('/api/goal/publish/report', { goal_id: gid });
+  const rep = r.report || {};
+  if (!rep.ok) {
+    setPrLog(gid, `<span class="err">not handed over &mdash; ` +
+      `${esc((rep.blocked || ['the gate refused it']).join('; '))}</span>`);
+    loadPrs();
+    return;
+  }
+  if (!confirm(`Push ${rep.branch} to ${rep.base} and open a pull request?\n\n` +
+      `${rep.objective || gid}\n\n` +
+      `${(rep.commits || []).length} commit(s). This leaves the machine.`)) {
+    setPrLog(gid, 'nothing was pushed');
+    return;
+  }
+  setPrLog(gid, 'pushing the branch and opening it…');
+  const a = await post('/api/goal/publish', { goal_id: gid, confirm: true });
+  const got = a.report || {};
+  setPrLog(gid, got.pr_url
+    ? `<span class="ok">opened</span> <a href="${esc(got.pr_url)}" target="_blank">${esc(got.pr_url)}</a>`
+    : `<span class="err">${esc((got.blocked || ['it did not open']).join('; '))}</span>`);
+  loadPrs();
+}
+
+/** Merge one pull request, on GitHub's answer about it rather than on ours.
+ *
+ *  The first call is a preflight and reaches GitHub for a fresh reading, which
+ *  is the whole point: the row was painted when the tab loaded and every fact
+ *  the gate reads - the rollup, the draft flag, whether it is still open - moves
+ *  without anybody here doing anything. The confirm quotes that reading, so what
+ *  is being agreed to is those specific checks and not the idea of merging. */
+async function acceptPr(repo, number) {
+  const key = `${repo}#${number}`;
+  setPrLog(key, 'asking GitHub what it says about this one right now…');
+  const p = await post('/api/pr/merge', { repo, number });
+  if (!p.ok) { setPrLog(key, `<span class="err">${esc(p.error)}</span>`); return; }
+  if ((p.blocked || []).length) {
+    // Not a failure of the press. The state moved between the paint and the
+    // click, and saying so is more use than a red row with no explanation.
+    setPrLog(key, `<span class="err">will not merge: ${esc(p.blocked.join('; '))}</span>`);
+    loadPrs();
+    return;
+  }
+  const c = p.checks || {};
+  if (!confirm(`Merge ${repo}#${number} (squash) and delete ${p.head}?\n\n` +
+      `${p.title || ''}\n\n` +
+      `GitHub says ${c.passed} of ${c.total} checks passed` +
+      (c.skipped ? `, ${c.skipped} skipped` : '') + `.\n\n` +
+      `This is not reversible from here.`)) {
+    setPrLog(key, 'not merged');
+    return;
+  }
+  setPrLog(key, 'merging…');
+  const a = await post('/api/pr/merge', { repo, number, confirm: true, method: 'squash' });
+  setPrLog(key, a.merged
+    ? `<span class="ok">merged</span> <span class="muted">GitHub now says ` +
+      `${esc(String(a.state_after || '').toLowerCase())}</span>`
+    : `<span class="err">${esc((a.blocked || [a.error || 'it did not merge']).join('; '))}</span>` +
+      (a.output ? `<pre class="dep-tail">${esc(a.output)}</pre>` : ''));
+  loadPrs();
+}
+
+/** Try the cheapest thing that has not been tried on a stuck pull request.
+ *
+ *  One button and not three, because choosing the tier is the feature. A re-run
+ *  is free and fixes a flake; a worker costs a worktree and a budget and is the
+ *  answer when the branch is genuinely broken; the architect is a reading, and
+ *  it is what is left when there is nobody to send. The server keeps the record
+ *  of what has already been tried, so pressing this twice escalates instead of
+ *  re-running the same dead workflow and reporting progress. */
+async function resolvePr(repo, number) {
+  const key = `${repo}#${number}`;
+  setPrLog(key, 'working out the cheapest thing left to try…');
+  const r = await post('/api/pr/resolve', { repo, number, tier: 'auto' });
+  if (!r.ok) {
+    setPrLog(key, `<span class="err">${esc(r.tier ? `${r.tier}: ` : '')}` +
+      `${esc(r.error)}</span>`);
+    return;
+  }
+  const tier = r.tier
+    ? `<span class="pr-tier">${esc(r.tier)}</span> `
+    : '';
+  const steps = (r.steps || []).length
+    ? `<pre class="dep-tail">${esc((r.steps || []).map((s) =>
+        `run ${s.run} → exit ${s.exit}  ${s.said || ''}`).join('\n'))}</pre>`
+    : '';
+  // The architect's answer is shown in full and marked as a reading. Nothing
+  // was stored and nothing ran, and a box that looked like a result would be
+  // read as one.
+  const g = r.reading;
+  const read = g
+    ? `<div class="pr-read"><b>${g.ours === false
+        ? 'not this branch\u2019s fault' : 'cause'}</b>: ${esc(g.cause)}` +
+      (g.fix ? `<div><b>fix</b>: ${esc(g.fix)}</div>` : '') +
+      ((g.commands || []).length
+        ? `<pre class="dep-tail">${esc(g.commands.join('\n'))}</pre>` : '') +
+      `<div class="muted">a reading &mdash; nothing here was stored or run</div></div>`
+    : '';
+  setPrLog(key, tier + `<span class="muted">${esc(r.note || '')}</span>` + steps + read);
+  // Only where something on GitHub or on the board actually moved. Reloading
+  // after a reading would throw the reading away to repaint an identical row.
+  if (r.tier === 'rerun' || r.goal_opened) loadPrs();
+}
+
+/** The lane this pane is asked about, or '' for the whole workspace. Narrowed
+ *  by default and widened by the button, exactly as `depLane` is. */
+function prLane() {
+  return state.prAll ? '' : (state.sel || '');
+}
+
+/** What a narrowed handoff pane is NOT showing.
+ *
+ *  Two numbers rather than one, because a pull request withheld because it
+ *  belongs to another lane and a finished goal withheld for the same reason are
+ *  different things, and a single total would be a number about neither. */
+function prScope(v) {
+  if (!v.lane) return '';
+  const loose = (v.open || []).filter((p) => !p.lane).length;
+  const bits = [];
+  if (v.hidden_open) {
+    bits.push(`<b>${v.hidden_open}</b> open pull request` +
+      `${v.hidden_open === 1 ? '' : 's'} on a shared repository belong` +
+      `${v.hidden_open === 1 ? 's' : ''} to another lane`);
+  }
+  if (v.hidden_ready) {
+    bits.push(`<b>${v.hidden_ready}</b> finished goal` +
+      `${v.hidden_ready === 1 ? '' : 's'} elsewhere`);
+  }
+  return `<div class="dep-scope"><b>${esc(v.lane)}</b> only &mdash; every number below ` +
+    `counts this lane and nothing else.` +
+    (bits.length
+      ? ` ${bits.join(', and ')} &mdash; <i>All lanes</i> shows ` +
+        `${bits.length > 1 || v.hidden_open > 1 || v.hidden_ready > 1 ? 'them' : 'it'}.`
+      : '') +
+    // A pull request nothing here opened, on a branch that is not `amp/<lane>`,
+    // cannot be attributed to a lane - so it is on this screen rather than
+    // assigned to one by guesswork. Said only when one is actually here: as a
+    // standing sentence it was a caveat about nothing on nearly every load.
+    (loose
+      ? ` ${loose} of the pull request${loose === 1 ? '' : 's'} below could not be ` +
+        `attributed to any lane, so ${loose === 1 ? 'it is' : 'they are'} shown on ` +
+        `every lane rather than assigned to one by guesswork.`
+      : '') +
+    `</div>`;
+}
+
 async function loadPrs() {
+  const lane = prLane();
+  $('btn-pr-scope').textContent = lane ? 'All lanes' : 'This lane';
+  // With nothing selected there is nothing to narrow TO.
+  $('btn-pr-scope').disabled = !state.sel;
+  const q = lane ? `?lane=${encodeURIComponent(lane)}` : '';
   // Said out loud: this asks GitHub about every repository and reads every
   // finished goal's worktree, so the pause is real and a silent one looks broken.
-  $('pr-status').textContent = 'asking GitHub, and reading every finished goal…';
+  $('pr-status').textContent = lane
+    ? `asking GitHub about ${lane}, and reading its finished goals…`
+    : 'asking GitHub, and reading every finished goal…';
   try {
-    renderPrs(await api('/api/prs'));
+    renderPrs(await api(`/api/prs${q}`));
     $('pr-status').textContent = '';
   } catch (e) {
     $('pr-out').innerHTML = `<span class="err">${esc(String(e.message || e))}</span>`;
@@ -3011,6 +4137,10 @@ async function loadPrs() {
 
 function wirePrs() {
   $('btn-pr-reload').onclick = loadPrs;
+  $('btn-pr-scope').onclick = () => {
+    state.prAll = !state.prAll;
+    loadPrs();
+  };
 }
 
 // ------------------------------------------------------------------- publish
@@ -3089,9 +4219,14 @@ function renderDeploy(v) {
       `serve.</b> Nobody outside this machine can install that version. Some of these are a tree that is BEHIND the registry rather than ahead of it &mdash; the two numbers on the row say which.</div>`
     : '';
 
-  $('dep-out').innerHTML = head + waiting + ids +
+  // A lane with no deployable thing in it has no toll to report, and `head`
+  // would say every service here has a working credential - of none.
+  const empty = v.lane && !(v.targets || []).length;
+  $('dep-out').innerHTML = depScope(v) + (empty ? '' : head + waiting + ids) +
     (rows ? `<div class="dep-list">${rows}</div>`
-          : '<span class="muted">nothing deployable found</span>');
+          : `<span class="muted">${v.lane
+              ? esc(v.lane) + ' has nothing deployable in it'
+              : 'nothing deployable found'}</span>`);
   document.querySelectorAll('.dep-login').forEach((b) => {
     b.onclick = () => providerLogin(b.dataset.provider);
   });
@@ -3186,17 +4321,227 @@ async function runDeploy(key, publish) {
   }
 }
 
+// ------------------------------------------------------ what is already live
+//
+// The rest of this tab answers "could this be deployed". This answers "what IS
+// deployed", and it had been answering it from `wrangler.toml` - which found
+// exactly one Cloudflare service on an account serving twenty-two sites out of
+// this workspace, because every one of them is built by Cloudflare from a git
+// push and none of them is deployed from this machine.
+//
+// So there is no button on these rows, deliberately. `wrangler pages deploy`
+// would upload a build that no commit produced, straight past the integration
+// that owns the site - a deployment nobody could trace back to a sha, which is
+// the exact shape of the `live_deployed` claim this tab exists to make
+// checkable. The row carries the two commits and says nothing else.
+
+function renderPages(v) {
+  if (!v.asked) {
+    $('cf-out').innerHTML =
+      `<div class="dep-toll">${esc(v.why || 'Cloudflare would not say')}</div>`;
+    return;
+  }
+  // One repository often serves several sites - `WebHost.Systems` serves
+  // `webhost.systems` and `app.webhost.systems`, `AmpersandBoxDesign` serves
+  // two - and alphabetical rows put those nine apart. So each repository is a
+  // headed group, and the header is what carries the directory: repeating it on
+  // every row underneath a heading that says it is noise.
+  let head_rel;
+  const rows = (v.sites || []).map((s) => {
+    const g = s.git_state || {};
+    const live = s.live || {};
+    let group = '';
+    if (s.rel !== head_rel) {
+      head_rel = s.rel;
+      group = s.rel
+        ? `<div class="cf-repo"><b>${esc(s.rel)}</b>` +
+          `<span class="muted">${s.lane ? esc(s.lane) : 'no lane owns this'}</span>` +
+          (s.siblings > 1
+            ? `<span class="cf-many">${s.siblings} sites</span>`
+            : '') +
+          `</div>`
+        // Not "unmatched" or "unknown": these are sites that exist and are
+        // being served, and the only thing missing is a directory here.
+        : `<div class="cf-repo cf-repo-out"><b>built outside this workspace</b>` +
+          `<span class="muted">no directory here holds the commit they are serving` +
+          `</span></div>`;
+    }
+    // Three states, and they are not degrees of the same thing. Level and
+    // behind are both comparisons that happened; the third is the comparison
+    // REFUSING to happen, and it must not read like agreement.
+    const dist = !s.rel
+      ? '<span class="dep-orphan">no directory here builds this</span>'
+      : g.ahead === null || g.ahead === undefined
+        ? `<span class="dep-unknown">${esc(g.why || 'never deployed')}</span>`
+        : g.ahead === 0
+          ? '<span class="dep-ok">serving HEAD</span>'
+          : `<span class="dep-behind">${g.ahead} commit${g.ahead === 1 ? '' : 's'} behind</span>`;
+    // A build that broke sits ABOVE the live line, not instead of it, because
+    // they are two facts and the site is still serving the older one. Reading
+    // the newest deployment as the live one is the mistake this section made
+    // for an hour: `docs` was reported live at a commit its build never
+    // finished, with a confident number beside it.
+    const f = live.failed;
+    const broke = f
+      ? `<div class="dep-broke">last build <b>${esc(f.state || 'did not finish')}</b>` +
+        (f.sha ? ` at <code>${esc(f.sha)}</code>` : '') +
+        ` &mdash; so the site is still serving what is below</div>`
+      : '';
+    // Every custom domain, and the pages.dev one dropped: the first is what the
+    // world types and the second is Cloudflare's plumbing.
+    const doms = (s.domains || []).filter((d) => !d.endsWith('.pages.dev'));
+    // The join that was tried and failed, kept on the row rather than dropped:
+    // `zapp.bendscript.com` sits under "built outside this workspace" and the
+    // obvious thing to do about that is join it to `bendscript.com/` by name.
+    // This is the record of that having been tried, and refused by git.
+    const no = s.refused
+      ? `<div class="cf-refused">not <code>${esc(s.refused.rel)}</code> &mdash; ` +
+        `that repository has no commit <code>${esc(s.refused.sha || '?')}</code>, ` +
+        `so the name matching is a coincidence</div>`
+      : '';
+    return group + `<div class="dep-row${s.stale ? ' dep-stale' : ''}${s.broken ? ' dep-broken' : ''}">` +
+      `<div><b>${esc(s.name)}</b> ` +
+      `<span class="muted">${doms.length ? esc(doms.join(', ')) : 'no custom domain'}</span>` +
+      broke + no +
+      `<div class="dep-last">` +
+      (live.sha
+        ? `live <code>${esc(live.sha)}</code>` +
+          (live.branch ? ` from ${esc(live.branch)}` : '') +
+          (g.head ? ` &middot; here <code>${esc(g.head)}</code>` : '') +
+          (live.age ? ` &middot; ${esc(live.age)}` : '')
+        : '<span class="muted">no production deployment</span>') +
+      `</div></div>` +
+      // How this site found its repository, and only when that is worth
+      // knowing. A name match is the ordinary case and says nothing; a commit
+      // match is the pane asserting something git checked.
+      //
+      // Where the lane used to be. A lane owns the REPOSITORY, so with the
+      // rows grouped it belongs in the header - printing it again on every
+      // sibling underneath said "no lane owns this" three times about one
+      // directory.
+      `<div class="muted">${s.joined === 'commit'
+        ? '<span class="cf-proved">found by its commit</span>' : ''}</div>` +
+      `<div class="dep-act">${dist}</div>` +
+      `</div>`;
+  }).join('');
+
+  // Above the stale count, because it is a different problem and it outranks
+  // it: "push again" is the fix for behind, and it is exactly what has already
+  // been tried on a site whose build is failing.
+  const broken = v.broken
+    ? `<div class="dep-toll dep-alarm"><b>${v.broken} site${v.broken === 1 ? '' : 's'} ` +
+      `${v.broken === 1 ? 'has' : 'have'} a production build that did not finish.</b> ` +
+      `Cloudflare kept serving the previous commit, so nothing is down &mdash; but the ` +
+      `commit that was pushed is not live and pushing it again will not change that.` +
+      ((v.lanes_broken || []).length
+        ? ` Lanes holding one: <b>${v.lanes_broken.map(esc).join(', ')}</b>.` : '') +
+      `</div>`
+    : '';
+
+  const head = v.stale
+    ? `<div class="dep-toll"><b>${v.stale} site${v.stale === 1 ? '' : 's'} ` +
+      `${v.stale === 1 ? 'is' : 'are'} serving a commit older than the tree.</b> ` +
+      `That work is finished, committed, and nobody outside this machine can see it. ` +
+      `These deploy on a push, so the fix is a push.` +
+      ((v.lanes_stale || []).length
+        ? ` Lanes holding one: <b>${v.lanes_stale.map(esc).join(', ')}</b>.` : '') +
+      `</div>`
+    : `<div class="dep-toll">Every site with a directory here is serving that directory&rsquo;s HEAD.</div>`;
+
+  const orph = v.orphans
+    ? `<div class="dep-toll muted">${v.orphans} of ${(v.sites || []).length} are built from ` +
+      `somewhere other than this workspace. They are listed so that the number on this ` +
+      `screen is the whole account rather than the part of it we recognise.` +
+      (v.refused
+        ? ` ${v.refused} of them ${v.refused === 1 ? 'has a name that matches' : 'have names that match'} ` +
+          `a directory here and ${v.refused === 1 ? 'is' : 'are'} not built from it &mdash; ` +
+          `said on the row, so the join is not tried again.`
+        : '') +
+      `</div>`
+    : '';
+
+  // The thing the account does that one row per site could not show: a single
+  // repository is often serving several sites, so a push moves more than one of
+  // them and any one of them can be behind or broken on its own.
+  const many = v.multi
+    ? `<div class="dep-toll muted">${v.multi} ${v.multi === 1 ? 'repository serves' : 'repositories serve'} ` +
+      `more than one site &mdash; grouped below, because a commit that is live on one of them ` +
+      `is not necessarily live on its neighbour.` +
+      (v.by_commit
+        ? ` ${v.by_commit} ${v.by_commit === 1 ? 'site found its' : 'sites found their'} repository ` +
+          `by the commit it is serving rather than by its name; a subdomain never joins on the ` +
+          `name alone.`
+        : '') +
+      `</div>`
+    : '';
+
+  // Under a lane filter there is nothing to say about levelness when the lane
+  // owns no site: `head` would claim every site is serving HEAD, of none.
+  const empty = v.lane && !(v.sites || []).length;
+  $('cf-out').innerHTML = depScope(v) + (empty ? '' : broken + head + many + orph) +
+    (rows ? `<div class="dep-list cf-list">${rows}</div>`
+          : `<span class="muted">${v.lane
+              ? 'no Pages site is built from ' + esc(v.lane)
+              : 'no Pages projects on this account'}</span>`);
+}
+
+/** The lane this pane is asked about, or '' for the whole workspace.
+ *
+ *  Narrowed by default and widened by the button, never the other way round: an
+ *  operator who has selected a lane is asking about that lane, and a pane that
+ *  opened on thirty-eight sites to answer a question about one is why this
+ *  exists. With no lane selected there is nothing to narrow TO, so it is the
+ *  whole workspace regardless of what the toggle says. */
+function depLane() {
+  return state.depAll ? '' : (state.sel || '');
+}
+
 async function loadDeploy() {
+  const lane = depLane();
+  $('btn-dep-scope').textContent = lane ? 'All lanes' : 'This lane';
+  // With nothing selected the button has nowhere to go, so it says so rather
+  // than offering a narrowing that would empty the pane.
+  $('btn-dep-scope').disabled = !state.sel;
+  const q = lane ? `?lane=${encodeURIComponent(lane)}` : '';
   // Said out loud because it is slow and reaches the network: without this the
   // tab looks broken for the seconds each provider takes to answer.
-  $('dep-status').textContent = 'asking each provider…';
+  $('dep-status').textContent = lane
+    ? `asking each provider ${lane} needs…` : 'asking each provider…';
   try {
-    renderDeploy(await api('/api/deploy'));
+    renderDeploy(await api(`/api/deploy${q}`));
     $('dep-status').textContent = '';
   } catch (e) {
     $('dep-out').innerHTML = `<span class="err">${esc(String(e.message || e))}</span>`;
     $('dep-status').textContent = '';
   }
+  // After, not with. This is a wrangler start-up per project and there are
+  // thirty-eight of them; making "which credential is missing" wait behind
+  // "which commit is live" would put half a minute in front of the answer the
+  // operator opened the tab for.
+  $('cf-out').innerHTML =
+    '<span class="muted">asking Cloudflare which commit each site is serving…</span>';
+  try {
+    renderPages(await api(`/api/deploy/pages${q}`));
+  } catch (e) {
+    $('cf-out').innerHTML = `<span class="err">${esc(String(e.message || e))}</span>`;
+  }
+}
+
+/** What a narrowed pane is NOT showing, said in the pane.
+ *
+ *  Every count on this tab is a count of what was drawn, which is the only way
+ *  a filtered total can be honest - but it also means a number here is smaller
+ *  than the same number a moment ago, for a reason that is not progress. This
+ *  line is that reason. */
+function depScope(v) {
+  if (!v.lane) return '';
+  return `<div class="dep-scope"><b>${esc(v.lane)}</b> only &mdash; every number below ` +
+    `counts this lane and nothing else.` +
+    (v.hidden
+      ? ` <b>${v.hidden}</b> elsewhere in the workspace ${v.hidden === 1 ? 'is' : 'are'} ` +
+        `not on this screen; <i>All lanes</i> shows them.`
+      : '') +
+    `</div>`;
 }
 
 /** Start a browser sign-in and keep asking the PROVIDER whether it took.
@@ -3232,6 +4577,10 @@ async function providerLogin(provider) {
 
 function wireDeploy() {
   $('btn-dep-reload').onclick = loadDeploy;
+  $('btn-dep-scope').onclick = () => {
+    state.depAll = !state.depAll;
+    loadDeploy();
+  };
 }
 
 function wireDirection() {
@@ -3345,105 +4694,6 @@ function svList(items, cls, extra) {
 
 function renderSupervisor(sup) {
   const el = $('mi-sup');
-// ------------------------------------------------------ what is already live
-//
-// The rest of this tab answers "could this be deployed". This answers "what IS
-// deployed", and it had been answering it from `wrangler.toml` - which found
-// exactly one Cloudflare service on an account serving twenty-two sites out of
-// this workspace, because every one of them is built by Cloudflare from a git
-// push and none of them is deployed from this machine.
-//
-// So there is no button on these rows, deliberately. `wrangler pages deploy`
-// would upload a build that no commit produced, straight past the integration
-// that owns the site - a deployment nobody could trace back to a sha, which is
-// the exact shape of the `live_deployed` claim this tab exists to make
-// checkable. The row carries the two commits and says nothing else.
-
-function renderPages(v) {
-  if (!v.asked) {
-    $('cf-out').innerHTML =
-      `<div class="dep-toll">${esc(v.why || 'Cloudflare would not say')}</div>`;
-    return;
-  }
-  const rows = (v.sites || []).map((s) => {
-    const g = s.git_state || {};
-    const live = s.live || {};
-    // Three states, and they are not degrees of the same thing. Level and
-    // behind are both comparisons that happened; the third is the comparison
-    // REFUSING to happen, and it must not read like agreement.
-    const dist = !s.rel
-      ? '<span class="dep-orphan">no directory here builds this</span>'
-      : g.ahead === null || g.ahead === undefined
-        ? `<span class="dep-unknown">${esc(g.why || 'never deployed')}</span>`
-        : g.ahead === 0
-          ? '<span class="dep-ok">serving HEAD</span>'
-          : `<span class="dep-behind">${g.ahead} commit${g.ahead === 1 ? '' : 's'} behind</span>`;
-    // A build that broke sits ABOVE the live line, not instead of it, because
-    // they are two facts and the site is still serving the older one. Reading
-    // the newest deployment as the live one is the mistake this section made
-    // for an hour: `docs` was reported live at a commit its build never
-    // finished, with a confident number beside it.
-    const f = live.failed;
-    const broke = f
-      ? `<div class="dep-broke">last build <b>${esc(f.state || 'did not finish')}</b>` +
-        (f.sha ? ` at <code>${esc(f.sha)}</code>` : '') +
-        ` &mdash; so the site is still serving what is below</div>`
-      : '';
-    // Every custom domain, and the pages.dev one dropped: the first is what the
-    // world types and the second is Cloudflare's plumbing.
-    const doms = (s.domains || []).filter((d) => !d.endsWith('.pages.dev'));
-    return `<div class="dep-row${s.stale ? ' dep-stale' : ''}${s.broken ? ' dep-broken' : ''}">` +
-      `<div><b>${esc(s.name)}</b> ` +
-      `<span class="muted">${doms.length ? esc(doms.join(', ')) : 'no custom domain'}</span>` +
-      broke +
-      `<div class="dep-last">` +
-      (live.sha
-        ? `live <code>${esc(live.sha)}</code>` +
-          (live.branch ? ` from ${esc(live.branch)}` : '') +
-          (g.head ? ` &middot; here <code>${esc(g.head)}</code>` : '') +
-          (live.age ? ` &middot; ${esc(live.age)}` : '')
-        : '<span class="muted">no production deployment</span>') +
-      `</div></div>` +
-      `<div class="muted">${esc(s.rel || '—')}</div>` +
-      `<div>${s.lane ? esc(s.lane) : '<span class="dep-orphan">no lane owns this</span>'}</div>` +
-      `<div class="dep-act">${dist}</div>` +
-      `</div>`;
-  }).join('');
-
-  // Above the stale count, because it is a different problem and it outranks
-  // it: "push again" is the fix for behind, and it is exactly what has already
-  // been tried on a site whose build is failing.
-  const broken = v.broken
-    ? `<div class="dep-toll dep-alarm"><b>${v.broken} site${v.broken === 1 ? '' : 's'} ` +
-      `${v.broken === 1 ? 'has' : 'have'} a production build that did not finish.</b> ` +
-      `Cloudflare kept serving the previous commit, so nothing is down &mdash; but the ` +
-      `commit that was pushed is not live and pushing it again will not change that.` +
-      ((v.lanes_broken || []).length
-        ? ` Lanes holding one: <b>${v.lanes_broken.map(esc).join(', ')}</b>.` : '') +
-      `</div>`
-    : '';
-
-  const head = v.stale
-    ? `<div class="dep-toll"><b>${v.stale} site${v.stale === 1 ? '' : 's'} ` +
-      `${v.stale === 1 ? 'is' : 'are'} serving a commit older than the tree.</b> ` +
-      `That work is finished, committed, and nobody outside this machine can see it. ` +
-      `These deploy on a push, so the fix is a push.` +
-      ((v.lanes_stale || []).length
-        ? ` Lanes holding one: <b>${v.lanes_stale.map(esc).join(', ')}</b>.` : '') +
-      `</div>`
-    : `<div class="dep-toll">Every site with a directory here is serving that directory&rsquo;s HEAD.</div>`;
-
-  const orph = v.orphans
-    ? `<div class="dep-toll muted">${v.orphans} of ${(v.sites || []).length} are built from ` +
-      `somewhere other than this workspace. They are listed so that the number on this ` +
-      `screen is the whole account rather than the part of it we recognise.</div>`
-    : '';
-
-  $('cf-out').innerHTML = broken + head + orph +
-    (rows ? `<div class="dep-list">${rows}</div>`
-          : '<span class="muted">no Pages projects on this account</span>');
-}
-
   const last = (sup || {}).last;
   if (!last) {
     el.innerHTML = '<div class="muted">No reading yet. Nothing has been held against ' +
@@ -3455,17 +4705,6 @@ function renderPages(v) {
     `<div class="verdict ${esc(v)}">${esc(VERDICT_WORD[v] || v)}` +
     `<span class="muted"> · ${esc(last.at || '')}` +
     (sup.stale ? ` · ${sup.since} change${sup.since === 1 ? '' : 's'} since` : '') +
-  // After, not with. This is a wrangler start-up per project and there are
-  // thirty-eight of them; making "which credential is missing" wait behind
-  // "which commit is live" would put half a minute in front of the answer the
-  // operator opened the tab for.
-  $('cf-out').innerHTML =
-    '<span class="muted">asking Cloudflare which commit each site is serving…</span>';
-  try {
-    renderPages(await api('/api/deploy/pages'));
-  } catch (e) {
-    $('cf-out').innerHTML = `<span class="err">${esc(String(e.message || e))}</span>`;
-  }
     `</span></div>` +
     `<div class="md">${md(last.summary || '')}</div>` +
     // Drift first. It is the only part of a reading that says something here is
@@ -3530,6 +4769,7 @@ function applyWorkspace(ws) {
   renderWorkspacePick(ws);
   renderAlign(state.supervisor, ws);
   renderWorkspaces(ws);
+  renderMove(ws);
   if ($('mi-text') !== document.activeElement) $('mi-text').value = ws.mission || '';
 }
 
@@ -3553,15 +4793,115 @@ async function switchWorkspace(slug) {
   state.sel = null;
   state.goal = null;
   state.consult = null;
+  // The Blueprint is workspace-scoped end to end - the layers, the triggers and
+  // every prompt it builds - so its caches go too. A stack diagram left over
+  // from another workspace is the exact kind of quietly-wrong this screen exists
+  // to stop.
+  state.bp.map = state.bp.trigs = state.bp.actions = state.bp.ctx = null;
   await refresh();
   await loadChat();
   if ($('pane-direction').classList.contains('active')) loadDirection();
+  if (!$('blueprint').classList.contains('hidden')) bpShow(state.bp.view);
+}
+
+// Moving a lane is the only control in this console that deletes state in order
+// to succeed: a lane leaves one config, some goal files leave one directory, and
+// git relocates a checked-out worktree. So it is two buttons, not one. The first
+// asks and changes nothing; the second only appears once there is an answer on
+// screen to have read, and it goes away again the moment the question changes.
+
+function renderMove(ws) {
+  const lanes = (state.lanes || []).map((l) => l.name);
+  const opt = (v, t) => `<option value="${esc(v)}">${esc(t)}</option>`;
+  const l = $('mv-lane');
+  const lh = lanes.length
+    ? lanes.map((n) => opt(n, n)).join('')
+    : opt('', 'no lanes in this workspace');
+  if (l._html !== lh) { l._html = lh; l.innerHTML = lh; }
+  const t = $('mv-to');
+  const others = (ws.list || []).filter((w) => w.slug !== ws.current);
+  const th = others.length
+    ? others.map((w) => opt(w.slug, w.name)).join('')
+    : opt('', 'there is nowhere else yet');
+  if (t._html !== th) { t._html = th; t.innerHTML = th; }
+  l.disabled = t.disabled = !lanes.length || !others.length;
+  $('btn-mv-check').disabled = l.disabled;
+}
+
+// Any change to what is being asked invalidates the answer on screen, so the
+// answer goes with it. Leaving a stale plan next to a live "Move it" is how you
+// move the lane you were looking at a minute ago.
+function moveReset() {
+  const out = $('mv-out');
+  if (out) out.innerHTML = '';
+  const go = $('btn-mv-do');
+  if (go) go.classList.add('hidden');
+}
+
+function wireMove() {
+  $('mv-lane').onchange = moveReset;
+  $('mv-to').onchange = moveReset;
+
+  $('btn-mv-check').onclick = async () => {
+    const lane = $('mv-lane').value;
+    const to = $('mv-to').value;
+    moveReset();
+    if (!lane || !to) return;
+    // The workspace this screen was showing when the choice was made, sent so
+    // the harness can refuse if something else moved it in between. Another
+    // console against this same state directory is a normal Wednesday here.
+    const r = await post('/api/lane/move',
+      { lane, to, from: (state.workspace || {}).current });
+    const out = $('mv-out');
+    if (!r.ok) {
+      out.innerHTML = `<div class="mv-no">${esc(r.error || 'refused')}</div>`;
+      return;
+    }
+    const left = Object.entries(r.left_behind || {});
+    out.innerHTML =
+      `<div class="mv-go"><b>${esc(lane)}</b> would move from ` +
+      `<b>${esc(r.from)}</b> to <b>${esc(r.to)}</b>.</div>` +
+      `<ul class="mv-list">` +
+      `<li>${r.goals} goal${r.goals === 1 ? '' : 's'} move${r.goals === 1 ? 's' : ''} with it</li>` +
+      `<li>${r.worktree
+        ? 'its worktree moves too, with anything uncommitted in it'
+        : 'no worktree — this lane has never been dispatched'}</li>` +
+      (left.length
+        ? `<li class="mv-stay">stays behind in ${esc(r.from)}: ` +
+          left.map(([k, n]) => `${n} ${esc(k)}`).join(', ') + `</li>`
+        : `<li>nothing else on record mentions it</li>`) +
+      `</ul>`;
+    $('btn-mv-do').classList.remove('hidden');
+  };
+
+  $('btn-mv-do').onclick = async () => {
+    const lane = $('mv-lane').value;
+    const to = $('mv-to').value;
+    if (!lane || !to) return;
+    const b = $('btn-mv-do');
+    b.disabled = true;
+    const r = await post('/api/lane/move',
+      { lane, to, apply: true, from: (state.workspace || {}).current });
+    b.disabled = false;
+    b.classList.add('hidden');
+    if (!r.ok || !r.moved) {
+      $('mv-out').innerHTML =
+        `<div class="mv-no">${esc(r.error || 'nothing moved')}</div>`;
+      return;
+    }
+    $('mv-out').innerHTML =
+      `<div class="mv-did"><b>${esc(lane)}</b> is now in <b>${esc(r.to)}</b>. ` +
+      `Switch to that workspace to see it.</div>`;
+    applyWorkspace(r.workspace);
+    refresh();
+  };
 }
 
 async function openMission() {
   $('mission').classList.remove('hidden');
   $('mi-status').textContent = '';
   $('mi-ws-status').textContent = '';
+  moveReset();
   const r = await api('/api/workspaces');
   state.supervisor = r.supervisor;
   applyWorkspace(r.workspace);
@@ -3689,7 +5029,6 @@ function renderSolved(r) {
   box.innerHTML = `
     <div class="rp-reading">${esc(r.assessment || '')}</div>
     ${sec('Proposed, and now waiting with the rest',
-  renderMove(ws);
       (r.proposals || []).filter((p) => p.kind === 'goal'),
       (p) => `<li><b>${esc(p.lane)}</b> ${esc(p.text)}<br><span class="muted">${esc(p.why || '')}</span></li>`)}
     ${sec('Open questions it wants settled first',
@@ -3718,104 +5057,10 @@ async function solveReport(rid, btn) {
   btn.disabled = true;
   st.textContent = 'reading the report back and working out what it asks for';
   st.className = 'muted';
-// Moving a lane is the only control in this console that deletes state in order
-// to succeed: a lane leaves one config, some goal files leave one directory, and
-// git relocates a checked-out worktree. So it is two buttons, not one. The first
-// asks and changes nothing; the second only appears once there is an answer on
-// screen to have read, and it goes away again the moment the question changes.
-
-function renderMove(ws) {
-  const lanes = (state.lanes || []).map((l) => l.name);
-  const opt = (v, t) => `<option value="${esc(v)}">${esc(t)}</option>`;
-  const l = $('mv-lane');
-  const lh = lanes.length
-    ? lanes.map((n) => opt(n, n)).join('')
-    : opt('', 'no lanes in this workspace');
-  if (l._html !== lh) { l._html = lh; l.innerHTML = lh; }
-  const t = $('mv-to');
-  const others = (ws.list || []).filter((w) => w.slug !== ws.current);
-  const th = others.length
-    ? others.map((w) => opt(w.slug, w.name)).join('')
-    : opt('', 'there is nowhere else yet');
-  if (t._html !== th) { t._html = th; t.innerHTML = th; }
-  l.disabled = t.disabled = !lanes.length || !others.length;
-  $('btn-mv-check').disabled = l.disabled;
-}
-
-// Any change to what is being asked invalidates the answer on screen, so the
-// answer goes with it. Leaving a stale plan next to a live "Move it" is how you
-// move the lane you were looking at a minute ago.
-function moveReset() {
-  const out = $('mv-out');
-  if (out) out.innerHTML = '';
-  const go = $('btn-mv-do');
-  if (go) go.classList.add('hidden');
-}
-
-function wireMove() {
-  $('mv-lane').onchange = moveReset;
-  $('mv-to').onchange = moveReset;
-
-  $('btn-mv-check').onclick = async () => {
-    const lane = $('mv-lane').value;
-    const to = $('mv-to').value;
-    moveReset();
-    if (!lane || !to) return;
-    // The workspace this screen was showing when the choice was made, sent so
-    // the harness can refuse if something else moved it in between. Another
-    // console against this same state directory is a normal Wednesday here.
-    const r = await post('/api/lane/move',
-      { lane, to, from: (state.workspace || {}).current });
-    const out = $('mv-out');
-    if (!r.ok) {
-      out.innerHTML = `<div class="mv-no">${esc(r.error || 'refused')}</div>`;
-      return;
-    }
-    const left = Object.entries(r.left_behind || {});
-    out.innerHTML =
-      `<div class="mv-go"><b>${esc(lane)}</b> would move from ` +
-      `<b>${esc(r.from)}</b> to <b>${esc(r.to)}</b>.</div>` +
-      `<ul class="mv-list">` +
-      `<li>${r.goals} goal${r.goals === 1 ? '' : 's'} move${r.goals === 1 ? 's' : ''} with it</li>` +
-      `<li>${r.worktree
-        ? 'its worktree moves too, with anything uncommitted in it'
-        : 'no worktree — this lane has never been dispatched'}</li>` +
-      (left.length
-        ? `<li class="mv-stay">stays behind in ${esc(r.from)}: ` +
-          left.map(([k, n]) => `${n} ${esc(k)}`).join(', ') + `</li>`
-        : `<li>nothing else on record mentions it</li>`) +
-      `</ul>`;
-    $('btn-mv-do').classList.remove('hidden');
-  };
-
-  $('btn-mv-do').onclick = async () => {
-    const lane = $('mv-lane').value;
-    const to = $('mv-to').value;
-    if (!lane || !to) return;
-    const b = $('btn-mv-do');
-    b.disabled = true;
-    const r = await post('/api/lane/move',
-      { lane, to, apply: true, from: (state.workspace || {}).current });
-    b.disabled = false;
-    b.classList.add('hidden');
-    if (!r.ok || !r.moved) {
-      $('mv-out').innerHTML =
-        `<div class="mv-no">${esc(r.error || 'nothing moved')}</div>`;
-      return;
-    }
-    $('mv-out').innerHTML =
-      `<div class="mv-did"><b>${esc(lane)}</b> is now in <b>${esc(r.to)}</b>. ` +
-      `Switch to that workspace to see it.</div>`;
-    applyWorkspace(r.workspace);
-    refresh();
-  };
-}
-
   $('rp-solved').innerHTML = '';
   const r = await post('/api/report/solve', { report_id: rid });
   btn.disabled = false;
   if (!r.ok) {
-  moveReset();
     st.textContent = r.error || 'failed';
     st.className = 'err';
     return;
@@ -3884,6 +5129,21 @@ async function sendChat() {
   const el = $('dock-text');
   const text = el.value.trim();
   if (!text) return;
+  // Who is listening is decided by the mode, and only by the mode. In briefing
+  // you are talking to the briefer, which reaches no lane and starts no work -
+  // so this goes to a route that structurally cannot dispatch, rather than to
+  // the board's own with a flag on it.
+  if (state.dock === 'brief') {
+    el.value = '';
+    const b = await post('/api/brief', { text });
+    if (!b.ok) {
+      $('dock-sub').innerHTML = `<span class="err">${esc(b.error)}</span>`;
+      el.value = text;
+      return;
+    }
+    await loadChat();
+    return;
+  }
   const lane = $('dock-lane').value;
   el.value = '';
   const r = await post('/api/chat', { lane, text });
@@ -3920,7 +5180,12 @@ async function refresh() {
   state.models = s.consult_models;
   state.workers = s.workers || {};
   state.limits = s.limits || {};
-  $('polled').textContent = s.polled_at ? `polled ${s.polled_at}` : 'never polled';
+  // The stage ladder is the same for every lane, so it rides once on the
+  // payload rather than seven times per lane.
+  state.stages = s.stages || [];
+  // `stamp` carries the instant in the markup, so the 15s retimer keeps this
+  // honest without another poll - and the exact time is still on hover.
+  $('polled').innerHTML = s.polled_at ? `polled ${stamp(s.polled_at)}` : 'never polled';
 
   if (!$('d-budget').dataset.set) {
     $('d-budget').value = s.claude_budget_usd;
@@ -3964,6 +5229,12 @@ async function refresh() {
     state.supervisor = s.supervisor;
     renderWorkspacePick(s.workspace);
     renderAlign(s.supervisor, s.workspace);
+    // The lane list is one of the things a poll can change under this control -
+    // a move, an `lane add`, another session - and until this line was here it
+    // went on offering a lane that had already left. Picking it then failed with
+    // "there is no lane called plugins in core", which reads like the operator
+    // got it wrong when it was the screen that was out of date.
+    renderMove(s.workspace);
   }
 
   renderHealth();
@@ -3989,11 +5260,6 @@ async function refresh() {
   renderLanes();
   renderGoals();
   if (!state.sel && state.lanes.length) select(state.lanes[0].name);
-}
-
-async function loadCredits() {
-  const c = await api('/api/credits');
-  $('credit').textContent = c.ok ? `$${c.remaining} left` : '';
 }
 
 async function loadRulings() {
@@ -4108,6 +5374,14 @@ $('si-code').onkeydown = (e) => { if (e.key === 'Enter') submitCode(); };
 // Cancelling has to reach the server: the pty child is still sitting there
 // polling OpenAI, and hiding the sheet would only hide it from you.
 $('btn-settings').onclick = openSettings;
+$('btn-notify').onclick = () => toggleNotify();
+$('btn-notify-close').onclick = () => toggleNotify(false);
+// Escape closes it, because the panel covers the right of the board and the
+// close button is the far corner of a window this console is often only a
+// third of.
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') toggleNotify(false);
+});
 $('btn-set-close').onclick = () => $('settings').classList.add('hidden');
 $('set-openrouter').onchange = (e) => setFlag('openrouter_enabled', e.target.checked);
 $('set-auto-escalate').onchange = (e) => setFlag('auto_escalate', e.target.checked);
@@ -4118,17 +5392,12 @@ $('set-bar').oninput = (e) => { $('set-bar-out').textContent = e.target.value + 
 $('set-bar').onchange = (e) => setFlag('adopt_confidence', Number(e.target.value) / 100);
 $('set-need').oninput = (e) => { $('set-need-out').textContent = e.target.value + '%'; };
 $('set-need').onchange = (e) => setFlag('adopt_need', Number(e.target.value) / 100);
+$('set-spec-rounds').onchange = (e) => setFlag('spec_max_rounds', Number(e.target.value));
 $('set-db-mirror').onchange = (e) => dbSet('mirror', e.target.checked);
 $('set-db-keep').onchange = (e) => dbSet('history_keep', e.target.value);
 $('set-db-sweep').onchange = (e) => dbSet('sweep_min', e.target.value);
 $('btn-db-backup').onclick = dbBackup;
 $('btn-db-verify').onclick = dbVerify;
-    // The lane list is one of the things a poll can change under this control -
-    // a move, an `lane add`, another session - and until this line was here it
-    // went on offering a lane that had already left. Picking it then failed with
-    // "there is no lane called plugins in core", which reads like the operator
-    // got it wrong when it was the screen that was out of date.
-    renderMove(s.workspace);
 $('btn-db-prune').onclick = dbPrune;
 // A plain navigation, not a fetch: the server sends it as an attachment and the
 // browser saves it where the operator keeps things. Holding a 20 MB database in
@@ -4440,7 +5709,6 @@ $('btn-ask').onclick = async () => {
     `<span class="good">${esc(c.model)}</span> · ${c.cost_tokens} tok · ${esc(c.id)}`;
   await loadConsults(state.sel, c.id);
   loadChat();
-  loadCredits();
   loadRulings();
 };
 
@@ -4576,6 +5844,139 @@ $('btn-h-load').onclick = loadHistory;
 $('h-all').onchange = loadHistory;
 $('h-troubled').onchange = renderHistory;
 
+// ---------------------------------------------------------------- blockers
+//
+// The pipeline, drawn as the one thing it is.
+//
+// Eleven panes each show one rung of this and none of them shows the joins, so
+// the shape of the machine only exists in the head of whoever built it. This
+// draws all seven rungs, who drives each, what state it is actually in, what is
+// stopping it, and the feedback edges that make it a loop rather than a
+// conveyor - which is the half that is invisible everywhere else.
+//
+// Two kinds of answer are useful here and they are deliberately not merged:
+// `blocked` is work the harness would do if something were cleared, and `gap`
+// is a rung nothing automates at all. A gap is not a fault - it is the next
+// thing worth building, and calling it a fault would send you looking for a
+// switch that was never wired.
+
+const FLOW_TONE = {
+  off: 'off', gap: 'gap', blocked: 'bad', running: 'run', ready: 'ready', clear: 'ok',
+};
+
+async function loadBlockers() {
+  const out = $('b-out');
+  if (!state.sel) {
+    state.flow = null;
+    out.innerHTML = '<div class="empty">Pick a lane. The flow is one lane\'s flow.</div>';
+    return;
+  }
+  out.innerHTML = '<div class="empty">Reading&hellip;</div>';
+  const r = await api('/api/flow?lane=' + encodeURIComponent(state.sel));
+  if (!r || r.ok === false) {
+    state.flow = null;
+    out.innerHTML = `<div class="empty">${esc((r && r.error) || 'could not read the flow')}</div>`;
+    return;
+  }
+  state.flow = r.flow;
+  renderBlockers();
+}
+
+/** One rung's buttons. `post` does the thing and reloads; `tab` goes to where
+ *  the thing is done. Nothing here is decorative: a button that only opened a
+ *  pane says so by being drawn quieter than one that acts. */
+function flowActions(f) {
+  return (f.actions || []).map((a, i) =>
+    `<button class="fa${a.primary ? ' primary' : ''}${a.tab ? ' goes' : ''}" ` +
+    `data-stage="${esc(f.stage)}" data-i="${i}"` +
+    (a.why ? ` title="${esc(a.why)}"` : '') + `>${esc(a.label)}</button>`
+  ).join('');
+}
+
+function renderBlockers() {
+  const out = $('b-out');
+  const d = state.flow;
+  if (!d) return;
+  const only = $('b-only').checked;
+
+  const actors = (d.actors || []).map((a) =>
+    `<span class="ac ${a.on ? (a.ready ? 'on' : 'warn') : 'offr'}" title="${esc(a.why || '')}">` +
+    `${esc(a.role)} ${a.on ? (a.ready ? '\u25cf' : '\u25cb') : 'off'}</span>`
+  ).join('');
+
+  const head =
+    `<div class="flow-head">` +
+    `<div class="fh-l">carried as far as <b>${esc(d.stage)}</b> in <b>${esc(d.lane)}</b>, ` +
+    `which is set to <b>${esc(d.mode)}</b>` +
+    (d.rung ? ` &middot; evidence judged to <b>${esc(d.rung)}</b>` : ' &middot; no evidence rung yet') +
+    `</div><div class="fh-r">${actors}</div></div>` +
+    (d.gates && d.gates.length
+      ? `<div class="flow-gates"><b>${d.gates.length} gate(s) up across the fleet</b> &mdash; ` +
+        d.gates.map((g) => `<span title="${esc(g.why)}">${esc(g.gate)}</span>`).join(', ') +
+        `</div>`
+      : '');
+
+  const fb = (d.edges || []).filter((e) => e.kind === 'feedback');
+
+  const rows = (d.flow || []).map((f, idx) => {
+    const stuck = f.state === 'blocked' || f.state === 'gap' || f.state === 'off';
+    if (only && !stuck) return '';
+    const fwd = (d.edges || []).find((e) => e.kind !== 'feedback' && e.from === f.stage);
+    const blockers = (f.blockers || []).map((b) =>
+      `<div class="fb"><span class="who ${esc(b.whose)}">${esc(b.whose)}</span>` +
+      `<span class="what">${esc(b.what)}</span><span class="fwhy">${esc(b.why)}</span></div>`
+    ).join('');
+    return (
+      `<div class="frung ${FLOW_TONE[f.state] || ''}${f.is_ceiling ? ' ceiling' : ''}">` +
+      `<div class="fr-head">` +
+      `<span class="fst">${esc(f.label)}</span>` +
+      `<span class="who ${esc(f.who)}">${esc(f.who)}</span>` +
+      `<span class="fstate">${esc(f.state)}</span>` +
+      `<span class="fmeans">${esc(f.means)}</span>` +
+      (f.is_ceiling ? '<span class="fceil">stops here</span>' : '') +
+      `</div>` +
+      `<div class="fruns">${esc(f.runs)}</div>` +
+      `<div class="fat">${esc(f.at)}</div>` +
+      (blockers ? `<div class="fbs">${blockers}</div>` : '') +
+      `<div class="facts">${flowActions(f)}</div>` +
+      `</div>` +
+      (fwd && idx < (d.flow || []).length - 1
+        ? `<div class="fedge" title="${esc(fwd.what)}">\u2193 <span class="who ${esc(fwd.who)}">` +
+          `${esc(fwd.who)}</span> ${esc(fwd.what)}</div>`
+        : '')
+    );
+  }).join('');
+
+  const back = fb.length
+    ? `<div class="flow-back"><h4>and back round</h4>` +
+      fb.map((e) =>
+        `<div class="fbk"><span class="fbe">${esc(e.from)} \u21b0 ${esc(e.to)}</span>` +
+        `<span class="who ${esc(e.who)}">${esc(e.who)}</span>` +
+        `<span class="fwhy">${esc(e.what)}</span></div>`).join('') +
+      `</div>`
+    : '';
+
+  out.innerHTML = head + `<div class="flow">${rows || '<div class="empty">Nothing is stuck.</div>'}</div>` + back;
+
+  out.querySelectorAll('.fa').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const f = (state.flow.flow || []).find((x) => x.stage === btn.dataset.stage);
+      const a = f && f.actions[Number(btn.dataset.i)];
+      if (!a) return;
+      if (a.tab) return showTab(a.tab);
+      btn.disabled = true;
+      btn.textContent = 'working\u2026';
+      const r = await post(a.post, a.body);
+      if (r && r.ok === false) alert(r.error || 'that did not go through');
+      await refresh();
+      loadBlockers();
+    });
+  });
+}
+
+$('btn-flow').onclick = loadBlockers;
+$('b-only').onchange = renderBlockers;
+
 function showTab(name) {
   document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x.dataset.tab === name));
   document.querySelectorAll('.pane').forEach((x) => x.classList.remove('active'));
@@ -4587,6 +5988,10 @@ function showTab(name) {
   // Loaded on open, not on every poll: it reads a file and a store off disk, and
   // nothing in it changes between ticks except when a goal finishes.
   if (name === 'direction') loadDirection();
+  // On open, not on the poll. It reads only what is already on disk, so it is
+  // cheap - but the buttons on it act, and redrawing them under a hand that is
+  // reaching for one is its own kind of wrong.
+  if (name === 'blockers') loadBlockers();
   if (name === 'specs') loadSpec();
   if (name === 'history' && !state.history.length) loadHistory();
   if (name === 'preview' && state.sel) loadPreview();
@@ -4619,6 +6024,1618 @@ $('dock-toggle').onclick = () => {
   $('dock-toggle').textContent = collapsed ? '+' : '\u2212';
 };
 
+// `reload` is false for the one call that only dresses the switch to match what
+// was restored: boot repaints the feed a few lines further down anyway, and a
+// second load in briefing mode is a second walk of the board for one answer.
+function setDockMode(mode, reload = true) {
+  state.dock = mode;
+  localStorage.setItem('amp.dock', mode);
+  $('dock-mode').querySelectorAll('button').forEach((b) =>
+    b.classList.toggle('on', b.dataset.mode === mode));
+  // No caption here, on purpose. `#dock-sub` belongs to the BOARD - it is
+  // rewritten on every poll with what is waiting on you - so a mode label
+  // written into it is erased within seconds, and until it is, it is sitting on
+  // top of live state. The switch already shows which mode is on, and it is on
+  // screen whether the dock is open or shut.
+  //
+  // The composer changes hands with the mode, so it has to SAY so. A lane
+  // picker in briefing mode would be a control that quietly does nothing: the
+  // briefer reaches no lane, and offering the choice is a promise the mode
+  // cannot keep.
+  $('dock-lane').classList.toggle('hidden', mode === 'brief');
+  $('dock-text').placeholder = mode === 'brief'
+    ? 'ask about what\u2019s going on'
+    : 'ask, or say what you want done';
+  // Switching while the dock is shut asks for something you cannot see. Open
+  // it: the press said "show me", and the only reading that honours it is to
+  // show it.
+  if ($('dock').classList.contains('collapsed')) $('dock-toggle').click();
+  if (reload) loadChat();
+}
+
+$('dock-mode').querySelectorAll('button').forEach((b) =>
+  b.addEventListener('click', () => setDockMode(b.dataset.mode)));
+setDockMode(state.dock, false);
+
+// ------------------------------------------------------------ lane column width
+//
+// Kept in the browser, like the dock mode: which column is wider is what this
+// person wants to look at, not a fact about the workspace. Clamped rather than
+// free, because a column dragged to zero cannot be dragged back - the grip goes
+// with it.
+
+const LANE_W_MIN = 200;
+const LANE_W_MAX = 720;
+const LANE_W_DEFAULT = 340;
+
+// The width actually in force, so the drag never has to read it back out of a
+// computed style and re-parse its own output.
+let laneW = LANE_W_DEFAULT;
+
+function setLaneWidth(px, save) {
+  laneW = Math.round(Math.min(LANE_W_MAX, Math.max(LANE_W_MIN, px)));
+  document.documentElement.style.setProperty('--lane-w', `${laneW}px`);
+  if (save) localStorage.setItem('amp.lanew', String(laneW));
+}
+
+function wireLaneGrip() {
+  const saved = parseInt(localStorage.getItem('amp.lanew') || '', 10);
+  setLaneWidth(isFinite(saved) ? saved : LANE_W_DEFAULT, false);
+
+  const grip = $('lane-grip');
+  // Whether a drag is under way, held here rather than asked of the pointer.
+  // `hasPointerCapture` would be the tidier gate, but capture is a request the
+  // browser can decline - and a declined capture would leave a grip that looks
+  // draggable and silently is not.
+  let dragging = false;
+
+  grip.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    dragging = true;
+    // Capture is still asked for: the pointer spends the whole drag over the
+    // pane to the right, and with it the moves keep arriving here anyway.
+    try { grip.setPointerCapture(e.pointerId); } catch (_) { /* moves still land below */ }
+    document.body.classList.add('resizing');
+  });
+  // Listened for on the window, not the grip: if capture was declined the
+  // moves land on whatever is under the cursor, and the drag has to survive it.
+  window.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    setLaneWidth(e.clientX - document.querySelector('main').getBoundingClientRect().left, false);
+  });
+  const end = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    try { grip.releasePointerCapture(e.pointerId); } catch (_) { /* never held it */ }
+    document.body.classList.remove('resizing');
+    // Written once, at the end. Saving on every move would put a few hundred
+    // writes through localStorage for one drag.
+    setLaneWidth(laneW, true);
+  };
+  window.addEventListener('pointerup', end);
+  window.addEventListener('pointercancel', end);
+  grip.addEventListener('dblclick', () => setLaneWidth(LANE_W_DEFAULT, true));
+}
+
+// ============================================================== blueprint ===
+//
+// Three views over one question: does the thing that is about to run actually
+// know what it needs to know? The Map answers it structurally, the Triggers
+// answer it causally, and the Context answers it literally - by building the
+// real prompt and taking it apart.
+//
+// Nothing in here dispatches. The one control that writes anything at all
+// writes an UNSCORED proposal into the same queue every other proposer writes
+// into, which is why it can be a diagram and not a foot-gun.
+
+state.bp = {
+  view: 'flow', map: null, trigs: null, actions: null, ctx: null,
+  node: null, open: new Set(), sel: new Set(),
+  flow: { lens: 'agents', level: 'lane', cy: null, panels: {}, pick: null, land: null },
+};
+
+function openBlueprint() {
+  $('blueprint').classList.remove('hidden');
+  document.querySelector('main').classList.add('hidden');
+  bpShow(state.bp.view);
+}
+
+function closeBlueprint() {
+  $('blueprint').classList.add('hidden');
+  document.querySelector('main').classList.remove('hidden');
+}
+
+function bpShow(view) {
+  state.bp.view = view;
+  document.querySelectorAll('.bp-tab').forEach((t) =>
+    t.classList.toggle('active', t.dataset.bp === view));
+  document.querySelectorAll('.bp-pane').forEach((p) =>
+    p.classList.toggle('active', p.id === 'bp-pane-' + view));
+  if (view === 'flow') loadBpFlow();
+  if (view === 'map' && !state.bp.map) loadBpMap();
+  if (view === 'triggers' && !state.bp.trigs) loadBpTriggers();
+  if (view === 'context' && !state.bp.actions) loadBpActions();
+}
+
+// ------------------------------------------------------------------- flow
+//
+// One canvas, three lenses, and they are deliberately the same three things
+// the panes beside them list. This is a LENS, not a fourth source of truth:
+// the server builds the elements out of `map_view`, `triggers_view` and
+// `context_view`, the very functions the lists render, so a picture that
+// disagreed with a list would be a bug in one place rather than a difference
+// of opinion between two.
+//
+// Nothing here writes. Clicking an element says what it is; that is all.
+
+const BP_FLOW_STYLE = [
+  { selector: 'node', style: {
+    'background-color': '#1d2430', 'border-width': 1, 'border-color': '#33405a',
+    label: 'data(label)', color: '#c9d4e4', 'font-size': 11,
+    'text-valign': 'center', 'text-halign': 'center', 'text-wrap': 'wrap',
+    'text-max-width': '120px', shape: 'round-rectangle',
+    width: 'label', height: 24, padding: '8px',
+  } },
+  { selector: 'node.layer', style: {
+    'background-color': '#141922', 'background-opacity': 0.6,
+    'border-color': '#3b4d6e', 'border-width': 1, 'text-valign': 'top',
+    color: '#8fa4c2', 'font-size': 12, 'font-weight': 'bold', padding: '18px',
+    shape: 'round-rectangle',
+  } },
+  { selector: 'node.layer.loose', style: { 'border-style': 'dashed', color: '#a0761f' } },
+  // Amber, and only here: a lane no review has ever ruled on is the single most
+  // useful thing on this canvas, and it is invisible if it looks like the rest.
+  { selector: 'node.unjudged', style: { 'border-color': '#a0761f', 'border-style': 'dashed' } },
+  { selector: 'node.port', style: {
+    'background-color': '#22303f', 'border-color': '#4b7fb5', 'border-width': 2,
+    shape: 'round-diamond', color: '#9ec6ee', padding: '14px',
+  } },
+  { selector: 'node.call', style: {
+    'background-color': '#243024', 'border-color': '#4f7a4f', 'border-width': 2,
+    color: '#bfe0bf', padding: '12px',
+  } },
+  { selector: 'node.block.inline', style: { 'border-style': 'dotted' } },
+  { selector: 'node.block.empty', style: {
+    'border-color': '#a0761f', 'background-color': '#2a2317', color: '#e0b357',
+  } },
+  { selector: 'edge', style: {
+    width: 1.4, 'line-color': '#3a465c', 'target-arrow-color': '#3a465c',
+    'target-arrow-shape': 'triangle', 'curve-style': 'bezier',
+    label: 'data(label)', 'font-size': 9, color: '#7d8ba1',
+    'text-background-color': '#0f131a', 'text-background-opacity': 0.85,
+    'text-background-padding': '2px', 'arrow-scale': 0.8,
+  } },
+  { selector: 'edge.contains', style: { 'line-style': 'dashed', 'line-color': '#4a5a74' } },
+  { selector: 'edge.represents', style: { 'line-color': '#6a5a8a', 'target-arrow-color': '#6a5a8a' } },
+  // Armed and off must not be a shade apart. An armed trigger fires on the next
+  // tick; an off one does nothing, ever, and telling them apart at a glance is
+  // the entire reason to draw this.
+  { selector: 'edge.trig.armed', style: {
+    'line-color': '#4f9d5f', 'target-arrow-color': '#4f9d5f', width: 2.4,
+  } },
+  { selector: 'edge.trig.off', style: {
+    'line-color': '#4a5468', 'target-arrow-color': '#4a5468', 'line-style': 'dashed',
+  } },
+  { selector: 'edge.trig.broken', style: {
+    'line-color': '#b4574f', 'target-arrow-color': '#b4574f',
+  } },
+  { selector: 'edge.waiting', style: { 'line-style': 'dotted', width: 2.4 } },
+  { selector: 'edge.feeds.empty', style: {
+    'line-color': '#a0761f', 'target-arrow-color': '#a0761f', 'line-style': 'dashed',
+  } },
+
+  // --- the agents lens ---
+  // Two shapes and one rule: an actor is a rounded box with its model under its
+  // name, a rung is a squarer one with the actor holding it under its name. The
+  // second line is the whole point of the lens, so it is drawn IN the node
+  // rather than left to the panel.
+  { selector: 'node.actor', style: {
+    'background-color': '#1b2733', 'border-color': '#41607e', 'border-width': 2,
+    color: '#cfe2f2', shape: 'round-rectangle', height: 'label', padding: '12px',
+    label: 'data(label)', 'font-size': 12, 'font-weight': 'bold',
+  } },
+  { selector: 'node.actor[sub]', style: {
+    label: (n) => `${n.data('label')}\n${n.data('sub')}`, 'line-height': 1.35,
+  } },
+  { selector: 'node.actor.off', style: {
+    'border-color': '#4a5468', 'border-style': 'dashed', color: '#6f7b8c',
+    'background-color': '#151a21',
+  } },
+  // Switched on and unable to answer is not the same as switched off, and it is
+  // the failure that otherwise looks like nothing happening at all.
+  { selector: 'node.actor.broken', style: {
+    'border-color': '#b4574f', 'border-style': 'solid', color: '#e6a49e',
+  } },
+  { selector: 'node.subject', style: {
+    'background-color': '#241f2e', 'border-color': '#6a5a8a', 'border-width': 2,
+    color: '#d3c6ea', height: 'label', padding: '12px', 'font-weight': 'bold',
+    label: (n) => `${n.data('label')}\n${n.data('sub')}`, 'line-height': 1.35,
+  } },
+  { selector: 'node.stage', style: {
+    'background-color': '#141a22', 'border-color': '#33405a', shape: 'rectangle',
+    height: 'label', padding: '10px', 'font-size': 11,
+    label: (n) => `${n.data('label')}\n${n.data('sub')}`, 'line-height': 1.35,
+  } },
+  { selector: 'node.stage.running', style: { 'border-color': '#4f9d5f', 'border-width': 2 } },
+  { selector: 'node.stage.ready', style: { 'border-color': '#4f9d5f' } },
+  { selector: 'node.stage.blocked', style: { 'border-color': '#b4574f', 'border-width': 2 } },
+  { selector: 'node.stage.gap', style: { 'border-color': '#a0761f', 'border-style': 'dashed' } },
+  // Above the ceiling. Faded rather than hidden: the rungs still exist and the
+  // work still has to pass through them, it just will not start here.
+  { selector: 'node.stage.out', style: { opacity: 0.42, 'border-style': 'dashed' } },
+  { selector: 'node.stage.ceiling', style: {
+    'border-color': '#e0b357', 'border-width': 3, color: '#f0ddb0',
+  } },
+  { selector: 'edge.performs', style: {
+    'line-style': 'dashed', 'line-color': '#41607e', 'target-arrow-color': '#41607e',
+    width: 1.2, 'arrow-scale': 0.6, opacity: 0.75,
+  } },
+  { selector: 'edge.hand', style: {
+    'line-color': '#5b7091', 'target-arrow-color': '#5b7091', width: 2,
+  } },
+  // The half that makes it a loop. Curved away from the forward chain on
+  // purpose - drawn straight it lands underneath the arrow it is answering.
+  { selector: 'edge.hand.feedback', style: {
+    'line-color': '#6a5a8a', 'target-arrow-color': '#6a5a8a', 'line-style': 'dashed',
+    'curve-style': 'unbundled-bezier', 'control-point-distances': [-90],
+    'control-point-weights': [0.5], width: 1.6,
+  } },
+  { selector: 'edge.subject-edge', style: {
+    'line-color': '#6a5a8a', 'target-arrow-color': '#6a5a8a', width: 1.6,
+  } },
+  { selector: 'edge.watches', style: {
+    'line-style': 'dotted', 'line-color': '#6a5a8a', 'target-arrow-color': '#6a5a8a',
+    width: 1.2, 'arrow-scale': 0.6, opacity: 0.8,
+  } },
+  // Advice is drawn thinner and dashed than a hand-off on purpose. The two are
+  // the claim this screen is most able to overstate: a hand-off moves the work,
+  // and advice moves nothing at all until somebody acts on it.
+  { selector: 'edge.advises', style: {
+    'line-style': 'dashed', 'line-color': '#8a7ab0', 'target-arrow-color': '#8a7ab0',
+    width: 1.2, 'arrow-scale': 0.7, opacity: 0.85,
+  } },
+
+  // --- the levels above one lane ---
+  // A loop node is the same rounded box as an actor, because at these levels the
+  // thing that runs IS a call rather than somebody holding a rung.
+  { selector: 'node.loop', style: {
+    'background-color': '#141d26', 'border-color': '#41607e', 'border-width': 2,
+    color: '#cfe2f2', shape: 'round-rectangle', height: 'label', padding: '11px',
+    label: (n) => `${n.data('label')}\n${n.data('sub')}`, 'line-height': 1.35,
+    'font-size': 12,
+  } },
+  { selector: 'node.loop.measure', style: {
+    'background-color': '#1e2418', 'border-color': '#5f7d3f', color: '#cfe0bb',
+  } },
+  { selector: 'node.loop.lanes, node.loop.work', style: {
+    'background-color': '#241f2e', 'border-color': '#6a5a8a', color: '#d3c6ea',
+  } },
+  { selector: 'node.loop.advisory', style: {
+    'border-color': '#6a5a8a', 'border-style': 'dashed',
+  } },
+  // Drafts write nothing until they are accepted, and the border says so before
+  // the panel is opened.
+  { selector: 'node.loop.draft', style: {
+    'border-style': 'dashed', 'border-color': '#a0761f', color: '#e8d4a8',
+  } },
+  { selector: 'node.written', style: {
+    'background-color': '#14181f', 'border-color': '#3b4756', shape: 'rectangle',
+    height: 'label', padding: '9px', 'font-size': 11, color: '#aab6c5',
+    label: (n) => `${n.data('label')}\n${n.data('sub')}`, 'line-height': 1.3,
+  } },
+  { selector: 'node.ws', style: {
+    'background-color': '#171c23', 'border-color': '#3b4756', 'border-width': 2,
+    color: '#c3cddb', shape: 'round-rectangle', height: 'label', padding: '13px',
+    label: (n) => `${n.data('label')}\n${n.data('sub')}`, 'line-height': 1.35,
+    'font-weight': 'bold',
+  } },
+  { selector: 'node.ws.current', style: {
+    'border-color': '#e0b357', 'border-width': 3, color: '#f0ddb0',
+  } },
+  { selector: 'edge.port', style: {
+    'line-color': '#5b7091', 'target-arrow-color': '#5b7091', width: 2,
+  } },
+  // Waiting is not failing - the far end simply has not admitted it. Amber
+  // rather than red, and it is the count that is on the label.
+  { selector: 'edge.port.waiting', style: {
+    'line-color': '#a0761f', 'target-arrow-color': '#a0761f', 'line-style': 'dashed',
+  } },
+
+  { selector: '.picked', style: { 'border-color': '#e0e6ef', 'border-width': 3 } },
+  // An edge has no border, so the node rule above did nothing to it and a picked
+  // arrow looked identical to an unpicked one - which now matters, because
+  // arrows carry panels too.
+  { selector: 'edge.picked', style: {
+    'line-color': '#e0e6ef', 'target-arrow-color': '#e0e6ef', 'line-style': 'solid',
+    width: 3, opacity: 1,
+  } },
+];
+
+const BP_FLOW_LAYOUT = {
+  // Both hand-laid lenses use `preset`, for the same reason and a different one.
+  // Agents is a pipeline: it reads left to right or it does not read, and there
+  // is no layout that can be told that.
+  agents: { name: 'preset', padding: 30 },
+  // The map lens is laid out by hand - see `bpMapPositions`. Every core
+  // cytoscape layout treats a compound parent as one more node to push around,
+  // so the layers land on top of each other and the graph reads as a smear.
+  map: { name: 'preset', padding: 30 },
+  triggers: { name: 'breadthfirst', directed: true, animate: false, padding: 30,
+    spacingFactor: 1.3 },
+  context: { name: 'breadthfirst', directed: true, animate: false, padding: 20,
+    spacingFactor: 1.1 },
+};
+
+// The Agents lens is four pictures, not one, and they do not want the same
+// layout. Three are hand-laid for the same reason the pipeline is - each says
+// something about order or about sides - and `workspaces` is the one that is
+// genuinely a graph of peers, so a circle is the honest shape for it.
+const BP_LEVEL_LAYOUT = {
+  lane: { name: 'preset', padding: 30 },
+  workspace: { name: 'preset', padding: 30 },
+  workspaces: { name: 'circle', animate: false, padding: 40 },
+  harness: { name: 'preset', padding: 30 },
+};
+
+/** Put every lane inside its own layer, in reading order, without overlap.
+ *
+ * Written out rather than left to a layout because the layers are the point of
+ * this lens: a run of boxes laid side by side is a picture of how the work
+ * stacks, and a force layout that happens to overlap two of them is a picture
+ * of nothing. Positions are for the child nodes only - cytoscape sizes a
+ * compound parent around whatever is inside it.
+ */
+function bpMapPositions(elements) {
+  const COL = 200, ROW = 46, PAD = 60;
+  const kids = new Map();
+  const loose = [];
+  for (const e of elements) {
+    if (e.data.source) continue;
+    if (e.data.parent) {
+      if (!kids.has(e.data.parent)) kids.set(e.data.parent, []);
+      kids.get(e.data.parent).push(e.data.id);
+    } else if (!(e.classes || '').includes('layer')) {
+      loose.push(e.data.id);
+    }
+  }
+  const groups = [...kids.entries()];
+  if (loose.length) groups.push([null, loose]);
+
+  const pos = {};
+  let x = 0, y = 0, rowTall = 0;
+  for (const [, ids] of groups) {
+    const cols = Math.min(3, Math.max(1, Math.ceil(Math.sqrt(ids.length))));
+    const rows = Math.ceil(ids.length / cols);
+    // Wrap onto a new band once a row of layers is wider than a comfortable
+    // canvas. `fit` will scale it afterwards; this only decides the shape.
+    if (x && x + cols * COL > 1100) { x = 0; y += rowTall + PAD; rowTall = 0; }
+    ids.forEach((id, i) => {
+      pos[id] = { x: x + (i % cols) * COL, y: y + Math.floor(i / cols) * ROW };
+    });
+    x += cols * COL + PAD;
+    rowTall = Math.max(rowTall, rows * ROW);
+  }
+  return elements.map((e) => (pos[e.data.id] ? { ...e, position: pos[e.data.id] } : e));
+}
+
+/** The pipeline, left to right, with the actors above the rungs they hold.
+ *
+ * Positions rather than a layout because this lens is a claim about order:
+ * direction comes before code, and code comes before review, and a graph that
+ * puts them in a ring because that packed better has thrown away the only thing
+ * it was drawn to say. An actor sits over the AVERAGE of its own rungs, so who
+ * is holding what is readable without following a dashed line to its end.
+ */
+function bpAgentPositions(elements) {
+  const COL = 150, LANE_Y = 210, ACTOR_Y = 40;
+  const stages = [], actors = [];
+  let subject = null;
+  for (const e of elements) {
+    if (e.data.source) continue;
+    const c = e.classes || '';
+    if (c.includes('stage')) stages.push(e.data.id);
+    else if (c.includes('actor')) actors.push(e.data.id);
+    else if (c.includes('subject')) subject = e.data.id;
+  }
+  const pos = {};
+  if (subject) pos[subject] = { x: -COL, y: LANE_Y };
+  stages.forEach((id, i) => { pos[id] = { x: i * COL, y: LANE_Y }; });
+
+  // Where each actor's own lines end. Read off the edges rather than from a
+  // second copy of STAGE_WHO here - the edges are what the picture draws, so an
+  // actor floating away from its own lines would be this file disagreeing with
+  // itself.
+  //
+  // Two passes, because one actor watches the others. `performs` always ends on
+  // a rung, which is placed before any actor is; `watches` ends on another
+  // ACTOR, which has no position yet on the first pass. Averaging both together
+  // silently dropped every unplaced target, so the supervisor came out over the
+  // lane - the exact reading the three-edge fix was made to stop.
+  const avg = (xs) => xs.reduce((s, v) => s + v, 0) / xs.length;
+  const ends = (a, kind) => elements
+    .filter((e) => (e.classes || '').includes(kind) && e.data.source === a)
+    .map((e) => pos[e.data.target]).filter(Boolean).map((p) => p.x);
+
+  const held = actors.filter((a) => ends(a, 'performs').length);
+  held.forEach((a) => { pos[a] = { y: ACTOR_Y, x: avg(ends(a, 'performs')) }; });
+
+  // Whoever holds no rung is placed by what it watches, a row further up: it is
+  // above the pipeline in the picture because it is above it in the machine -
+  // it reads what the others did and recommends, and starts nothing.
+  // An actor attached to nothing at all is parked past the end rather than at
+  // zero, where it would sit on top of whoever holds the first rung.
+  let spare = stages.length;
+  actors.filter((a) => !pos[a]).forEach((a) => {
+    const xs = ends(a, 'watches');
+    pos[a] = xs.length ? { y: ACTOR_Y - 110, x: avg(xs) }
+      : { y: ACTOR_Y, x: (spare++) * COL };
+  });
+  return elements.map((e) => (pos[e.data.id] ? { ...e, position: pos[e.data.id] } : e));
+}
+
+/** The workspace level: the report loop as a ring, the advice down the side.
+ *
+ * A ring rather than a line because it IS one - the last arrow of the report
+ * loop is what the next report measures, and a layout that laid it out
+ * left-to-right would end with an arrow flying back over the top of everything,
+ * which reads as an exception rather than as the point.
+ *
+ * The three calls that only advise are put on their own side, away from the
+ * ring, because none of them is a step in it. Mixing them in would make the
+ * loop look like it has seven stations when it has four.
+ */
+const BP_WS_POS = {
+  'K:report': { x: 60, y: -160 }, 'K:solve': { x: 380, y: -160 },
+  'K:lanes': { x: 380, y: 70 }, 'K:work': { x: 60, y: 70 },
+  'K:supervise': { x: -300, y: -20 }, 'K:doctrine': { x: -300, y: 110 },
+  'K:settle': { x: -300, y: 240 },
+};
+
+function bpWorkspacePositions(elements) {
+  const pos = { ...BP_WS_POS };
+  for (const e of elements) {
+    // The subject carries the workspace's own slug in its id, so it is found by
+    // its class rather than named here.
+    if (!e.data.source && (e.classes || '').includes('subject')) {
+      pos[e.data.id] = { x: -300, y: -180 };
+    }
+  }
+  return elements.map((e) => (pos[e.data.id] ? { ...e, position: pos[e.data.id] } : e));
+}
+
+/** The harness level: each call beside the one thing it writes.
+ *
+ * The right column is placed off the EDGES rather than off its own order, so a
+ * call added to the list lands next to what it actually writes even if the two
+ * lists ever stop being parallel. Two lists that have to stay in step are a
+ * thing that eventually does not.
+ */
+function bpHarnessPositions(elements) {
+  const ROW = 96;
+  const pos = {};
+  const calls = elements.filter((e) => !e.data.source && (e.classes || '').includes('loop'));
+  calls.forEach((e, i) => { pos[e.data.id] = { x: 0, y: i * ROW }; });
+  for (const e of elements) {
+    // Only the outbound arrow - the feedback edge runs the other way, and using
+    // it would place a call at the row of what it reads instead.
+    if (!e.data.source || !e.data.id.startsWith('HE:')) continue;
+    const at = pos[e.data.source];
+    if (at) pos[e.data.target] = { x: 380, y: at.y };
+  }
+  let spare = calls.length;
+  for (const e of elements) {
+    if (!e.data.source && !pos[e.data.id]) pos[e.data.id] = { x: 380, y: (spare++) * ROW };
+  }
+  return elements.map((e) => (pos[e.data.id] ? { ...e, position: pos[e.data.id] } : e));
+}
+
+const BP_LEVEL_POS = {
+  lane: bpAgentPositions, workspace: bpWorkspacePositions,
+  harness: bpHarnessPositions,
+};
+
+async function loadBpFlow() {
+  const lens = state.bp.flow.lens;
+  // The Context lens needs a call picked before it can draw one, and the list
+  // of calls is the same one the Context pane loads. Fetched here rather than
+  // duplicated.
+  // Both Context and Agents are drawn ABOUT something and need it picked first.
+  // Agents wants only the lane - a rung is held by the same actor whichever call
+  // is being built - so the call picker is hidden rather than offered and
+  // ignored.
+  const needs = lens === 'context' || lens === 'agents';
+  if (needs) {
+    if (!state.bp.actions) await loadBpActions();
+    if (!state.bp.map) await loadBpMap();
+    bpFlowArgs();
+  }
+  $('bp-flow-args').classList.toggle('hidden', !needs);
+  $('bp-flow-act-l').classList.toggle('hidden', lens !== 'context');
+  $('bp-flow-lvl-l').classList.toggle('hidden', lens !== 'agents');
+  // Which of the four levels is asking is not knowable until the answer comes
+  // back, so the lane picker is left as it was and corrected in `renderBpFlow`.
+  // Hiding it here on a guess would flicker it on every redraw.
+
+  const q = new URLSearchParams({ lens });
+  if (needs) {
+    if (lens === 'context') q.set('action', $('bp-flow-act').value || '');
+    if (lens === 'agents') q.set('level', state.bp.flow.level || 'lane');
+    q.set('lane', $('bp-flow-lane').value || '');
+  }
+  $('bp-flow-note').innerHTML = '<span class="spin">drawing&hellip;</span>';
+  const r = await api('/api/blueprint/flow?' + q.toString());
+  $('bp-flow-note').textContent = '';
+  if (!r.ok) {
+    $('bp-flow-empty').textContent = r.error || 'it refused';
+    $('bp-flow-empty').classList.remove('hidden');
+    return;
+  }
+  renderBpFlow(r);
+}
+
+// Refill a picker only when its list actually changed, keeping the selection if
+// it survives. `if (!options.length)` filled these ONCE, which is wrong for the
+// lane picker: switching workspace nulls `state.bp.map` but leaves the old
+// workspace's lanes sitting in the DOM, and every lane-scoped call then refuses
+// with "pick a lane" about a lane the picker itself offered.
+function bpFill(id, want, fallback) {
+  const el = $(id);
+  const have = [...el.options].map((o) => o.value);
+  if (have.length === want.length && have.every((v, i) => v === want[i].value)) return;
+  const keep = want.some((w) => w.value === el.value) ? el.value : fallback;
+  el.innerHTML = want.map((w) =>
+    `<option value="${esc(w.value)}" title="${esc(w.title || '')}"` +
+    `${w.value === keep ? ' selected' : ''}>${esc(w.label)}</option>`).join('');
+  el.value = keep;
+}
+
+function bpFlowArgs() {
+  const acts = state.bp.actions || [];
+  const lanes = ((state.bp.map || {}).nodes || []).map((n) => n.lane);
+  bpFill('bp-flow-act', acts.map((a) => ({ value: a.id, label: a.title, title: a.what })),
+    (acts[0] || {}).id);
+  bpFill('bp-flow-lane', lanes.map((l) => ({ value: l, label: l })),
+    lanes.includes(state.sel) ? state.sel : lanes[0]);
+}
+
+function renderBpFlow(r) {
+  const box = $('bp-flow');
+  $('bp-flow-empty').classList.toggle('hidden', !r.empty);
+  $('bp-flow-empty').textContent = r.empty || '';
+  $('bp-flow-legend').innerHTML = (r.legend || []).map((l) =>
+    `<span class="bp-leg bp-leg-${esc(l.k)}">${esc(l.k)}<span class="muted"> &mdash; ${esc(l.t)}</span></span>`).join('')
+    + (r.note ? `<span class="bp-leg bp-leg-note muted">${esc(r.note)}</span>` : '');
+  $('bp-flow-tip').classList.add('hidden');
+  state.bp.flow.panels = r.panels || {};
+
+  // The levels come from the server so this file holds no second copy of what
+  // they are, and the picker is corrected from the answer rather than from what
+  // was asked - a level the server declined to draw must not be left showing as
+  // the one you are on.
+  if (r.levels) {
+    if (!$('bp-flow-lvl').options.length) {
+      $('bp-flow-lvl').innerHTML = r.levels.map((l) =>
+        `<option value="${esc(l.id)}" title="${esc(l.what)}">${esc(l.label)}</option>`).join('');
+    }
+    state.bp.flow.level = r.level;
+    $('bp-flow-lvl').value = r.level;
+    $('bp-flow-lvl').title = r.level_what || '';
+  }
+  // A lane picker on a level that is not about one lane is a control that looks
+  // broken, so the server says whether this picture takes one.
+  if (r.lens === 'agents') {
+    $('bp-flow-lane-l').classList.toggle('hidden', !r.needs_lane);
+  } else {
+    $('bp-flow-lane-l').classList.remove('hidden');
+  }
+
+  if (state.bp.flow.cy) { state.bp.flow.cy.destroy(); state.bp.flow.cy = null; }
+  if (!r.elements.length) {
+    // The reason goes where the picture would have been. Left in the strip
+    // under a blank canvas it reads as a diagram that failed to load, which is
+    // a different claim from "this call has nothing to be built about yet".
+    box.innerHTML = `<div class="bp-flow-none">${esc(r.empty || 'nothing to draw')}</div>`;
+    $('bp-flow-empty').classList.add('hidden');
+    return;
+  }
+  box.innerHTML = '';
+
+  const level = r.lens === 'agents' ? (r.level || 'lane') : null;
+  const laid = r.lens === 'map' ? bpMapPositions(r.elements)
+    : level && BP_LEVEL_POS[level] ? BP_LEVEL_POS[level](r.elements) : r.elements;
+  const cy = cytoscape({
+    container: box, style: BP_FLOW_STYLE, elements: laid,
+    layout: (level ? BP_LEVEL_LAYOUT[level] : BP_FLOW_LAYOUT[r.lens]) || { name: 'grid' },
+    wheelSensitivity: 0.25,
+  });
+  state.bp.flow.cy = cy;
+  // A layout fits what it laid out, so four lanes fill the canvas at 300% and a
+  // lane name reads like a headline. Zooming OUT to fit is always right; zooming
+  // in past life size only makes a small graph look like a big one.
+  cy.ready(() => {
+    if (cy.zoom() > 1) { cy.zoom(1); cy.center(); }
+  });
+
+  cy.on('tap', 'node, edge', (ev) => {
+    cy.elements().removeClass('picked');
+    ev.target.addClass('picked');
+    const d = ev.target.data();
+    const panel = state.bp.flow.panels[d.id];
+    if (r.lens === 'agents' && panel) bpAgentPanel(d.id, panel);
+    else bpFlowTip(d, r.lens);
+  });
+  // A tap on the background is how you put the panel away, which is the only
+  // gesture people try without being told.
+  cy.on('tap', (ev) => {
+    if (ev.target === cy) {
+      cy.elements().removeClass('picked');
+      state.bp.flow.pick = null;
+      $('bp-flow-tip').classList.add('hidden');
+    }
+  });
+  // A jump names the node it is jumping to, and this is where it arrives. Doing
+  // it here rather than in the click handler is what makes it survive the round
+  // trip: the graph the jump lands on has not been drawn yet at the moment the
+  // jump is made.
+  //
+  // A jump that names nothing is a jump to the level itself, which is a real
+  // thing to want - `open the pipeline` has no one rung it means.
+  const land = state.bp.flow.land;
+  state.bp.flow.land = null;
+  if (land) {
+    const at = cy.getElementById(land);
+    if (at.nonempty()) {
+      cy.elements().removeClass('picked');
+      at.addClass('picked');
+      cy.center(at);
+      if (state.bp.flow.panels[land]) bpAgentPanel(land, state.bp.flow.panels[land]);
+      return;
+    }
+    // Said out loud rather than silently ignored. A jump landing on nothing is
+    // a wiring mistake in the lens, and the only person who can ever see it is
+    // whoever pressed the button.
+    $('bp-flow-note').textContent = `nothing called ${land} on this level`;
+    state.bp.flow.pick = null;
+  }
+  // Re-open whatever was open before a write redrew the canvas. Without this
+  // every change closes the panel you changed it from, so a second change means
+  // finding the node again - and the whole point of putting the switches on the
+  // graph was that they are where the thing they govern is.
+  if (state.bp.flow.pick && state.bp.flow.panels[state.bp.flow.pick]) {
+    const back = cy.getElementById(state.bp.flow.pick);
+    if (back.nonempty()) back.addClass('picked');
+    bpAgentPanel(state.bp.flow.pick, state.bp.flow.panels[state.bp.flow.pick]);
+  }
+}
+
+/** One node's real controls, floated over the graph.
+ *
+ * Every row that writes posts to an endpoint that already existed - the role
+ * switches from Settings, the mode and the ceiling from Lanes, the two loops
+ * from Specs and Pull requests. This panel builds the body from `body` plus the
+ * one `field` the control owns, so there is no second copy of what any of those
+ * calls take, and nothing here can send a shape the server has not always
+ * accepted.
+ */
+function bpAgentPanel(id, p) {
+  const tip = $('bp-flow-tip');
+  state.bp.flow.pick = id;
+  const bits = [`<b>${esc(p.title)}</b>`, `<div>${esc(p.what)}</div>`];
+  (p.rows || []).forEach((row, i) => {
+    const key = `bpa-${i}`;
+    if (row.kind === 'fact') {
+      bits.push(`<div class="bp-row"><span class="muted">${esc(row.label)}</span> ` +
+        `${esc(row.value)}${row.why ? `<div class="muted">${esc(row.why)}</div>` : ''}</div>`);
+    } else if (row.kind === 'toggle') {
+      bits.push(`<div class="bp-row"><label><input type="checkbox" id="${key}"` +
+        `${row.value ? ' checked' : ''}> ${esc(row.label)}</label>` +
+        `<div class="muted">${esc(row.why || '')}</div></div>`);
+    } else if (row.kind === 'select') {
+      const opts = (row.options || []).map((o) =>
+        `<option value="${esc(o.value)}"${o.value === row.value ? ' selected' : ''}` +
+        `${o.cannot ? ' disabled' : ''} title="${esc(o.cannot || o.note || '')}">` +
+        `${esc(o.value)}${o.cannot ? ' \u2014 cannot' : ''}</option>`).join('');
+      const note = (row.options || []).find((o) => o.value === row.value);
+      bits.push(`<div class="bp-row"><label>${esc(row.label)} ` +
+        `<select id="${key}">${opts}</select></label>` +
+        `<div class="muted">${esc((note && note.note) || row.why || '')}</div></div>`);
+    } else if (row.kind === 'button') {
+      bits.push(`<div class="bp-row"><button id="${key}">${esc(row.label)}</button>` +
+        `<div class="muted">${esc(row.why || '')}</div></div>`);
+    } else if (row.kind === 'goto') {
+      // Drawn apart from the buttons that write, because they are not the same
+      // kind of thing at all: one changes the harness, the other only moves you
+      // to where you can read what a call is actually sent.
+      bits.push(`<div class="bp-row bp-goto"><button id="${key}" class="bp-gotob">` +
+        `${esc(row.label)}</button>` +
+        `<div class="muted">${esc(row.why || '')}</div></div>`);
+    }
+  });
+  tip.innerHTML = bits.join('');
+  tip.classList.remove('hidden');
+
+  (p.rows || []).forEach((row, i) => {
+    const el = $(`bpa-${i}`);
+    if (!el) return;
+    const send = async (value) => {
+      el.disabled = true;
+      $('bp-flow-note').innerHTML = '<span class="spin">saving&hellip;</span>';
+      const r = await post(row.post, { ...row.body, [row.field]: value });
+      el.disabled = false;
+      // A refusal is reported AND the redraw still happens - the server refusing
+      // is exactly the case where the panel must not be left showing the value
+      // it just failed to set. The message is put back afterwards because the
+      // redraw clears this line on its way past.
+      const err = (r && r.ok === false) ? (r.error || 'it refused') : '';
+      // Redrawn from the server rather than patched in place: a mode outranks a
+      // loop, a ceiling outranks both, and the only thing that knows what a
+      // change actually did is the thing that just did it.
+      await loadBpFlow();
+      $('bp-flow-note').textContent = err;
+    };
+    if (row.kind === 'toggle') el.onchange = () => send(el.checked);
+    else if (row.kind === 'select') el.onchange = () => send(el.value);
+    else if (row.kind === 'button') el.onclick = () => send(row.value);
+    else if (row.kind === 'goto') el.onclick = () => bpFlowGoto(row);
+  });
+}
+
+/** Follow a jump: to another level of this lens, or to the exact prompt.
+ *
+ * This is the whole reason the lenses share one canvas. `the architect reviews
+ * it` on one screen and `here is what the architect is sent` on another are the
+ * same fact twice, and the second was unreachable from the first until
+ * something carried the address across. The address is what is set here: a lens
+ * plus, depending, a level and a node, or an action and a lane.
+ */
+function bpFlowGoto(row) {
+  if (row.lens === 'agents') {
+    state.bp.flow.level = row.level;
+    // Empty means the level itself, and cytoscape would happily hand back an
+    // empty collection for `''` and report a landing that never happened.
+    state.bp.flow.land = row.node || null;
+    // Cleared on purpose: the panel that is open belongs to the level being
+    // left, and the arriving level either lands on something or on nothing.
+    state.bp.flow.pick = null;
+    loadBpFlow();
+    return;
+  }
+  // Into the Context lens, at the build this node makes. The lane comes from
+  // the jump when it carries one - a workspace-scoped call has no lane, and
+  // forcing the picker to one would be inventing an argument the call does not
+  // take.
+  state.bp.flow.lens = row.lens;
+  state.bp.flow.pick = state.bp.flow.land = null;
+  document.querySelectorAll('.bp-lensb').forEach((o) =>
+    o.classList.toggle('active', o.dataset.lens === row.lens));
+  if (row.action) $('bp-flow-act').value = row.action;
+  if (row.lane) $('bp-flow-lane').value = row.lane;
+  loadBpFlow();
+}
+
+function bpFlowTip(d, lens) {
+  const tip = $('bp-flow-tip');
+  const bits = [`<b>${esc(d.label || d.id)}</b>`];
+  if (d.tip) bits.push(`<div>${esc(d.tip)}</div>`);
+  if (d.rung) bits.push(`<div class="muted">judged rung: ${esc(d.rung)}</div>`);
+  if (d.mode) bits.push(`<div class="muted">${esc(d.mode)} &middot; ${esc(d.stage)} &middot; ` +
+    `${d.open} open, ${d.blocked} blocked, ${d.findings} unread</div>`);
+  if (d.reads) bits.push(`<div class="muted">reads: ${esc(d.reads)}</div>`);
+  if (d.chars !== undefined) bits.push(`<div class="muted">${d.chars.toLocaleString()} chars</div>`);
+  if (d.would !== undefined) {
+    bits.push(`<div class="muted">${d.would
+      ? `<b>would fire now</b> on ${d.would} occurrence(s)`
+      : 'nothing matches it right now'}</div>`);
+  }
+  // The lens picked it, so the lens says where to go to act on it. Nothing on
+  // this canvas edits anything.
+  bits.push('<div class="muted">' + esc(
+    lens === 'triggers' ? 'arm, edit or remove it on the Triggers pane'
+      : lens === 'context' ? 'the exact bytes are on the Context pane'
+      : 'lane details are on the Map pane') + '</div>');
+  tip.innerHTML = bits.join('');
+  tip.classList.remove('hidden');
+}
+
+// ------------------------------------------------------------------ map
+
+const RUNG_MEANS = {
+  spec: 'written down and argued for',
+  in_tree: 'it exists in the repository',
+  live_local: 'it runs here',
+  live_deployed: 'it runs where someone else can reach it',
+  external: 'someone outside has used it',
+};
+
+async function loadBpMap() {
+  const r = await api('/api/blueprint');
+  if (!r.ok) {
+    $('bp-map').innerHTML = `<div class="err">${esc(r.error)}</div>`;
+    return;
+  }
+  state.bp.map = r;
+  renderBpMap();
+}
+
+function renderBpMap() {
+  const m = state.bp.map;
+  // The button stays available once layers exist: the drafter is shown the
+  // layers already drawn and asked to argue with them, which is a different and
+  // more useful call than the one-shot seeding it replaced.
+  $('bp-seed').textContent = m.suggest ? 'Suggest layers' : 'Redraft layers';
+  // The unplaced column is always drawn, and always last. A lane nobody has
+  // filed is the single most useful thing on this screen - it is a lane whose
+  // place in the stack no one has had to say out loud yet.
+  const cols = m.stacks.concat([{ id: '', name: 'not filed', note:
+    'lanes nobody has put in a layer yet' }]);
+  // Rows top-down: the furthest evidence at the top, so the stack reads the way
+  // people describe it. The last row is for lanes no review has ruled on, which
+  // is a different fact from "it only has a spec".
+  const rows = m.rungs.slice().reverse().concat([null]);
+  const at = (rung, sid) => m.nodes.filter((n) =>
+    (n.rung || null) === rung && (n.stack || '') === sid);
+
+  let h = '<table class="bp-grid"><thead><tr><th class="bp-rung"></th>';
+  for (const c of cols) {
+    h += `<th title="${esc(c.note || '')}">${esc(c.name)}` +
+      (c.id ? `<button class="bp-x" data-stack-del="${esc(c.id)}" title="remove this layer">&times;</button>` : '') +
+      '</th>';
+  }
+  h += '</tr></thead><tbody>';
+  for (const rung of rows) {
+    const label = rung || 'not judged yet';
+    const why = rung ? RUNG_MEANS[rung] || ''
+      : 'no review has awarded this lane a rung';
+    h += `<tr><th class="bp-rung" title="${esc(why)}">${esc(label)}` +
+      `<span class="bp-why">${esc(why)}</span></th>`;
+    for (const c of cols) {
+      const here = at(rung, c.id);
+      h += '<td>' + (here.length ? here.map(bpChip).join('') : '<span class="bp-none">&middot;</span>') + '</td>';
+    }
+    h += '</tr>';
+  }
+  h += '</tbody></table>';
+
+  // The edges the harness already knows about, drawn as sentences rather than
+  // lines. A line between two boxes says they are related; this says how, and
+  // `represents` in particular carries a rule - a commit on the surface moves
+  // no rung on the system it presents - that an arrow could never carry.
+  if (m.edges.length) {
+    h += '<h4 class="bp-h">How they are already wired</h4><ul class="bp-edges">';
+    for (const e of m.edges) {
+      h += `<li><b>${esc(e.from)}</b> <span class="bp-kind">${esc(e.kind)}</span> ` +
+        `<b>${esc(e.to)}</b> <span class="muted">&mdash; ${esc(e.why)}</span></li>`;
+    }
+    h += '</ul>';
+  }
+  $('bp-map').innerHTML = h;
+
+  $('bp-map').querySelectorAll('[data-lane]').forEach((el) =>
+    el.onclick = () => showBpNode(el.dataset.lane));
+  $('bp-map').querySelectorAll('[data-stack-del]').forEach((el) =>
+    el.onclick = async (ev) => {
+      ev.stopPropagation();
+      await post('/api/blueprint/stack', { op: 'remove', id: el.dataset.stackDel });
+      state.bp.trigs = null;
+      loadBpMap();
+    });
+}
+
+// ---------------------------------------------------------------- draft layers
+//
+// The draft is held here, in the page, and nowhere else until it is accepted.
+// That is the whole point of the two steps: what comes back from the architect
+// is a proposal about how this portfolio is shaped, and it gets to be wrong in
+// front of the operator before it gets to be the thing triggers are wired to.
+
+async function bpDraftStacks() {
+  const box = $('bp-draft');
+  box.classList.remove('hidden');
+  box.innerHTML = '<div class="bp-draft-head"><span class="spin">reading every ' +
+    'lane\u2019s direction\u2026</span></div>';
+  const r = await post('/api/blueprint/stack', { op: 'draft' });
+  if (!r.ok) {
+    box.innerHTML = `<div class="err">${esc(r.error)}</div>` +
+      (r.raw ? `<pre class="bp-raw">${esc(r.raw)}</pre>` : '') +
+      '<div class="row"><button data-bpd="close">Close</button></div>';
+    bpDraftWire();
+    return;
+  }
+  state.bp.draft = r;
+  renderBpDraft();
+}
+
+function bpDraftClose() {
+  state.bp.draft = null;
+  $('bp-draft').classList.add('hidden');
+  $('bp-draft').innerHTML = '';
+}
+
+/** Read whatever the operator has typed back into the draft, before anything
+ *  re-renders. A structural edit that silently discarded a renamed layer would
+ *  be the most annoying possible bug on this screen. */
+function bpDraftSync() {
+  const d = state.bp.draft;
+  if (!d) return;
+  $('bp-draft').querySelectorAll('[data-bpd-name]').forEach((el) => {
+    const l = d.layers[+el.dataset.bpdName];
+    if (l) l.name = el.value;
+  });
+  $('bp-draft').querySelectorAll('[data-bpd-note]').forEach((el) => {
+    const l = d.layers[+el.dataset.bpdNote];
+    if (l) l.note = el.value;
+  });
+}
+
+/** Move one lane to a layer index, or to -1 for left out. */
+function bpDraftMove(lane, to) {
+  const d = state.bp.draft;
+  let row = null;
+  for (const l of d.layers) {
+    const i = l.lanes.findIndex((x) => x.lane === lane);
+    if (i >= 0) row = l.lanes.splice(i, 1)[0];
+  }
+  const j = d.unplaced.findIndex((x) => x.lane === lane);
+  if (j >= 0) row = d.unplaced.splice(j, 1)[0];
+  if (!row) return;
+  if (to >= 0 && d.layers[to]) d.layers[to].lanes.push({ lane, why: row.why || '' });
+  // A lane the operator moves out by hand is out because they said so, and
+  // saying that is more honest than leaving the drafter's reason attached to a
+  // decision the drafter did not make.
+  else d.unplaced.push({ lane, why: row.why || '', missed: false, moved: true });
+  renderBpDraft();
+}
+
+function renderBpDraft() {
+  const d = state.bp.draft;
+  const opts = (sel) => d.layers.map((l, i) =>
+    `<option value="${i}"${i === sel ? ' selected' : ''}>${esc(l.name || `layer ${i + 1}`)}</option>`)
+    .join('') + `<option value="-1"${sel < 0 ? ' selected' : ''}>\u2014 leave out</option>`;
+
+  let h = '<div class="bp-draft-head"><h4>Suggested layers</h4>';
+  h += d.source === 'architect'
+    ? `<span class="muted">drafted by ${esc(d.model || 'the architect')} off what each ` +
+      'lane says it is for. Nothing is saved until you accept.</span>'
+    : `<span class="warn">${esc(d.note || 'the architect is off')}</span>`;
+  h += '<button data-bpd="close" class="bp-x" title="discard">&times;</button></div>';
+
+  // Two things the drafter can get wrong about lanes that exist are shown as
+  // its errors, not silently repaired, because they say how much to trust the
+  // rest of what it said.
+  if ((d.invented || []).length) {
+    h += `<div class="err">it named ${d.invented.map((x) => `<code>${esc(x)}</code>`).join(', ')}` +
+      ', which are not lanes in this workspace. Those were dropped.</div>';
+  }
+  if ((d.duplicated || []).length) {
+    h += `<div class="err">it put ${d.duplicated.map((x) => `<code>${esc(x)}</code>`).join(', ')}` +
+      ' in more than one layer. Only the first was kept.</div>';
+  }
+
+  d.layers.forEach((l, i) => {
+    h += '<div class="bp-draft-layer"><div class="bp-draft-top">' +
+      `<input data-bpd-name="${i}" value="${esc(l.name)}" placeholder="layer name">` +
+      `<button data-bpd="del" data-i="${i}" class="bp-x" title="drop this layer">&times;</button></div>` +
+      `<input class="bp-draft-note" data-bpd-note="${i}" value="${esc(l.note || '')}" ` +
+      'placeholder="what belongs in this layer, and what does not">';
+    h += l.lanes.length ? '<ul class="bp-draft-lanes">' : '<p class="bp-none">no lane here yet</p>';
+    for (const row of l.lanes) {
+      h += `<li><b>${esc(row.lane)}</b> <span class="muted">${esc(row.why || '')}</span>` +
+        `<select data-bpd-move="${esc(row.lane)}">${opts(i)}</select></li>`;
+    }
+    if (l.lanes.length) h += '</ul>';
+    h += '</div>';
+  });
+
+  h += '<div class="bp-draft-layer out"><div class="bp-draft-top"><b>Left out</b>' +
+    '<span class="muted">these stay unfiled &mdash; the map draws them in its own column</span></div>';
+  h += d.unplaced.length ? '<ul class="bp-draft-lanes">' : '<p class="bp-none">nothing</p>';
+  for (const row of d.unplaced) {
+    const why = row.missed
+      ? 'the drafter did not mention this lane at all'
+      : (row.moved ? 'you moved it out' : row.why || '');
+    h += `<li><b>${esc(row.lane)}</b> <span class="${row.missed ? 'warn' : 'muted'}">${esc(why)}</span>` +
+      `<select data-bpd-move="${esc(row.lane)}">${opts(-1)}</select></li>`;
+  }
+  if (d.unplaced.length) h += '</ul>';
+  h += '</div>';
+
+  h += '<div class="row bp-draft-act"><button data-bpd="accept" class="primary">Accept these layers</button>' +
+    '<button data-bpd="again">Draft it again</button>' +
+    '<button data-bpd="add">+ empty layer</button>' +
+    '<button data-bpd="close">Discard</button>' +
+    '<span class="muted">accepting replaces the layers you have now, and any ' +
+    'trigger pointing at one of them is switched off and told why.</span></div>';
+  $('bp-draft').innerHTML = h;
+  bpDraftWire();
+}
+
+function bpDraftWire() {
+  const box = $('bp-draft');
+  box.querySelectorAll('[data-bpd-move]').forEach((el) =>
+    el.onchange = () => { bpDraftSync(); bpDraftMove(el.dataset.bpdMove, +el.value); });
+  box.querySelectorAll('[data-bpd]').forEach((el) => el.onclick = async () => {
+    const d = state.bp.draft;
+    switch (el.dataset.bpd) {
+      case 'close': return bpDraftClose();
+      case 'again': return bpDraftStacks();
+      case 'add':
+        bpDraftSync();
+        d.layers.push({ name: '', note: '', lanes: [] });
+        return renderBpDraft();
+      case 'del': {
+        bpDraftSync();
+        const [gone] = d.layers.splice(+el.dataset.i, 1);
+        for (const row of gone.lanes) d.unplaced.push({ ...row, missed: false, moved: true });
+        return renderBpDraft();
+      }
+      case 'accept': {
+        bpDraftSync();
+        const r = await post('/api/blueprint/stack',
+          { op: 'apply', layers: d.layers.filter((l) => (l.name || '').trim()) });
+        if (!r.ok) return alert(r.error);
+        bpDraftClose();
+        state.bp.trigs = null;
+        return loadBpMap();
+      }
+      default:
+    }
+  });
+}
+
+function bpChip(n) {
+  const flags = [];
+  if (n.mode !== 'build') flags.push(n.mode);
+  if (n.contradictions) flags.push(`${n.contradictions} contradiction${n.contradictions > 1 ? 's' : ''}`);
+  if (!n.specs) flags.push('no spec');
+  return `<span class="bp-lane${n.contradictions ? ' bad' : ''}" data-lane="${esc(n.lane)}"` +
+    ` title="${esc(n.for || '')}">${esc(n.lane)}` +
+    (flags.length ? `<span class="bp-flag">${esc(flags.join(' · '))}</span>` : '') +
+    '</span>';
+}
+
+function showBpNode(lane) {
+  const n = (state.bp.map.nodes || []).find((x) => x.lane === lane);
+  const box = $('bp-node');
+  if (!n) return box.classList.add('hidden');
+  state.bp.node = lane;
+  const field = (k, label) => n[k]
+    ? `<div class="bp-field"><b>${esc(label)}</b><p>${esc(n[k])}</p></div>` : '';
+  box.innerHTML =
+    `<div class="bp-node-head"><h3>${esc(n.lane)}</h3>` +
+    `<span class="muted">${esc(n.path)} &middot; ${esc(n.repo || 'no repo')} &middot; ${esc(n.mode)} &middot; ${esc(n.stage)}</span>` +
+    '<button id="bp-node-x" title="close">&times;</button></div>' +
+    '<div class="bp-place"><label>layer <select id="bp-place">' +
+    '<option value="">not filed</option>' +
+    (state.bp.map.stacks || []).map((s) =>
+      `<option value="${esc(s.id)}"${s.id === n.stack ? ' selected' : ''}>${esc(s.name)}</option>`).join('') +
+    '</select></label>' +
+    `<span class="muted">rung <b>${esc(n.rung || 'not judged yet')}</b> &mdash; read from the reviews, not set here</span></div>` +
+    field('for', 'What it is for') +
+    field('thesis', 'The bet') +
+    field('claim', 'What it claims to have shown') +
+    field('bar', 'What would settle it') +
+    field('unknown', 'What it does not know') +
+    (n.represents ? `<div class="bp-field"><b>Presents</b><p>${esc(n.represents)} &mdash; a commit here moves no rung on that.</p></div>` : '') +
+    `<div class="bp-counts">${n.goals.open} open goal(s) &middot; ${n.goals.blocked} blocked &middot; ` +
+    `${n.goals.done} done &middot; ${n.specs} design document(s) &middot; ` +
+    `${n.findings} unread finding(s)</div>` +
+    '<div class="row"><button id="bp-node-ctx">See what a worker in this lane is sent</button></div>';
+  box.classList.remove('hidden');
+  $('bp-node-x').onclick = () => box.classList.add('hidden');
+  $('bp-place').onchange = async () => {
+    const r = await post('/api/blueprint/place', { lane, stack: $('bp-place').value });
+    if (!r.ok) return alert(r.error);
+    await loadBpMap();
+    showBpNode(lane);
+  };
+  $('bp-node-ctx').onclick = async () => {
+    bpShow('context');
+    await loadBpActions();
+    $('bp-act').value = 'worker';
+    $('bp-lane').value = lane;
+    runBpContext();
+  };
+}
+
+// -------------------------------------------------------------- triggers
+
+async function loadBpTriggers() {
+  const r = await api('/api/blueprint/triggers');
+  if (!r.ok) {
+    $('bp-trigs').innerHTML = `<div class="err">${esc(r.error)}</div>`;
+    return;
+  }
+  state.bp.trigs = r;
+  renderBpTriggers();
+}
+
+/** What this workspace has taken in from the others, most recent first.
+ *
+ *  Drawn even when nothing is wired here, because it is the far end of a wire
+ *  somebody drew somewhere else - and a proposal arriving from another
+ *  workspace with nothing on this screen explaining it would be the one thing
+ *  on the Blueprint that could surprise you. */
+function bpInboxHtml(rows) {
+  if (!rows || !rows.length) return '';
+  return '<details class="bp-hist bp-inbox"><summary>Admitted from other ' +
+    `workspaces (${rows.length})</summary><ul>` +
+    rows.map((r) => `<li>${esc(r.at)} &middot; from <b>${esc(r.from_ws)}</b> ` +
+      `&middot; ${esc(r.lane || '?')} &middot; <b>${esc(r.state)}</b>` +
+      (r.proposal ? ` <code>${esc(r.proposal)}</code>` : '') +
+      (r.why ? ` <span class="muted">&mdash; ${esc(r.why)}</span>` : '') +
+      `<div class="muted">${esc((r.objective || '').slice(0, 160))}</div></li>`).join('') +
+    '</ul></details>';
+}
+
+function renderBpTriggers() {
+  const t = state.bp.trigs;
+  if (!t.triggers.length) {
+    $('bp-trigs').innerHTML = '<div class="empty">Nothing is wired up. A trigger ' +
+      'watches one side of the stack for a condition the harness can already ' +
+      'check on disk, and when it holds it proposes a goal in another lane.</div>' +
+      bpInboxHtml(t.inbox);
+    return;
+  }
+  $('bp-trigs').innerHTML = bpInboxHtml(t.inbox) + t.triggers.map((x) => {
+    const ev = t.events[x.when] || {};
+    const from = x.from_lanes.length
+      ? x.from_lanes.join(', ')
+      : '<span class="err">nothing &mdash; this watches no lane</span>';
+    return `<div class="bp-trig${x.on ? '' : ' off'}${x.broken ? ' broken' : ''}">` +
+      '<div class="bp-trig-head">' +
+      `<label class="bp-arm"><input type="checkbox" data-arm="${esc(x.id)}"${x.on ? ' checked' : ''}> armed</label>` +
+      `<span class="bp-when">when <b>${esc(from)}</b> ${esc(ev.label || x.when)}</span>` +
+      `<button class="bp-x" data-trig-del="${esc(x.id)}" title="remove">&times;</button></div>` +
+      (x.broken ? `<div class="err">${esc(x.broken)}</div>` : '') +
+      `<div class="bp-trig-body"><span class="muted">${esc(ev.what || '')}</span>` +
+      '<div class="bp-arrow">&darr; ' + (x.port
+        ? `request <b>${esc(x.to.id)}</b> in the workspace ` +
+          `<b>${esc(x.port.name)}</b> <span class="muted">&mdash; it is written here ` +
+          'and admitted over there, against that workspace&rsquo;s own bars' +
+          (x.port.waiting ? `; ${x.port.waiting} still waiting` : '') + '</span>'
+        : `propose in <b>${esc(x.to.id)}</b>`) + '</div>' +
+      `<pre class="bp-obj">${esc(x.objective)}</pre>` +
+      (x.why ? `<div class="muted">${esc(x.why)}</div>` : '') +
+      `<div class="bp-trig-foot">fired ${x.fires || 0} time(s)` +
+      (x.would && x.would.length
+        ? ` &middot; <b>would fire now on ${esc(x.would.map((w) => w.lane).join(', '))}</b>`
+        : ' &middot; nothing matches right now') +
+      '</div>' +
+      (x.history && x.history.length
+        ? '<details class="bp-hist"><summary>what it has done</summary><ul>' +
+          x.history.map((h) => `<li>${esc(h.at)} &middot; ${esc(h.lane)} &middot; ` +
+            (h.proposal ? `proposed <code>${esc(h.proposal)}</code>`
+              : h.request ? `requested <code>${esc(h.request)}</code> in ${esc(h.ws)}`
+              : esc(h.note)) + '</li>').join('') +
+          '</ul></details>'
+        : '') +
+      '</div></div>';
+  }).join('');
+
+  $('bp-trigs').querySelectorAll('[data-arm]').forEach((el) =>
+    el.onchange = async () => {
+      await post('/api/blueprint/trigger',
+        { op: 'set', id: el.dataset.arm, patch: { on: el.checked } });
+      loadBpTriggers();
+    });
+  $('bp-trigs').querySelectorAll('[data-trig-del]').forEach((el) =>
+    el.onclick = async () => {
+      await post('/api/blueprint/trigger', { op: 'remove', id: el.dataset.trigDel });
+      loadBpTriggers();
+    });
+}
+
+function bpTriggerForm() {
+  const m = state.bp.map || { stacks: [], nodes: [], rungs: [] };
+  const t = state.bp.trigs || { events: {} };
+  const lanes = m.nodes.map((n) => n.lane);
+  const box = $('bp-trig-form');
+  box.innerHTML =
+    '<div class="row"><label>when <select id="bt-when">' +
+    Object.entries(t.events).map(([k, v]) =>
+      `<option value="${esc(k)}">${esc(v.label)}</option>`).join('') +
+    '</select></label>' +
+    '<label>on <select id="bt-kind">' +
+    '<option value="lane">one lane</option>' +
+    '<option value="stack">a whole layer</option>' +
+    '<option value="rung">every lane at a rung</option></select></label>' +
+    '<span id="bt-who"></span>' +
+    '<span id="bt-arg"></span></div>' +
+    '<div class="row"><label>propose in <select id="bt-ws">' +
+    (t.workspaces || []).map((w) =>
+      `<option value="${esc(w.slug)}"${w.slug === t.current_ws ? ' selected' : ''}>` +
+      `${esc(w.name)}${w.slug === t.current_ws ? ' (here)' : ''}</option>`).join('') +
+    '</select> <select id="bt-to"></select></label>' +
+    '<span class="muted">one lane, because the proposal is held to that lane\'s mode, stage and bars</span></div>' +
+    '<div id="bt-port" class="muted hidden">Another workspace: this writes a ' +
+    'REQUEST here and stops. That workspace admits it the next time it is ' +
+    'opened, against its own bars.</div>' +
+    '<label>objective <textarea id="bt-obj" rows="3" placeholder="what should be proposed, written as the goal itself"></textarea></label>' +
+    '<label>why <input id="bt-why" placeholder="optional — the reason, carried onto every proposal it writes"></label>' +
+    '<div class="row"><button id="bt-save" class="primary">Add it</button>' +
+    '<button id="bt-cancel">Cancel</button><span id="bt-msg" class="msg"></span></div>';
+
+  const who = () => {
+    const k = $('bt-kind').value;
+    const opts = k === 'lane' ? lanes
+      : k === 'stack' ? m.stacks.map((s) => s.id)
+      : m.rungs;
+    const label = k === 'stack' ? m.stacks.map((s) => s.name) : opts;
+    $('bt-who').innerHTML = '<select id="bt-who-v">' +
+      opts.map((o, i) => `<option value="${esc(o)}">${esc(label[i])}</option>`).join('') + '</select>';
+  };
+  const arg = () => {
+    const ev = t.events[$('bt-when').value] || {};
+    $('bt-arg').innerHTML = ev.arg === 'rung'
+      ? 'reaching <select id="bt-arg-v">' +
+        m.rungs.map((r) => `<option value="${esc(r)}">${esc(r)}</option>`).join('') + '</select>'
+      : '';
+  };
+  // The lanes on offer are the TARGET workspace's own, not this one's. A port
+  // aimed at a lane that does not exist over there is refused by `add_trigger`
+  // anyway; not offering it is the cheaper half of the same check.
+  const to = () => {
+    const slug = $('bt-ws').value;
+    const w = (t.workspaces || []).find((x) => x.slug === slug) || { lanes: [] };
+    $('bt-to').innerHTML = (w.lanes || []).map((l) =>
+      `<option value="${esc(l)}">${esc(l)}</option>`).join('');
+    $('bt-port').classList.toggle('hidden', slug === t.current_ws);
+  };
+  $('bt-kind').onchange = who;
+  $('bt-when').onchange = arg;
+  $('bt-ws').onchange = to;
+  who(); arg(); to();
+
+  $('bt-cancel').onclick = () => box.classList.add('hidden');
+  $('bt-save').onclick = async () => {
+    const body = {
+      op: 'add', when: $('bt-when').value,
+      from: { kind: $('bt-kind').value, id: $('bt-who-v').value },
+      to: {
+        kind: 'lane', id: $('bt-to').value,
+        ws: $('bt-ws').value === t.current_ws ? '' : $('bt-ws').value,
+      },
+      objective: $('bt-obj').value.trim(), why: $('bt-why').value.trim(),
+    };
+    if ($('bt-arg-v')) body.arg = $('bt-arg-v').value;
+    const r = await post('/api/blueprint/trigger', body);
+    if (!r.ok) {
+      $('bt-msg').innerHTML = `<span class="err">${esc(r.error)}</span>`;
+      return;
+    }
+    box.classList.add('hidden');
+    loadBpTriggers();
+  };
+  box.classList.remove('hidden');
+}
+
+// --------------------------------------------------------------- draft triggers
+//
+// Same two steps as the layers, held to the same rule: the draft lives in this
+// page and nowhere else until it is accepted, and accepting it writes triggers
+// that are OFF. Nothing drafted here can fire without a separate press made
+// after reading what it would propose.
+
+async function bpDraftTriggers() {
+  const box = $('bp-trig-draft-box');
+  box.classList.remove('hidden');
+  box.innerHTML = '<div class="bp-draft-head"><span class="spin">reading the lanes, ' +
+    'the layers and what is already wired\u2026</span></div>';
+  const r = await post('/api/blueprint/trigger', { op: 'draft' });
+  if (!r.ok) {
+    box.innerHTML = `<div class="err">${esc(r.error)}</div>` +
+      (r.raw ? `<pre class="bp-raw">${esc(r.raw)}</pre>` : '') +
+      '<div class="row"><button data-btd="close">Close</button></div>';
+    bpTrigDraftWire();
+    return;
+  }
+  state.bp.tdraft = r;
+  renderBpTrigDraft();
+}
+
+function bpTrigDraftClose() {
+  state.bp.tdraft = null;
+  $('bp-trig-draft-box').classList.add('hidden');
+  $('bp-trig-draft-box').innerHTML = '';
+}
+
+/** Read the edited objectives back before anything re-renders. */
+function bpTrigDraftSync() {
+  const d = state.bp.tdraft;
+  if (!d) return;
+  $('bp-trig-draft-box').querySelectorAll('[data-btd-obj]').forEach((el) => {
+    const t = d.triggers[+el.dataset.btdObj];
+    if (t) t.objective = el.value;
+  });
+}
+
+function renderBpTrigDraft() {
+  const d = state.bp.tdraft;
+  const box = $('bp-trig-draft-box');
+  let h = '<div class="bp-draft-head">drafted by <b>' + esc(d.model || d.source) +
+    '</b> &mdash; nothing is written yet, and everything accepted arrives ' +
+    '<b>disarmed</b></div>';
+  if (d.note) h += `<div class="muted">${esc(d.note)}</div>`;
+
+  h += d.triggers.map((t, i) => {
+    const port = t.to.ws
+      ? ` <span class="bp-port">in workspace ${esc(t.to.ws)}</span>` : '';
+    return '<div class="bp-draft-layer"><div class="bp-draft-top">' +
+      `<label class="bp-arm"><input type="checkbox" data-btd-take="${i}" checked> take it</label>` +
+      `<span class="bp-when">when <b>${esc(t.from.name || t.from.id)}</b> ` +
+      `${esc(t.event)}${t.arg ? ' ' + esc(t.arg) : ''} &rarr; propose in ` +
+      `<b>${esc(t.to.id)}</b>${port}</span></div>` +
+      `<textarea class="bp-draft-note" rows="2" data-btd-obj="${i}">${esc(t.objective)}</textarea>` +
+      (t.why ? `<div class="muted">${esc(t.why)}</div>` : '') +
+      `<div class="muted">watches: ${esc((t.from_lanes || []).join(', ') || 'nothing')}</div>` +
+      '</div>';
+  }).join('');
+
+  // Rejected rows are SHOWN, not dropped. Four of six coming back silently
+  // looks exactly like a drafter that only found four, and the two it got
+  // wrong are the ones worth reading.
+  if ((d.rejected || []).length) {
+    h += '<div class="bp-draft-layer out"><b>Could not be wired</b>' +
+      d.rejected.map((t) =>
+        `<div class="muted">&ldquo;${esc((t.objective || '').slice(0, 90))}&rdquo; ` +
+        `&mdash; <span class="err">${esc(t.rejected)}</span></div>`).join('') +
+      '</div>';
+  }
+  if (!d.triggers.length) {
+    h += '<div class="empty">Nothing here can be wired as written.</div>';
+  }
+  h += '<div class="bp-draft-act row">' +
+    (d.triggers.length
+      ? '<button data-btd="accept" class="primary">Add them, disarmed</button>' : '') +
+    '<button data-btd="again">Draft again</button>' +
+    '<button data-btd="close">Close</button><span id="btd-msg" class="msg"></span></div>';
+  box.innerHTML = h;
+  bpTrigDraftWire();
+}
+
+function bpTrigDraftWire() {
+  const box = $('bp-trig-draft-box');
+  box.querySelectorAll('[data-btd]').forEach((el) => {
+    el.onclick = async () => {
+      const act = el.dataset.btd;
+      if (act === 'close') return bpTrigDraftClose();
+      if (act === 'again') return bpDraftTriggers();
+      if (act !== 'accept') return;
+      bpTrigDraftSync();
+      const take = [...box.querySelectorAll('[data-btd-take]')]
+        .filter((c) => c.checked).map((c) => +c.dataset.btdTake);
+      const rows = take.map((i) => {
+        const t = state.bp.tdraft.triggers[i];
+        return { when: t.when, arg: t.arg || '', from: t.from,
+          to: t.to, objective: (t.objective || '').trim(), why: t.why };
+      }).filter((t) => t.objective);
+      if (!rows.length) {
+        $('btd-msg').innerHTML = '<span class="err">nothing is ticked</span>';
+        return;
+      }
+      const r = await post('/api/blueprint/trigger', { op: 'apply', triggers: rows });
+      if (!r.ok) {
+        $('btd-msg').innerHTML = `<span class="err">${esc(r.error)}</span>`;
+        return;
+      }
+      bpTrigDraftClose();
+      $('bp-note').innerHTML = `<span class="good">added ${r.added}, all disarmed` +
+        (r.failed && r.failed.length ? ` &middot; ${r.failed.length} refused` : '') +
+        '</span>';
+      loadBpTriggers();
+    };
+  });
+}
+
+// --------------------------------------------------------------- context
+
+async function loadBpActions() {
+  if (!state.bp.map) await loadBpMap();
+  const r = await api('/api/blueprint/actions');
+  if (!r.ok) return;
+  state.bp.actions = r.actions;
+  $('bp-act').innerHTML = r.actions.map((a) =>
+    `<option value="${esc(a.id)}" title="${esc(a.what)}">${esc(a.title)}</option>`).join('');
+  const lanes = (state.bp.map.nodes || []).map((n) => n.lane);
+  $('bp-lane').innerHTML = lanes.map((l) =>
+    `<option value="${esc(l)}"${l === state.sel ? ' selected' : ''}>${esc(l)}</option>`).join('');
+  bpActNote();
+}
+
+function bpActNote() {
+  const a = (state.bp.actions || []).find((x) => x.id === $('bp-act').value);
+  $('bp-ctx-sub').textContent = a ? a.what : '';
+}
+
+async function runBpContext() {
+  const action = $('bp-act').value;
+  const lane = $('bp-lane').value;
+  $('bp-ctx').innerHTML = '<div class="spin">building it&hellip;</div>';
+  state.bp.sel = new Set();
+  const r = await api(`/api/blueprint/context?action=${encodeURIComponent(action)}` +
+    `&lane=${encodeURIComponent(lane)}`);
+  state.bp.ctx = r;
+  renderBpContext();
+}
+
+function renderBpContext() {
+  const c = state.bp.ctx;
+  if (!c.ok) {
+    // Not an error page. "There is no open proposal in this lane to sharpen" is
+    // an answer about the workspace, and the operator asked a fair question.
+    $('bp-ctx').innerHTML =
+      `<div class="bp-nosubject">${esc(c.error || 'the server did not answer')}</div>`;
+    return;
+  }
+  let h = `<div class="bp-ctx-head"><h3>${esc(c.title)}</h3>` +
+    `<span class="muted">${esc(c.what)}</span>` +
+    `<div class="bp-ctx-sum">about <b>${esc(c.subject)}</b> &middot; ` +
+    `${c.chars.toLocaleString()} chars &middot; ~${c.tokens_est.toLocaleString()} tokens &middot; ` +
+    `${c.blocks.length} block(s)</div></div>`;
+
+  if (c.empty.length) {
+    // The most valuable thing on the page. A block that was built and came back
+    // with nothing is a hole in what the agent knows, and it is invisible in
+    // the prompt itself precisely because there is nothing there to see.
+    h += '<div class="bp-empty-blocks"><b>Built, but had nothing to say &mdash; ' +
+      'so it is not in this prompt at all:</b><ul>' +
+      c.empty.map((e) => `<li><code>${esc(e.fn)}</code> &mdash; ${esc(e.why)}` +
+        (e.reads.length ? `<span class="muted"> (reads ${esc(e.reads.join('; '))})</span>` : '') +
+        '</li>').join('') + '</ul></div>';
+  }
+
+  h += '<div class="bp-blocks">' + c.blocks.map((b, i) => {
+    const share = Math.round((b.chars / Math.max(c.chars, 1)) * 100);
+    return `<div class="bp-block" data-i="${i}">` +
+      '<div class="bp-block-head">' +
+      `<label class="bp-pick"><input type="checkbox" data-pick="${i}"></label>` +
+      `<span class="bp-block-name">${esc(b.heading)}</span>` +
+      (b.headings > 1 ? `<span class="bp-sub">${b.headings} documents</span>` : '') +
+      `<span class="bp-size" style="--w:${share}%">${b.chars.toLocaleString()} chars ` +
+      `&middot; ~${b.tokens_est.toLocaleString()} tok &middot; ${share}%</span></div>` +
+      `<div class="bp-block-from"><code>${esc(b.from)}</code>` +
+      (b.shared ? '<span class="bp-shared">shared with other calls</span>' : '') +
+      `<span class="muted"> &mdash; ${esc(b.why)}</span></div>` +
+      (b.reads.length
+        ? '<div class="bp-reads">reads: ' + b.reads.map((x) => `<code>${esc(x)}</code>`).join(' ') + '</div>'
+        : '') +
+      `<details class="bp-body"><summary>exact bytes</summary><pre>${esc(b.text)}</pre></details>` +
+      '</div>';
+  }).join('') + '</div>';
+
+  h += '<div class="bp-drill hidden" id="bp-drill"></div>';
+  $('bp-ctx').innerHTML = h;
+  $('bp-ctx').querySelectorAll('[data-pick]').forEach((el) =>
+    el.onchange = () => {
+      const i = Number(el.dataset.pick);
+      if (el.checked) state.bp.sel.add(i); else state.bp.sel.delete(i);
+      renderBpDrill();
+    });
+}
+
+function renderBpDrill() {
+  const box = $('bp-drill');
+  const n = state.bp.sel.size;
+  if (!n) return box.classList.add('hidden');
+  const c = state.bp.ctx;
+  const picked = [...state.bp.sel].sort((a, b) => a - b).map((i) => c.blocks[i]);
+  box.innerHTML =
+    `<b>${n} block(s) picked</b> <span class="muted">${esc(picked.map((b) => b.heading).join(' · '))}</span>` +
+    '<textarea id="bp-drill-q" rows="2" placeholder="what do you want to ask about these?"></textarea>' +
+    '<div class="row"><button id="bp-drill-dock">Ask the orchestrator</button>' +
+    '<button id="bp-drill-arch">Escalate to the architect</button>' +
+    '<span class="muted">the orchestrator is fast and cheap; the architect is GPT-5.6 and its answer is recorded as a ruling on this lane</span>' +
+    '<span id="bp-drill-msg" class="msg"></span></div>';
+  box.classList.remove('hidden');
+
+  // The excerpt is capped per block rather than in total, so picking two blocks
+  // cannot silently drop the second one - which would be a question asked about
+  // something the answerer never saw.
+  const packet = () => {
+    const q = $('bp-drill-q').value.trim();
+    return `I am looking at the context the "${c.title}" call is sent about ` +
+      `${c.subject} in lane ${c.lane}. These parts of it:\n\n` +
+      picked.map((b) => `## ${b.heading}  (from ${b.from}, ${b.chars} chars)\n` +
+        b.text.slice(0, 4000) + (b.text.length > 4000 ? '\n…[trimmed]' : '')).join('\n\n') +
+      `\n\n---\n\n${q}`;
+  };
+  const need = () => {
+    const q = $('bp-drill-q').value.trim();
+    if (!q) $('bp-drill-msg').innerHTML = '<span class="err">ask something first</span>';
+    return q;
+  };
+  $('bp-drill-dock').onclick = async () => {
+    if (!need()) return;
+    const r = await post('/api/chat', { lane: '', text: packet() });
+    $('bp-drill-msg').innerHTML = r.ok
+      ? '<span class="good">sent — the answer lands in the dock</span>'
+      : `<span class="err">${esc(r.error)}</span>`;
+    if (r.ok) loadChat();
+  };
+  $('bp-drill-arch').onclick = async () => {
+    if (!need()) return;
+    $('bp-drill-msg').innerHTML = '<span class="spin">consulting GPT-5.6…</span>';
+    const r = await post('/api/ask', { lane: c.lane, question: packet() });
+    $('bp-drill-msg').innerHTML = r.ok
+      ? `<span class="good">${esc(r.consult.id)} — open it in Escalate</span>`
+      : `<span class="err">${esc(r.error)}</span>`;
+    if (r.ok) { loadRulings(); loadChat(); }
+  };
+}
+
+function wireBlueprint() {
+  $('btn-blueprint').onclick = openBlueprint;
+  $('bp-close').onclick = closeBlueprint;
+  document.querySelectorAll('.bp-tab').forEach((t) =>
+    t.onclick = () => bpShow(t.dataset.bp));
+  $('bp-reload').onclick = () => {
+    state.bp.map = state.bp.trigs = state.bp.actions = null;
+    if (state.bp.view === 'flow') loadBpFlow();
+    if (state.bp.view === 'map') loadBpMap();
+    if (state.bp.view === 'triggers') { loadBpMap(); loadBpTriggers(); }
+    if (state.bp.view === 'context') loadBpActions();
+  };
+  document.querySelectorAll('.bp-lensb').forEach((b) =>
+    b.onclick = () => {
+      state.bp.flow.lens = b.dataset.lens;
+      document.querySelectorAll('.bp-lensb').forEach((o) =>
+        o.classList.toggle('active', o === b));
+      loadBpFlow();
+    });
+  $('bp-flow-fit').onclick = () => {
+    if (state.bp.flow.cy) state.bp.flow.cy.fit(undefined, 30);
+  };
+  $('bp-flow-act').onchange = loadBpFlow;
+  $('bp-flow-lane').onchange = loadBpFlow;
+  $('bp-flow-lvl').onchange = () => {
+    state.bp.flow.level = $('bp-flow-lvl').value;
+    // Changing level by hand is not arriving from a jump, so whatever a jump
+    // asked to land on is dropped: landing on last level's node would either
+    // miss or, worse, hit a node of the same name meaning something else.
+    state.bp.flow.land = null;
+    loadBpFlow();
+  };
+  $('bp-seed').onclick = bpDraftStacks;
+  $('bp-stack-add').onclick = async () => {
+    const name = prompt('What is this layer called?');
+    if (!name) return;
+    const r = await post('/api/blueprint/stack', { op: 'add', name });
+    if (!r.ok) return alert(r.error);
+    loadBpMap();
+  };
+  $('bp-trig-new').onclick = async () => {
+    if (!state.bp.map) await loadBpMap();
+    if (!state.bp.trigs) await loadBpTriggers();
+    bpTriggerForm();
+  };
+  $('bp-trig-draft').onclick = bpDraftTriggers;
+  $('bp-trig-step').onclick = async () => {
+    $('bp-note').innerHTML = '<span class="spin">running…</span>';
+    const r = await post('/api/blueprint/trigger', { op: 'step' });
+    if (!r.ok) {
+      $('bp-note').innerHTML = `<span class="err">${esc(r.error)}</span>`;
+      return;
+    }
+    // Three different things can come out of one pass, and saying "wrote N
+    // proposals" for a request that was only queued for another workspace
+    // would claim something this pass did not do.
+    const took = r.fired.filter((f) => f.admitted).length;
+    const sent = r.fired.filter((f) => f.request).length;
+    const made = r.fired.filter((f) => f.proposal).length;
+    const said = [];
+    if (made) said.push(`wrote ${made} proposal(s) here — in Direction, unscored`);
+    if (sent) said.push(`queued ${sent} request(s) for another workspace`);
+    if (took) said.push(`admitted ${took} request(s) sent to this one`);
+    $('bp-note').innerHTML = said.length
+      ? `<span class="good">${said.join('; ')}</span>` : 'nothing matched';
+    loadBpTriggers();
+  };
+  $('bp-act').onchange = bpActNote;
+  $('bp-ctx-go').onclick = runBpContext;
+}
+
+wireBlueprint();
+wireLaneGrip();
 wireLaneAdd();
 wireGoals();
 wireDirection();
@@ -4627,9 +7644,8 @@ wireLaneModes();
 wireDeploy();
 wirePrs();
 wireMission();
+wireMove();
 wireReports();
 refresh();
-loadCredits();
 loadChat();
 setInterval(retimeStamps, 15000);
-wireMove();

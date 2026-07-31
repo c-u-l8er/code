@@ -15,14 +15,17 @@ index.html / app.js / app.css, no build step.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import mimetypes
+import os
 import socket
 import sys
 import tempfile
 import threading
 import time
 import traceback
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -31,6 +34,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import amp  # noqa: E402  the harness itself
+import blueprint  # noqa: E402  how the lanes stack, what fires between them, what is sent
 import preview  # noqa: E402  serving what a lane built, so you can look at it
 import store  # noqa: E402  the SQLite mirror of everything under .amp/
 
@@ -178,6 +182,16 @@ def state_payload() -> dict:
             ][:5]
         else:
             tasks = b.get("remote", {}).get(name, [])[:5]
+        # Both of these are read off disk, so they cost nothing per poll. The
+        # ratings are what the sidebar draws instead of a list of the last five
+        # dispatches: five task titles say what happened here recently, which is
+        # the one question the Log tab already answers, and say nothing at all
+        # about whether this lane is anywhere worth spending the next worker.
+        try:
+            ratings = amp.lane_ratings(name)
+        except Exception:
+            traceback.print_exc()
+            ratings = {}
         lanes.append(
             {
                 "name": name,
@@ -189,6 +203,9 @@ def state_payload() -> dict:
                 "bound": backend == "claude" or bool(lane.get("env_id")),
                 "running": any(t.get("status") == "running" for t in tasks),
                 "tasks": tasks,
+                "ratings": ratings,
+                "stage": amp.lane_stage(name),
+                "mode": amp.lane_mode(name),
                 "dispatch_count": len(history),
                 "last_dispatch": history[0]["dispatched_at"] if history else None,
             }
@@ -304,6 +321,12 @@ def state_payload() -> dict:
             # all four, because a dark dot with no reason is just a worry.
             "roles": amp.role_view(),
         },
+        # What the stage dropdown on every lane card is choosing between, sent
+        # once rather than per lane: it is the same ladder everywhere, and
+        # repeating it eleven times a poll is bytes for nothing.
+        "stages": [{"key": s, "means": amp.STAGE_MEANS[s],
+                    "automated": amp.STAGE_AUTOMATED[s], "who": amp.STAGE_WHO[s]}
+                   for s in amp.LANE_STAGES],
         "consult_models": amp.CONSULT_MODELS,
         "default_model": cfg.get("consult_model", amp.DEFAULT_CONSULT),
         "backends": list(amp.BACKENDS),
@@ -816,20 +839,53 @@ def do_answer_goal(body: dict) -> dict:
     return {"ok": True, "goal": amp.answer_goal(gid, text)}
 
 
-def do_push_goal(body: dict) -> dict:
-    """Give a stopped goal its rounds back and let it carry on."""
+def _triage_goal_bg(gid: str):
+    try:
+        amp.triage_goal(gid, BASE_URL)
+    except Exception:
+        traceback.print_exc()
+
+
+def do_triage_goal(body: dict) -> dict:
+    """Ask the orchestrator to have a go at a stopped goal's questions, now.
+
+    The same seam the heartbeat uses, reached by a click. The heartbeat only
+    re-reads a goal when the doctrine or a recorded decision has moved, which
+    is right for a background sweep and useless to an operator looking at a
+    question on screen and wanting it tried. This is the "read it again now"
+    button; it grants no new authority, so a question whose honest answer is
+    the operator's preference comes straight back as his.
+
+    Refused synchronously, run in the background - a turn takes as long as a
+    model takes, and holding the request open for that would leave the button
+    dead and the feed, which is already showing the turn, the only place
+    anything was happening.
+    """
     gid = body.get("goal_id") or ""
-    g = amp.load_goal(gid)
-    if not g:
+    why = amp.triage_blocker(gid)
+    if why:
+        return {"ok": False, "error": why}
+    threading.Thread(target=_triage_goal_bg, args=(gid,), daemon=True).start()
+    return {"ok": True, "triaging": True}
+
+
+def do_push_goal(body: dict) -> dict:
+    """Extend a budget-stopped goal's budget and let it carry on.
+
+    This used to zero `rounds` in place and, for a token stop, refuse outright
+    and tell the operator to raise a module constant. Both were wrong in the
+    same way: the first erased the only record of what the goal had cost, and
+    the second offered the operator a decision they could not actually take.
+    `amp.extend_goal_budget` moves the ceiling instead, so the spend survives
+    and a second extension is visible as one.
+    """
+    gid = body.get("goal_id") or ""
+    if not amp.load_goal(gid):
         return {"ok": False, "error": f"no goal {gid!r}"}
-    if g.get("cost_tokens", 0) >= amp.GOAL_TOKEN_CEILING:
-        return {"ok": False, "error": "this goal has spent its whole token ceiling. "
-                                      "Raise GOAL_TOKEN_CEILING or open a fresh goal."}
-    g["rounds"] = 0
-    g["stopped_on"] = None
-    g["state"] = "running"
-    amp.save_goal(g)
-    return {"ok": True, "goal": amp.goal_dispatch(gid)}
+    out = amp.extend_goal_budget(gid)
+    if out.get("error"):
+        return {"ok": False, "error": out["error"]}
+    return {"ok": True, "goal": out}
 
 
 def do_publish_report(body: dict) -> dict:
@@ -927,8 +983,12 @@ def do_direction(lane: str | None) -> dict:
 # ------------------------------------------------------------------ spec review
 
 
-def _dispatch_for_spec(run: dict, defects: list[str]) -> dict:
+def _dispatch_for_spec(run: dict, by_rel: dict) -> dict:
     """One spec run's next writer, out to a worker in that run's lane.
+
+    ONE writer for every document the reviewers named this round, which is what
+    `by_rel` is: `{document: [items]}`. A writer per document would be N workers
+    in a lane that runs one at a time, so N-1 of them would be refused.
 
     `report_back: False` because it reports to the run, not to a consult thread.
     Not queued: a spec run is a synchronous back-and-forth, and a writer that
@@ -937,7 +997,7 @@ def _dispatch_for_spec(run: dict, defects: list[str]) -> dict:
     """
     return do_dispatch({
         "lane": run["lane"],
-        "prompt": amp.spec_worker_prompt(run, defects),
+        "prompt": amp.spec_worker_prompt(run, by_rel),
         "backend": "claude",
         "spec_run_id": run["id"],
         "report_back": False,
@@ -954,7 +1014,11 @@ def do_spec(lane: str | None) -> dict:
 
 def do_spec_run(rid: str | None) -> dict:
     r = amp.load_specrun(rid or "")
-    return {"ok": True, "run": r} if r else {"ok": False, "error": f"no run {rid!r}"}
+    # Normalised, like the ones `spec_view` sends. A run recorded before a run
+    # covered a set carries one `rel` and a round-level verdict, and the tab
+    # would have to know both shapes to draw either.
+    return ({"ok": True, "run": amp.specrun_view(r)} if r
+            else {"ok": False, "error": f"no run {rid!r}"})
 
 
 def do_spec_start(body: dict) -> dict:
@@ -970,7 +1034,7 @@ def do_spec_start(body: dict) -> dict:
     if not amp.role_on("worker"):
         return {"ok": False, "error": "workers are switched off in Settings"}
     try:
-        r = amp.spec_review_open(lane, rel)
+        r = amp.spec_review_open(lane, [rel])
     except SystemExit as e:
         return {"ok": False, "error": str(e)}
     return {"ok": True, "run": r}
@@ -1005,11 +1069,12 @@ def do_spec_rate(body: dict) -> dict:
 
 
 def do_spec_campaign(body: dict) -> dict:
-    """Queue every document in the lane. The ticker starts them one at a time.
+    """Sharpen every document in the lane, in one run, with one writer.
 
-    The first one is started here rather than on the next tick: a button that
-    queues work and then does nothing visible for a minute is indistinguishable
-    from a button that did not work.
+    Slower than the single-document button by one architect call per document,
+    for the same reason that one is slow: the reviews happen inline, so the
+    button comes back with what every document was told, or with the reason it
+    was told nothing.
     """
     lane = body.get("lane") or ""
     if lane not in amp.config()["lanes"]:
@@ -1020,22 +1085,46 @@ def do_spec_campaign(body: dict) -> dict:
     if not amp.role_on("worker"):
         return {"ok": False, "error": "workers are switched off in Settings"}
     try:
-        amp.spec_campaign_open(lane, rels=body.get("rels"))
-        return {"ok": True, "plan": amp.spec_campaign_step(lane) or amp.spec_plan(lane)}
+        return {"ok": True, "plan": amp.spec_campaign_open(lane, rels=body.get("rels"))}
     except SystemExit as e:
         return {"ok": False, "error": str(e)}
 
 
 def do_spec_campaign_stop(body: dict) -> dict:
+    """Stop the run this selection opened. There is nothing else to stop.
+
+    The old queue could be stopped without touching the run it had started,
+    because that was a decision about what to start NEXT. A selection starts
+    everything at once, so this closes the run - the same thing the run's own
+    button does, reached from the strip that started it.
+    """
     lane = body.get("lane") or ""
     plan = amp.spec_campaign_close(lane)
     if not plan:
-        return {"ok": False, "error": f"no campaign on {lane!r}"}
-    # The run that is out stays out. It is paid for, it is mid-conversation, and
-    # stopping the campaign is a decision about what to start next - not about
-    # throwing away the document currently being rewritten. Stop it from its own
-    # button if that is what you meant.
+        return {"ok": False, "error": f"nothing has been sharpened on {lane!r}"}
     return {"ok": True, "plan": plan}
+
+
+def do_lane_refresh(body: dict) -> dict:
+    """Bring a lane's worker tree forward to its branch.
+
+    Under the lane lock, because it rewrites the same tree a worker would be
+    editing. Merging the branch in underneath a running writer would change the
+    file it is halfway through, and it has no way to notice.
+    """
+    lane = body.get("lane") or ""
+    if lane not in amp.config()["lanes"]:
+        return {"ok": False, "error": f"unknown lane {lane!r}"}
+    lock = lane_lock(lane)
+    if not lock.acquire(blocking=False):
+        return {"ok": False, "error": f"a worker is running in {lane} - "
+                                      f"refresh once it has finished"}
+    try:
+        return amp.lane_refresh(lane)
+    except SystemExit as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        lock.release()
 
 
 def do_spec_draft(body: dict) -> dict:
@@ -1143,11 +1232,16 @@ def do_direction_proposal(body: dict) -> dict:
 
     Adopting is the operator deciding what gets built, which is why it is a click
     and not a consequence of the review that proposed it.
+
+    The lane's own mode and stage are enforced inside `adopt_proposal`, not
+    here. A gate written in a handler is a gate the next client walks around,
+    and this handler is not the only way in. What this passes on is the
+    operator's answer to it.
     """
     pid = body.get("id") or ""
     action = body.get("action") or ""
     if action == "adopt":
-        return amp.adopt_proposal(pid)
+        return amp.adopt_proposal(pid, override=bool(body.get("override")))
     if action == "dismiss":
         p = amp.set_proposal(pid, "dismissed", reason=str(body.get("reason") or "")[:400])
         return {"ok": bool(p), "proposal": p} if p else {"ok": False, "error": "no such proposal"}
@@ -1221,6 +1315,34 @@ def do_ratify_doctrine() -> dict:
     return {"ok": True, "doctrine": {**amp.ratify_doctrine(), **amp.doctrine_state()}}
 
 
+def do_doctrine() -> dict:
+    """The workspace's own direction: the file, and what is measurable about it."""
+    try:
+        raw = amp.DOCTRINE_PATH.read_text()
+    except OSError:
+        raw = ""
+    return {"ok": True, "text": raw, "core": amp.doctrine(),
+            "begin": amp.DOCTRINE_BEGIN, "end": amp.DOCTRINE_END,
+            "mission": amp.mission(), "workspace": amp.current_workspace(),
+            "architect": amp.architect_available(),
+            "architect_off": "" if amp.architect_available() else amp.architect_off_reason(),
+            "stats": amp.doctrine_stats()}
+
+
+def do_set_doctrine(body: dict) -> dict:
+    return amp.set_doctrine(body.get("text") or "")
+
+
+def do_draft_doctrine() -> dict:
+    """Redraft the doctrine against the evidence. Saves nothing."""
+    return amp.draft_doctrine()
+
+
+def do_review_doctrine() -> dict:
+    """Judge the doctrine against the evidence. Saves nothing."""
+    return amp.review_doctrine()
+
+
 # ------------------------------------------------- workspaces, mission, supervisor
 
 
@@ -1277,28 +1399,6 @@ def do_workspace_remove(body: dict) -> dict:
                     "restores the workspace"}
 
 
-def do_mission(body: dict) -> dict:
-    """Write what this workspace is for.
-
-    The only text in the harness that no agent may author. It goes out with the
-    doctrine to every planner, worker and review from the next prompt onward.
-    """
-    if "text" not in body:
-        return {"ok": False, "error": "nothing to write"}
-    try:
-        amp.set_mission(str(body.get("text") or ""), body.get("slug") or None)
-    except amp.WorkspaceError as e:
-        return {"ok": False, "error": str(e)}
-    return {"ok": True, "workspace": amp.workspace_view()}
-
-
-def do_supervise() -> dict:
-    """Take a reading: is what is happening still the mission?
-
-    Slow and costs an architect call, like a direction review, and for the same
-    reason it is a request rather than something a timer does. Nothing it returns
-    is carried out - it names drift, it does not stop anything.
-    """
 def do_lane_move(body: dict) -> dict:
     """Move a lane, its goals and its worktree into another workspace.
 
@@ -1326,6 +1426,28 @@ def do_lane_move(body: dict) -> dict:
     return dict(out, workspace=amp.workspace_view())
 
 
+def do_mission(body: dict) -> dict:
+    """Write what this workspace is for.
+
+    The only text in the harness that no agent may author. It goes out with the
+    doctrine to every planner, worker and review from the next prompt onward.
+    """
+    if "text" not in body:
+        return {"ok": False, "error": "nothing to write"}
+    try:
+        amp.set_mission(str(body.get("text") or ""), body.get("slug") or None)
+    except amp.WorkspaceError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "workspace": amp.workspace_view()}
+
+
+def do_supervise() -> dict:
+    """Take a reading: is what is happening still the mission?
+
+    Slow and costs an architect call, like a direction review, and for the same
+    reason it is a request rather than something a timer does. Nothing it returns
+    is carried out - it names drift, it does not stop anything.
+    """
     return amp.supervise_workspace()
 
 
@@ -1426,6 +1548,97 @@ def do_remove_obligation(body: dict) -> dict:
 _PIPELINE_TICK = 60.0
 
 
+# ---------------------------------------------------------------- blueprint
+#
+# Three questions, one screen: how the lanes stack, what fires between them,
+# and what any given call is actually sent. Every route here is a thin wrapper -
+# the module holds the rules, so a second client cannot get a different answer
+# by asking a different endpoint.
+
+
+def _bp(fn, *a, **kw) -> dict:
+    """Run a blueprint call and turn its refusals into an answer, not a 500.
+
+    A refusal here is nearly always the operator being told something true -
+    "there is no open proposal to sharpen" - and a stack trace would bury it.
+    """
+    try:
+        out = fn(*a, **kw)
+    except (ValueError, LookupError) as e:
+        return {"ok": False, "error": str(e)}
+    return out if isinstance(out, dict) and "ok" in out else {"ok": True, **(out or {})}
+
+
+def do_blueprint_map() -> dict:
+    return {"ok": True, **blueprint.map_view()}
+
+
+def do_blueprint_triggers() -> dict:
+    return {"ok": True, **blueprint.triggers_view()}
+
+
+def do_blueprint_actions() -> dict:
+    return {"ok": True, **blueprint.actions_view()}
+
+
+def do_blueprint_flow(lens: str, action: str, lane: str, level: str) -> dict:
+    return blueprint.flow_view(lens or "agents",
+                               {"action": action, "lane": lane, "level": level})
+
+
+def do_blueprint_ports() -> dict:
+    return {"ok": True, **blueprint.ports_view()}
+
+
+def do_blueprint_context(action: str, lane: str) -> dict:
+    return blueprint.context_view(action, lane)
+
+
+def do_blueprint_stack(body: dict) -> dict:
+    op = (body.get("op") or "").strip()
+    if op == "add":
+        return _bp(blueprint.add_stack, body.get("name") or "", body.get("note") or "")
+    if op == "rename":
+        return _bp(blueprint.rename_stack, body.get("id") or "",
+                   body.get("name") or "", body.get("note"))
+    if op == "remove":
+        return _bp(blueprint.remove_stack, body.get("id") or "")
+    if op == "draft":
+        # Reads the lanes and proposes a layering. Writes nothing - `apply` is a
+        # separate call precisely so that accepting one is an act the operator
+        # performed rather than a side effect of asking.
+        return _bp(blueprint.draft_stacks)
+    if op == "apply":
+        return _bp(blueprint.apply_stacks, body.get("layers") or [])
+    return {"ok": False, "error": f"unknown layer operation {op!r}"}
+
+
+def do_blueprint_place(body: dict) -> dict:
+    return _bp(blueprint.place, body.get("lane") or "", body.get("stack") or None)
+
+
+def do_blueprint_trigger(body: dict) -> dict:
+    op = (body.get("op") or "").strip()
+    if op == "add":
+        return _bp(blueprint.add_trigger, body)
+    if op == "set":
+        return _bp(blueprint.set_trigger, body.get("id") or "", body.get("patch") or {})
+    if op == "remove":
+        return _bp(blueprint.remove_trigger, body.get("id") or "")
+    if op == "draft":
+        # Proposes wiring. Writes nothing - `apply` is a separate call, and even
+        # that writes triggers that are OFF.
+        return _bp(blueprint.draft_triggers)
+    if op == "apply":
+        return _bp(blueprint.apply_triggers, body.get("triggers") or [])
+    if op == "step":
+        # The same pass the heartbeat makes, on demand. It writes proposals and
+        # starts nothing, so there is no reason to make the operator wait a tick
+        # to see whether what they just wired up actually matches anything.
+        return {"ok": True, "fired": blueprint.step()}
+    return {"ok": False, "error": f"unknown trigger operation {op!r}"}
+
+
 def _pipeline_ticker():
     """The fleet's heartbeat: keep every running goal actually running.
 
@@ -1517,23 +1730,21 @@ def _pipeline_ticker():
                          else f"failed: {r.get('error')}"))
         except Exception:
             traceback.print_exc()
-        # A lane runs one worker at a time, so "sharpen every document" cannot be
-        # eleven runs started at once - it is a queue, and this is the only thing
-        # that empties it. Runs before sharpening so a lane that is already busy
-        # with a spec run is not also asked to start a proposal.
+        # A spec run that nobody is coming back to holds its lane's one writer,
+        # so every later selection is refused over work that has already stopped.
+        # There is no queue to step any more - a selection opens one run over the
+        # whole set - but a stranded run still has to be picked up or stopped, and
+        # this is the only thing that does it.
         try:
-            for name in amp.spec_campaigns_step():
-                p = amp.spec_plan(name) or {}
-                cur = (p.get("current") or {}).get("rel")
-                print(f"amp: spec campaign {name} -> "
-                      + (f"sharpening {cur}" if cur
-                         else f"{p.get('state')}: {p.get('why')}"))
+            for r in amp.spec_reap():
+                print(f"amp: spec run {r['id']} ({', '.join(r['rels']) or '?'}) "
+                      f"-> {r.get('state')}: {r.get('why')}")
         except Exception:
             traceback.print_exc()
         # Draft what is missing, rate what exists, sharpen what is under the bar.
         # One step for the whole stack per tick, and only with `auto_spec` on.
-        # After the campaign step, so a lane whose queue is mid-drain is seen as
-        # busy here rather than being handed a second thing to do.
+        # After the reaper, so a lane whose run has just been picked back up is
+        # seen as busy here rather than being handed a second thing to do.
         try:
             for r in amp.spec_auto_run():
                 if r.get("ok"):
@@ -1542,9 +1753,38 @@ def _pipeline_ticker():
                              else f" proposed {r.get('proposed')} goal(s)" if r["did"] == "explore"
                              else f" — {r.get('thin')} thin document(s), none worth a round"
                              if r["did"] == "settled"
-                             else f" ({r.get('queued', r.get('attempt'))})"))
+                             else f" ({r.get('chose', r.get('attempt'))} document(s))"
+                             if r["did"] == "campaign"
+                             else f" ({r.get('attempt')})"))
                 else:
                     print(f"amp: spec loop {r['lane']} {r['did']}: {r.get('error')}")
+        except Exception:
+            traceback.print_exc()
+        # Write the missing checks, waive what the architect ruled uncheckable,
+        # open the pull request, merge it once GitHub's own rollup passes, and
+        # send a worker at a conflict. One step for the whole stack per tick,
+        # and only on lanes with `auto_handoff` on - see `handoff_auto_on`,
+        # where the lane's mode and stage both outrank that switch.
+        try:
+            for r in amp.handoff_auto_run():
+                if r.get("ok"):
+                    print(f"amp: handoff loop {r['lane']} -> {r['did']}"
+                          + (f" {r.get('goal_id')}" if r.get("goal_id") else "")
+                          + (f" {r.get('url')}" if r.get("url") else ""))
+                else:
+                    print(f"amp: handoff loop {r['lane']} {r['did']}: "
+                          f"{r.get('error') or r.get('result', {}).get('blocked')}")
+        except Exception:
+            traceback.print_exc()
+        # What the operator drew on the Blueprint. A trigger writes an UNSCORED
+        # proposal and stops - it dispatches nothing and spends nothing - so it
+        # runs here, ahead of the sharpener, and everything downstream treats
+        # what it wrote exactly like any other proposal: scored first, then held
+        # or adopted by the same bars. A diagram cannot start work.
+        try:
+            for r in blueprint.step():
+                print(f"amp: blueprint trigger {r['trigger']} fired on {r['lane']}"
+                      f" -> proposed {r['proposal']} in {r['into']} ({r['note']})")
         except Exception:
             traceback.print_exc()
         # Anything still held back is held for one of two reasons - no odds on
@@ -1846,15 +2086,31 @@ def do_lanes() -> dict:
     return amp.lanes_view()
 
 
-def do_deploy() -> dict:
+def do_deploy(lane: str = "") -> dict:
     """What could be deployed, what credential it needs, and whether that works.
 
     Slow enough to be worth saying so: it runs each provider's own `whoami`, and
     those reach the network. Asked on opening the tab rather than on the
     heartbeat, because a credential does not change on its own - it changes when
     the operator signs in, which is the moment they are looking at this.
+
+    `lane` narrows it to that lane's targets. The narrowing happens in
+    `amp.deploy_view`, not here, so the counts it returns are counts of what it
+    returned - a filter applied at the edge would leave every total behind
+    describing a list the operator cannot see.
     """
-    return {"ok": True, **amp.deploy_view()}
+    return {"ok": True, **amp.deploy_view(lane or None)}
+
+
+def do_deploy_pages(lane: str = "") -> dict:
+    """Every Cloudflare Pages site, and which commit each one is serving.
+
+    Its own call rather than part of `do_deploy`, because it is a wrangler
+    start-up per project - thirty-eight of them - and the answer to "which
+    credential is missing" should not wait behind the answer to "which commit is
+    live". The tab paints the first, then fills in the second.
+    """
+    return {"ok": True, **amp.cf_pages_view(lane or None)}
 
 
 def do_deploy_preflight(body: dict) -> dict:
@@ -1879,17 +2135,6 @@ def do_deploy_run(body: dict) -> dict:
     reached either because a field was omitted is the wrong default.
     """
     return amp.start_deploy((body.get("key") or "").strip(),
-def do_deploy_pages() -> dict:
-    """Every Cloudflare Pages site, and which commit each one is serving.
-
-    Its own call rather than part of `do_deploy`, because it is a wrangler
-    start-up per project - thirty-eight of them - and the answer to "which
-    credential is missing" should not wait behind the answer to "which commit is
-    live". The tab paints the first, then fills in the second.
-    """
-    return {"ok": True, **amp.cf_pages_view()}
-
-
                             publish=body.get("publish") is True)
 
 
@@ -1916,7 +2161,7 @@ def do_deploy_history(body: dict) -> dict:
     return {"ok": True, "runs": list(reversed(rows))[:100]}
 
 
-def do_prs() -> dict:
+def do_prs(lane: str = "") -> dict:
     """The handoff across every lane: what is finished, and what is being tested.
 
     The slowest read in the console and worth it once, on opening the tab. It
@@ -1924,8 +2169,12 @@ def do_prs() -> dict:
     finished goal. Neither is on the heartbeat: a pull request appears when
     somebody opens one, and the checks behind these reports are read from disk
     rather than re-run, which is exactly why they are marked stale.
+
+    `lane` narrows it, and the narrowing happens in `amp.pr_view` rather than
+    here - the repositories the lane does not point at are then never asked
+    about at all, which is most of why the narrowed pane is the quick one.
     """
-    return {"ok": True, **amp.pr_view()}
+    return {"ok": True, **amp.pr_view(lane or None)}
 
 
 def do_pr_report(body: dict) -> dict:
@@ -1964,6 +2213,73 @@ def do_pr_waive(body: dict) -> dict:
     return amp.waive_condition(gid, text, body.get("why") or "")
 
 
+def do_pr_merge(body: dict) -> dict:
+    """Read GitHub's verdict on a pull request, and merge it if it passed.
+
+    `confirm: true` is required, and without it this is a preflight that touches
+    nothing - the same call, so what the operator is shown before accepting and
+    what refuses the merge are one piece of code. The gate itself lives in
+    `amp.merge_blockers` and is enforced there, not here: a gate that lives in a
+    request handler is a gate a second client walks around.
+    """
+    repo = (body.get("repo") or "").strip()
+    number = body.get("number")
+    if not repo or not isinstance(number, int):
+        return {"ok": False, "error": "a repository and a pull request number are needed"}
+    return amp.merge_pr(repo, number, confirm=body.get("confirm") is True,
+                        method=(body.get("method") or "squash"))
+
+
+def do_pr_resolve(body: dict) -> dict:
+    """Try the cheapest tier that has not been tried on a stuck pull request.
+
+    Left as one route with a `tier` rather than three, because `auto` choosing
+    the tier IS the feature - the operator asking for a re-run of something that
+    has already been re-run twice is the loop this replaces.
+    """
+    repo = (body.get("repo") or "").strip()
+    number = body.get("number")
+    if not repo or not isinstance(number, int):
+        return {"ok": False, "error": "a repository and a pull request number are needed"}
+    return amp.resolve_pr(repo, number, tier=(body.get("tier") or "auto"))
+
+
+def do_pr_auto(body: dict) -> dict:
+    """Switch the unattended handoff on or off for one lane.
+
+    Per lane and not per stack, for the same reason `do_auto_spec` is: the
+    lanes are not equally ready to have their work merged without being asked,
+    and the one thing an operator needs is to exclude the ones that are not.
+
+    The reply carries `running` as well as `on`, because the switch is not the
+    only thing that decides: the lane's mode and its stage ceiling both outrank
+    it, and a checkbox that ticked next to a lane whose stage stops at `code`
+    would be reporting a thing that is not going to happen.
+    """
+    lane = (body.get("lane") or "").strip()
+    if lane not in (amp.config().get("lanes") or {}):
+        return {"ok": False, "error": f"unknown lane {lane!r}"}
+    on = amp.set_auto_handoff(lane, bool(body.get("on")))
+    return {"ok": True, "lane": lane, "on": on,
+            "running": amp.handoff_auto_on(lane),
+            "why": amp.lane_admits(lane, "development")
+                   or amp.stage_admits(lane, "review")}
+
+
+def do_pr_auto_step(body: dict) -> dict:
+    """Run one step of the handoff on one lane, now.
+
+    The same call the heartbeat makes, reachable without waiting for it - but
+    NOT without the switch, which is checked inside `handoff_auto_step` rather
+    than here. A button that ran the loop on a lane the operator had switched
+    off would be a second way in past the only control there is.
+    """
+    lane = (body.get("lane") or "").strip()
+    if lane not in (amp.config().get("lanes") or {}):
+        return {"ok": False, "error": f"unknown lane {lane!r}"}
+    return amp.handoff_auto_step(lane)
+
+
 def do_set_lane_mode(body: dict) -> dict:
     """Change what a lane may START. Never stops what it is already doing.
 
@@ -1978,6 +2294,78 @@ def do_set_lane_mode(body: dict) -> dict:
                                                 body.get("mode") or "")}
     except amp.LaneError as e:
         return {"ok": False, "error": str(e)}
+
+
+def do_set_lane_direction(body: dict) -> dict:
+    """Write what a lane is FOR - the other half of what `mode` says it MAY do.
+
+    Sent as a whole object rather than one field at a time, because a direction
+    is read as one statement: a `bar` written against an older `claim` reads as
+    confident and is wrong, and the cheapest way to make that impossible is to
+    make partial writes impossible. Sending `{}` clears it, which is a real
+    answer - a lane whose purpose nobody can state is better shown as having
+    none than as having a stale one.
+    """
+    try:
+        return {"ok": True, "lane": body.get("lane") or "",
+                "direction": amp.set_lane_direction(body.get("lane") or "",
+                                                    body.get("direction") or {})}
+    except amp.LaneError as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_lane_directions() -> dict:
+    """Every lane's direction, with the mission it sits under."""
+    rungs = amp.lane_rungs()
+    return {"ok": True, "mission": amp.mission(),
+            "workspace": amp.current_workspace(),
+            "fields": list(amp.DIRECTION_FIELDS),
+            "after_bar": amp.AFTER_BAR,
+            "default_after_bar": amp.DEFAULT_AFTER_BAR,
+            "architect": amp.architect_available(),
+            "architect_off": "" if amp.architect_available() else amp.architect_off_reason(),
+            # The judged rung beside the written claim, because the one failure
+            # this screen exists to catch is a direction that says more than the
+            # lane's reviews ever did, and that is invisible while the two facts
+            # live on different pages.
+            "lanes": [{"name": n, "mode": amp.lane_mode(n),
+                       "rung": rungs.get(n, ""),
+                       "direction": amp.lane_direction(n)}
+                      for n in sorted(amp.config().get("lanes") or {})]}
+
+
+def do_draft_lane_direction(body: dict) -> dict:
+    """Redraft one lane's direction against its own evidence. Saves nothing."""
+    return amp.draft_lane_direction(body.get("lane") or "")
+
+
+def do_set_lane_stage(body: dict) -> dict:
+    """Change how far the harness may carry a lane by itself.
+
+    The other axis from `mode`, and deliberately its own call: a mode says what
+    kind of work may start, a stage says how far it may be taken, and folding
+    them into one control would make choosing either of them a choice about
+    both.
+    """
+    try:
+        return {"ok": True, **amp.set_lane_stage(body.get("lane") or "",
+                                                 body.get("stage") or "")}
+    except amp.LaneError as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_flow(lane: str | None) -> dict:
+    """Every rung of the pipeline for one lane, and what is stopping each.
+
+    Read-only and off disk. It takes no network reading, so it opens instantly -
+    the two rungs whose real state lives behind a `gh` or a `wrangler` call name
+    the tab that takes that reading rather than taking it here.
+    """
+    if not lane:
+        return {"ok": False, "error": "pick a lane first — the flow is a lane's flow"}
+    if lane not in (amp.config().get("lanes") or {}):
+        return {"ok": False, "error": f"unknown lane {lane!r}"}
+    return {"ok": True, "flow": amp.lane_flow(lane)}
 
 
 def do_bind_env(body: dict) -> dict:
@@ -2353,11 +2741,16 @@ def _first_line(text: str, limit: int = 240) -> str:
     return body[:limit] + "…" if len(body) > limit else body
 
 
-def chat_payload() -> dict:
+def chat_payload(brief: bool = False) -> dict:
     """The orchestrator thread: operator notes merged with what the board did.
 
     Task activity is derived rather than stored, so the thread cannot disagree
     with the board it is summarising.
+
+    `brief` adds the conversation with the briefer about that same thread, and
+    starts a turn if one is owed - see `_brief_view`. It is off by default and
+    the console only asks for it while somebody is actually looking at briefing
+    mode, which is what keeps the noisy default free.
     """
     # An idea is a note, but a quieter one: it is an aside a worker made in
     # passing, and it should not read like something that happened.
@@ -2427,7 +2820,10 @@ def chat_payload() -> dict:
                 "text": _first_line(t["text"]),
             })
     msgs.sort(key=lambda m: m.get("at") or "")
-    return {"ok": True, "messages": msgs}
+    out = {"ok": True, "messages": msgs}
+    if brief:
+        out["brief"] = _brief_view(msgs)
+    return out
 
 
 # ---------------------------------------------------------------- prior sessions
@@ -2488,6 +2884,182 @@ def do_history_ask(body: dict) -> dict:
     except SystemExit as e:
         return {"ok": False, "error": str(e) or "consult failed"}
     return {"ok": True, "consult": _consult_view(c)}
+
+
+# ---------------------------------------------------------------- briefing
+#
+# Briefing mode is the same thread with somebody on the other end of it. The
+# rules that person works to, why it is a view and never a source, and why it is
+# allowed to stay quiet are all in `amp.py` under "briefing". This is the half
+# that decides what counts as NEWS - which is the whole difficulty.
+#
+# It hangs off `chat_payload` rather than sitting on its own endpoint for one
+# reason that matters: what it is told has to be the feed on screen. Two calls
+# means two walks of the board, and a dispatch landing between them means being
+# told about a thread that is not the one you are looking at.
+
+# How far back the briefer reads. This thread is 1157 lines long on the board it
+# was built against, and briefing all of it would be both expensive and wrong:
+# "what has happened" means the recent past, and a summary that reaches back
+# three days buries today under it. Every line is still in the feed, which is
+# one click away.
+BRIEF_WINDOW = 40
+
+
+def _brief_line(m: dict) -> str:
+    """One message as a line the briefer can read.
+
+    Deliberately not JSON. This is prose for a model to summarise, and the
+    words that carry the meaning - stopped, failed, escalated - should be in
+    it rather than encoded in a `kind` field it has to interpret.
+    """
+    kind, lane = m.get("kind"), m.get("lane") or ""
+    at = (m.get("at") or "")[:16].replace("T", " ")
+    text = " ".join((m.get("text") or "").split())[:400]
+    cost = f" ${m['cost_usd']:.2f}" if m.get("cost_usd") else ""
+    if kind == "note":
+        return f"{at} note: {text}"
+    if kind == "idea":
+        return f"{at} passing idea{f' on {lane}' if lane else ''}: {text}"
+    if kind == "question":
+        qs = " | ".join(m.get("questions") or [])[:600]
+        return (f"{at} STOPPED: goal on {lane} is waiting on a decision and cannot "
+                f"continue: {qs}")
+    if kind == "you":
+        return f"{at} operator said: {text}"
+    if kind == "harness":
+        return f"{at} the harness asked the orchestrator: {text}"
+    if kind == "amp":
+        if m.get("status") == "running":
+            return f"{at} the orchestrator is mid-answer"
+        return f"{at} orchestrator replied{cost}: {text}"
+    if kind == "dispatch":
+        return (f"{at} sent to a worker on {lane} ({m.get('model') or m.get('backend')})"
+                f"{' as a reply' if m.get('resumed') else ''}: {text}")
+    if kind == "result":
+        turns = f", {m['num_turns']} turns" if m.get("num_turns") else ""
+        return f"{at} worker on {lane} {m.get('status')}{cost}{turns}: {text}"
+    if kind == "escalation":
+        auto = " (started on its own)" if m.get("trigger") == "auto" else ""
+        return f"{at} {lane} escalated to the architect{auto}: {text}"
+    if kind == "ruling":
+        needs = f", naming {m['needs']} piece(s) of work" if m.get("needs") else ""
+        return f"{at} architect ruled on {lane} (round {m.get('round')}{needs}): {text}"
+    return f"{at} {kind} {lane}: {text}"
+
+
+# How long the briefer waits between messages it sends off its own bat. A person
+# watching your board does not text you once per dispatch; they let a few things
+# pile up and then tell you where it got to. Nothing to do with cost - it is
+# about being someone worth reading. A reply to something you SAID is never
+# delayed by this.
+BRIEF_MIN_GAP_S = 45
+
+
+def _line_hash(line: str) -> str:
+    return hashlib.sha256(line.encode()).hexdigest()[:12]
+
+
+def _brief_new(msgs: list[dict], seen: set) -> tuple[str, list[str]]:
+    """The lines the briefer has not been shown yet, and their hashes.
+
+    Hashing the rendered LINE, rather than tracking a position in the feed, is
+    what makes "new" mean the right thing here. Two reasons, and the second is
+    the one that bites:
+
+    A message can CHANGE. A dispatch that was running when the briefer last
+    looked renders differently once it finishes, carrying the result and the
+    cost - the news is in the change, not in a new entry, and any watermark
+    that counts messages or compares timestamps sails straight past it.
+
+    A message can also NOT change while everything around it does. Re-reading
+    forty lines because one arrived is what made the old brief repeat itself,
+    and repetition is the single thing that stops this reading like a person.
+
+    `_brief_line` is deliberately stable for work in flight - it says "mid-answer"
+    and not how long it has been - so a running task does not re-hash on every
+    poll and start a conversation with itself.
+    """
+    fresh = [(l, h) for l, h in
+             ((l, _line_hash(l)) for l in
+              (_brief_line(m) for m in msgs[-BRIEF_WINDOW:]))
+             if h not in seen]
+    return "\n".join(l for l, _ in fresh), [h for _, h in fresh]
+
+
+def _run_brief_bg(new_lines: str, sig: str, seen: list, asked: str, covers: int):
+    try:
+        amp.brief_turn(new_lines, sig, seen, asked=asked, covers=covers)
+    except Exception:
+        traceback.print_exc()
+
+
+def _brief_start(msgs: list[dict], asked: str = "") -> bool:
+    """Start a turn if there is one owed. Returns whether one was started.
+
+    Shared by the poll and by the operator saying something, because the two
+    differ in exactly two ways and it is clearer to state them than to keep two
+    copies: being asked overrides the quiet gap, and being asked means a turn
+    happens even when the board has done nothing at all.
+    """
+    rec = amp.brief()
+    new_lines, hashes = _brief_new(msgs, set(rec.get("seen") or []))
+    # A question that was asked while a turn already held the claim was dropped
+    # on the floor: the POST could not start anything, and nothing retried. The
+    # poll picks that debt back up here, so being answered does not depend on
+    # having typed at a quiet moment.
+    asked = asked or amp.brief_unanswered()
+    if not asked:
+        if not new_lines:
+            return False
+        last = rec.get("last_run_at")
+        if last:
+            try:
+                gap = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(last)).total_seconds()
+            except ValueError:
+                gap = BRIEF_MIN_GAP_S + 1
+            if gap < BRIEF_MIN_GAP_S:
+                return False
+    # The signature covers what was asked as well as what is new, so two
+    # different questions about an unchanged board are two turns, not one
+    # refused as a duplicate.
+    sig = hashlib.sha256((asked + "\n" + new_lines).encode()).hexdigest()
+    if not amp.claim_brief(sig):
+        return False
+    threading.Thread(target=_run_brief_bg,
+                     args=(new_lines, sig, hashes, asked, len(hashes)),
+                     daemon=True).start()
+    return True
+
+
+def _brief_view(msgs: list[dict]) -> dict:
+    """The conversation so far, and whether the other side is mid-sentence.
+
+    No `current` flag any more, and its absence is the point. A brief that was
+    rewritten in place had to say whether it was still true; turns are dated
+    and stay said, so they carry that on their face the way any chat does.
+    """
+    _brief_start(msgs)
+    rec = amp.brief()
+    return {"turns": rec.get("turns") or [],
+            "working": rec.get("status") == "running",
+            "error": rec.get("error") if rec.get("status") == "failed" else None}
+
+
+def do_brief_send(body: dict) -> dict:
+    """The operator saying something to the briefer.
+
+    A separate route from `/api/chat` because it goes somewhere else entirely:
+    nothing here reaches the board, no lane hears it, and no work starts. The
+    briefer reads and talks, and that is the whole of what this can do.
+    """
+    text = (body.get("text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "nothing to say"}
+    amp.brief_say(text)
+    msgs = chat_payload()["messages"]
+    return {"ok": True, "working": _brief_start(msgs, asked=text)}
 
 
 def _run_orchestrator_bg(text: str):
@@ -2591,7 +3163,8 @@ class Handler(BaseHTTPRequestHandler):
                     200, do_log((q.get("lane") or [""])[0], (q.get("task_id") or [""])[0])
                 )
             if u.path == "/api/chat":
-                return self._send(200, chat_payload())
+                return self._send(200, chat_payload(
+                    brief=(q.get("brief") or [""])[0] == "1"))
             if u.path == "/api/history":
                 return self._send(200, do_history(
                     int((q.get("limit") or ["40"])[0]),
@@ -2603,6 +3176,8 @@ class Handler(BaseHTTPRequestHandler):
                                                    (q.get("id") or [None])[0]))
             if u.path == "/api/goal":
                 return self._send(200, do_goal({"goal_id": (q.get("id") or [""])[0]}))
+            if u.path == "/api/flow":
+                return self._send(200, do_flow((q.get("lane") or [None])[0]))
             if u.path == "/api/findings":
                 return self._send(200, do_findings(
                     (q.get("lane") or [None])[0],
@@ -2621,10 +3196,37 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_spec_candidates((q.get("lane") or [None])[0]))
             if u.path == "/api/lanes":
                 return self._send(200, do_lanes())
+            if u.path == "/api/lane/directions":
+                return self._send(200, do_lane_directions())
+            if u.path == "/api/blueprint":
+                return self._send(200, do_blueprint_map())
+            if u.path == "/api/blueprint/triggers":
+                return self._send(200, do_blueprint_triggers())
+            if u.path == "/api/blueprint/actions":
+                return self._send(200, do_blueprint_actions())
+            if u.path == "/api/blueprint/flow":
+                return self._send(200, do_blueprint_flow(
+                    (q.get("lens") or ["agents"])[0], (q.get("action") or [""])[0],
+                    (q.get("lane") or [""])[0], (q.get("level") or [""])[0]))
+            if u.path == "/api/blueprint/ports":
+                return self._send(200, do_blueprint_ports())
+            if u.path == "/api/blueprint/context":
+                # Builds the real prompt for real. No model is called, nothing
+                # is dispatched, and nothing on disk is written - it is the same
+                # code path the action takes, stopped one step before sending.
+                return self._send(200, do_blueprint_context(
+                    (q.get("action") or [""])[0], (q.get("lane") or [""])[0]))
+            if u.path == "/api/doctrine":
+                return self._send(200, do_doctrine())
+            # No `lane` is the whole workspace, which is what this pane has
+            # always shown. The narrowing is a request the console makes, not a
+            # default the server imposes on every client.
             if u.path == "/api/deploy":
-                return self._send(200, do_deploy())
+                return self._send(200, do_deploy((q.get("lane") or [""])[0]))
+            if u.path == "/api/deploy/pages":
+                return self._send(200, do_deploy_pages((q.get("lane") or [""])[0]))
             if u.path == "/api/prs":
-                return self._send(200, do_prs())
+                return self._send(200, do_prs((q.get("lane") or [""])[0]))
             if u.path == "/api/workspaces":
                 return self._send(200, do_workspaces())
             if u.path == "/api/supervisor":
@@ -2645,8 +3247,6 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/db/history":
                 return self._send(200, do_db_history((q.get("path") or [""])[0]))
             if u.path == "/api/db/changes":
-            if u.path == "/api/deploy/pages":
-                return self._send(200, do_deploy_pages())
                 # The feed a cloud sync will read. Exposed now because a sync
                 # that has to be designed against a database with no change
                 # log is a rewrite, not a feature.
@@ -2710,12 +3310,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_dispatch(body))
             if u.path == "/api/chat":
                 return self._send(200, do_chat_send(body))
+            # Talking to the briefer, which is not talking to the board. Its own
+            # route so that nothing about dispatching can arrive here by accident.
+            if u.path == "/api/brief":
+                return self._send(200, do_brief_send(body))
             if u.path == "/api/ask":
                 return self._send(200, do_ask(body))
+            if u.path == "/api/blueprint/stack":
+                return self._send(200, do_blueprint_stack(body))
+            if u.path == "/api/blueprint/place":
+                return self._send(200, do_blueprint_place(body))
+            if u.path == "/api/blueprint/trigger":
+                return self._send(200, do_blueprint_trigger(body))
             if u.path == "/api/goal/open":
                 return self._send(200, do_open_goal(body))
             if u.path == "/api/goal/answer":
                 return self._send(200, do_answer_goal(body))
+            if u.path == "/api/goal/triage":
+                return self._send(200, do_triage_goal(body))
             if u.path == "/api/goal/push":
                 return self._send(200, do_push_goal(body))
             if u.path == "/api/goal/close":
@@ -2748,6 +3360,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_spec_campaign_stop(body))
             if u.path == "/api/spec/draft":
                 return self._send(200, do_spec_draft(body))
+            if u.path == "/api/lane/refresh":
+                return self._send(200, do_lane_refresh(body))
             if u.path == "/api/report":
                 return self._send(200, do_report(body))
             if u.path == "/api/report/solve":
@@ -2768,6 +3382,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_close_ideas(body))
             if u.path == "/api/doctrine/ratify":
                 return self._send(200, do_ratify_doctrine())
+            # The only writer of DOCTRINE.md. It sits next to ratify on purpose:
+            # a save changes the digest, which is what puts the change on the
+            # board unratified, which is the only reason writing it here is safe.
+            if u.path == "/api/doctrine/save":
+                return self._send(200, do_set_doctrine(body))
+            if u.path == "/api/doctrine/draft":
+                return self._send(200, do_draft_doctrine())
+            if u.path == "/api/doctrine/review":
+                return self._send(200, do_review_doctrine())
             # `use` moves the ground under everything else in this process and
             # refuses while anything is running; the rest are bookkeeping.
             if u.path == "/api/workspace/use":
@@ -2778,6 +3401,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_workspace_rename(body))
             if u.path == "/api/workspace/remove":
                 return self._send(200, do_workspace_remove(body))
+            if u.path == "/api/lane/move":
+                return self._send(200, do_lane_move(body))
             if u.path == "/api/mission":
                 return self._send(200, do_mission(body))
             if u.path == "/api/supervise":
@@ -2802,8 +3427,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_restart(body))
             if u.path == "/api/history/note":
                 return self._send(200, do_history_note(body))
-            if u.path == "/api/lane/move":
-                return self._send(200, do_lane_move(body))
             if u.path == "/api/history/ask":
                 return self._send(200, do_history_ask(body))
             if u.path == "/api/preview/start":
@@ -2820,6 +3443,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_set_backend(body))
             if u.path == "/api/lane/mode":
                 return self._send(200, do_set_lane_mode(body))
+            if u.path == "/api/lane/direction":
+                return self._send(200, do_set_lane_direction(body))
+            if u.path == "/api/lane/direction/draft":
+                return self._send(200, do_draft_lane_direction(body))
+            if u.path == "/api/lane/stage":
+                return self._send(200, do_set_lane_stage(body))
             if u.path == "/api/deploy/login":
                 return self._send(200, do_provider_login(body))
             if u.path == "/api/deploy/poll":
@@ -2840,6 +3469,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_pr_write_checks(body))
             if u.path == "/api/pr/waive":
                 return self._send(200, do_pr_waive(body))
+            # `confirm` gates the merge the way it gates a publish - without it
+            # this is a preflight that changes nothing on GitHub.
+            if u.path == "/api/pr/merge":
+                return self._send(200, do_pr_merge(body))
+            if u.path == "/api/pr/resolve":
+                return self._send(200, do_pr_resolve(body))
+            if u.path == "/api/pr/auto":
+                return self._send(200, do_pr_auto(body))
+            if u.path == "/api/pr/auto/step":
+                return self._send(200, do_pr_auto_step(body))
             if u.path == "/api/auth/start":
                 return self._send(200, do_auth_start())
             if u.path == "/api/auth/code":
@@ -2878,6 +3517,111 @@ def free_port(start: int) -> int:
     return start
 
 
+# One console per STATE DIRECTORY, which is the thing actually being shared -
+# not per machine and not per port. Two consoles pointed at different AMP_HOMEs
+# are two separate harnesses and both may run; that pair is a normal setup
+# here, one of them serving a preview. The `.lock` suffix is what keeps this
+# out of the mirror (`store.SKIP_SUFFIX`), so renaming it needs a look there.
+CONSOLE_LOCK = ".console.lock"
+
+
+def _lock_holder(path: Path) -> dict | None:
+    """Who holds this lock, or None if nobody does any more.
+
+    A lock file outlives `kill -9`, so its existence proves nothing on its own,
+    and treating it as proof would mean recovering from a crash by deleting a
+    dotfile nobody documented. What is checked is the PROCESS.
+    """
+    try:
+        rec = json.loads(path.read_text())
+        pid = int(rec.get("pid") or 0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        # An unreadable lock names nobody. It cannot be honoured, because
+        # there is no port to send the operator to and no pid to check.
+        return None
+    if pid <= 0 or pid == os.getpid():
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    # Only ever used to declare a lock STALE, never to declare one live. A pid
+    # recycled into an unrelated program is not a console, and refusing to
+    # start for it would be a refusal the operator cannot act on. Where this
+    # cannot be read the pid check above stands on its own.
+    try:
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return rec
+    return rec if b"server.py" in cmd else None
+
+
+def take_console_lock(port: int, host: str) -> Path | None:
+    """Refuse to be the second console on one state directory.
+
+    `main` below assumes it is the only console: it marks every `running`
+    orchestrator turn failed, and `adopt_orphans` reconciles the SHARED board
+    against IN-PROCESS dicts that a second console starts empty. So a second
+    console does not merely race the first - it writes "the worker did not
+    survive" about a live worker another console is watching, and adopts that
+    worker's process group as its own. `free_port` is what made this silent:
+    it succeeds on the next port instead of failing on this one, so the way
+    you find out is by reading two boards that disagree.
+    """
+    path = amp.STATE_ROOT / CONSOLE_LOCK
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"pid": os.getpid(), "port": port, "host": host,
+                       "at": amp.now()}, indent=2, sort_keys=True) + "\n"
+    # Bounded, because the retry is for a lock found stale and cleared. An
+    # unbounded loop here would spin against a console starting at the same
+    # moment, which is the one case the exclusive create already settles.
+    for _ in range(3):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            held = _lock_holder(path)
+            if held:
+                raise SystemExit(
+                    f"amp: a console is already running on this state directory\n"
+                    f"      {amp.STATE_ROOT}\n"
+                    f"      pid {held.get('pid')}, started {held.get('at')}, at "
+                    f"http://{held.get('host') or HOST}:{held.get('port')}\n"
+                    f"      Two consoles here do not just race: the second one marks the "
+                    f"first's\n"
+                    f"      live orchestrator turn failed and adopts its running workers. "
+                    f"Use the\n"
+                    f"      one above, or stop it first.")
+            print(f"  cleared a stale console lock ({path.name})")
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        amp._fsync_dir(path.parent)
+        return path
+    raise SystemExit(f"amp: could not take the console lock at {path}")
+
+
+def release_console_lock(path: Path | None) -> None:
+    """Give the lock back, and only if it is still ours.
+
+    A lock this process took over as stale can since have been taken by a
+    third console - deleting that one on the way out would hand the directory
+    to whoever starts next, which is the race this whole thing closes.
+    """
+    if path is None:
+        return
+    try:
+        if int(json.loads(path.read_text()).get("pid") or 0) == os.getpid():
+            path.unlink()
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="amp browser console")
     ap.add_argument("--port", type=int, default=PORT)
@@ -2887,6 +3631,10 @@ def main(argv=None):
 
     global BASE_URL
     port = free_port(a.port)
+    # Before the socket and before the sweep below, because the point is not to
+    # start at all. Taken after `free_port` only so the refusal can say which
+    # port THIS console would have used.
+    lock = take_console_lock(port, a.host)
     srv = ThreadingHTTPServer((a.host, port), Handler)
     url = f"http://{a.host}:{port}"
     BASE_URL = url
@@ -2975,6 +3723,10 @@ def main(argv=None):
         # A preview's dev server is our child and holds a lane's worktree open.
         # Left behind, it survives every restart of this file and accumulates.
         preview.stop_all()
+        # Last, so a crash in the line above still hands the directory back.
+        # A lock left behind is recoverable - the next console reads the pid,
+        # finds nothing, and says it cleared a stale one.
+        release_console_lock(lock)
     return 0
 
 

@@ -16,7 +16,6 @@
   </div>
   <div class="health" id="health"></div>
   <div class="actions">
-    <span class="credit" id="credit"></span>
     <!-- Which workspace, before anything else in this bar: every number on the
          page is scoped to it, so reading the page without seeing it is how you
          end up reasoning about the wrong board. -->
@@ -27,7 +26,18 @@
          nothing at all. -->
     <span class="ws-why" id="ws-why"></span>
     <span class="align" id="align"></span>
+    <!-- Everything the board has to say that you have not read yet, behind one
+         control. It carries a count because a button with nothing on it is a
+         button nobody opens - and the count is red when any of it is a
+         contradiction, since that is the one kind that is not a queue. -->
+    <button id="btn-notify" title="findings, standing obligations and what the harness can see is wrong">
+      Notifications <span class="nbadge" id="notify-count"></span></button>
     <button id="btn-mission" title="what this workspace is for, and whether the work still is">Mission</button>
+    <!-- Not a sheet and not a modal: it replaces the board. The three things it
+         answers - how the lanes stack, what fires between them, and what each
+         call is actually sent - are all things you read across the whole
+         workspace at once, and none of them fit beside a lane list. -->
+    <button id="btn-blueprint" title="how the lanes stack, what fires between them, and exactly what each call is sent">Blueprint</button>
     <button id="btn-report" title="the whole workspace as one page: what happened, what is happening, where it is headed">Report</button>
     <button id="btn-settings" title="what spends, and what to switch off">Settings</button>
     <button id="btn-poll" class="primary">Poll</button>
@@ -35,19 +45,12 @@
 </header>
 
 <div id="banner" class="banner hidden"></div>
-<!-- What the work has said about the doctrine, above everything the harness
-     noticed by itself: a contradiction means something we believed is false. -->
-<div id="findings" class="findings hidden"></div>
-<!-- Things that have to keep being true and currently do not. Below findings:
-     a stale build is a chore, a contradiction is news. -->
-<div id="obligations" class="obligations hidden"></div>
-<div id="watch" class="watch hidden"></div>
 <div id="running" class="running hidden"></div>
 
 <main>
   <section class="lanes">
     <div class="section-head">
-      <h2>Lanes</h2>
+      <h2>LANES</h2>
       <span class="muted" id="polled">never polled</span>
       <button id="btn-lane-add" title="Register a repo under the workspace as a lane">+ lane</button>
     </div>
@@ -61,16 +64,22 @@
     </div>
   </section>
 
+  <!-- The gutter you drag to widen the lane list. Lane names are repo names,
+       which are as long as they are, so a fixed column either truncates them or
+       wastes the space on a workspace whose names are short. -->
+  <div id="lane-grip" class="lane-grip" title="drag to resize (double-click to reset)"></div>
+
   <section class="detail">
     <nav class="tabs">
-      <button class="tab active" data-tab="dispatch">Dispatch</button>
+      <button class="tab active" data-tab="blockers">Blockers</button>
+      <button class="tab" data-tab="dispatch">Dispatch</button>
       <button class="tab" data-tab="goals">Goals</button>
       <button class="tab" data-tab="direction">Direction</button>
       <button class="tab" data-tab="specs">Specs</button>
       <button class="tab" data-tab="log">Log</button>
       <button class="tab" data-tab="diff">Diff</button>
       <button class="tab" data-tab="preview">Preview</button>
-      <button class="tab" data-tab="ask">Ask GPT-5.6</button>
+      <button class="tab" data-tab="ask">Escalate</button>
       <button class="tab" data-tab="history">History</button>
       <button class="tab" data-tab="rulings">Rulings</button>
       <button class="tab" data-tab="settings">Settings</button>
@@ -78,7 +87,22 @@
       <button class="tab" data-tab="publish">Publish</button>
     </nav>
 
-    <div class="pane active" id="pane-dispatch">
+    <!-- The whole pipeline, drawn once. Every other pane shows one rung of it;
+         this is the only place the rungs are shown as connected, with what is
+         stopping each one and the button that unsticks it. It reads nothing
+         over the network, so it opens instantly and is the pane you land on. -->
+    <div class="pane active" id="pane-blockers">
+      <div class="pane-head">
+        <h3>Flow of <span class="lane-chip" id="b-lane">&mdash;</span></h3>
+        <div class="row">
+          <label><input type="checkbox" id="b-only"> only what is stuck</label>
+          <button id="btn-flow">Reload</button>
+        </div>
+      </div>
+      <div id="b-out" class="flowpane"><div class="empty">Pick a lane.</div></div>
+    </div>
+
+    <div class="pane" id="pane-dispatch">
       <div class="pane-head">
         <h3>Dispatch to <span class="lane-chip" id="d-lane">&mdash;</span></h3>
         <div class="row">
@@ -132,6 +156,46 @@
           <span class="muted" id="dir-status"></span>
         </div>
       </div>
+      <!-- What the SELECTED lane is for, which is a different question from
+           what the direction engine below is doing. The engine proposes work
+           across the whole workspace; this is the standard that work gets
+           proposed against, and until now it had a read/write API and no screen
+           at all - so the one record every proposer, scorer and judge is shown
+           was the one record nobody could see.
+
+           Drafting is a model call and saving is not. The draft button fills
+           these boxes in and changes nothing; the save button is the only thing
+           that writes. That split is deliberate: this is the only field set in
+           the system that is read BY the thing that would be writing it, so a
+           model allowed to save could revise the standard it is about to be
+           held to. -->
+      <details id="dir-lanedir" class="lanedir">
+        <summary>What this lane is for <span class="muted" id="ld-sum"></span></summary>
+        <div id="ld-body">select a lane on the left</div>
+      </details>
+      <!-- The same record, read rather than edited, and ABOVE the workspace
+           direction because it is the narrower of the two and the one that
+           changes when you change lanes. Everything under `dir-out` is read
+           from the workspace mission and DOCTRINE.md, so it is word for word
+           identical in all thirty-one lanes - which is correct, and is exactly
+           why a per-lane record that only existed inside a closed accordion
+           read as a page that never updates. -->
+      <div id="ld-read" class="ldread"></div>
+      <!-- The workspace's own direction, which is DOCTRINE.md. Until now this
+           file had a reader and no writer: it is injected verbatim into every
+           plan, review and worker prompt, and the only way to change it was to
+           leave the console. Same defect the lane directions had — the record
+           with the widest reach had the least machinery around it.
+
+           Saving here does not ratify. A save moves the digest, the digest
+           moving is what stands the change on the board unratified, and that
+           is the only reason a button that edits the rules is safe to have.
+           Draft and Review are model calls and neither writes. -->
+      <details id="dir-doctrine" class="lanedir">
+        <summary>What the whole workspace is held to
+          <span class="muted" id="dc-sum"></span></summary>
+        <div id="dc-body">loading…</div>
+      </details>
       <div id="dir-out" class="direction">loading…</div>
     </div>
 
@@ -223,7 +287,7 @@
 
     <div class="pane" id="pane-ask">
       <div class="pane-head">
-        <h3>Escalate <span class="lane-chip" id="a-lane">&mdash;</span> to GPT-5.6</h3>
+        <h3>Escalate <span class="lane-chip" id="a-lane">&mdash;</span> to architect</h3>
         <div class="row">
           <label>thread <select id="a-consult"></select></label>
           <label>model <select id="a-model"></select></label>
@@ -301,18 +365,23 @@ If the architect asks for a file by name it is fetched and sent without another 
          list kept by hand is wrong the first time somebody adds a service. The
          identities are asked of each provider rather than inferred from a file,
          because a token that exists is not a token that works. -->
-    <!-- The handoff, across every lane at once. The board answers "what is being
-         worked on"; this answers the two questions that come after it and that
-         nothing else on screen asks: what is finished and has never been handed
-         to anyone, and what has been handed over that nothing is testing.
+    <!-- The handoff. The board answers "what is being worked on"; this answers
+         the two questions that come after it and that nothing else on screen
+         asks: what is finished and has never been handed to anyone, and what
+         has been handed over that nothing is testing.
 
-         The four numbers along the top are counted from goals and from GitHub's
-         own answers, never from a model's summary of either. Nothing on this
-         tab merges anything, and there is no button here that could. -->
+         The numbers along the top are counted from goals and from GitHub's own
+         answers, never from a model's summary of either. There IS now a button
+         here that merges - and the only thing that decides whether it is drawn
+         is GitHub's own check rollup, which is the one piece of evidence this
+         harness structurally cannot manufacture for itself. -->
     <div class="pane" id="pane-prs">
       <div class="pane-head">
         <h3>What has been handed over</h3>
         <div class="row">
+          <!-- Same rule as Publish: an operator standing on a lane is asking
+               about that lane, and the whole workspace is one press away. -->
+          <button id="btn-pr-scope">All lanes</button>
           <button id="btn-pr-reload">Re-check</button>
           <span class="muted" id="pr-status"></span>
         </div>
@@ -328,6 +397,10 @@ If the architect asks for a file by name it is fetched and sent without another 
       <div class="pane-head">
         <h3>What could be deployed</h3>
         <div class="row">
+          <!-- What this pane is about. It opens on the selected lane, because an
+               operator standing on a lane is asking about that lane's work; the
+               whole account is one press away and the button names where it goes. -->
+          <button id="btn-dep-scope">All lanes</button>
           <button id="btn-dep-reload">Re-check</button>
           <span class="muted" id="dep-status"></span>
         </div>
@@ -336,6 +409,7 @@ If the architect asks for a file by name it is fetched and sent without another 
       shown is what a deploy would actually find rather than what a config file claims.
       Signing in opens a page in the browser; the console keeps asking the provider until
       the provider says yes &mdash; never until the CLI says so.</p>
+      <div id="dep-out" class="deploy">loading&hellip;</div>
 
       <h3 class="dep-h">What is already live</h3>
       <p class="muted">Cloudflare&rsquo;s own answer, not a config file&rsquo;s. Every one
@@ -345,10 +419,111 @@ If the architect asks for a file by name it is fetched and sent without another 
       that is the one claim about <code>live_deployed</code> on this screen that nobody
       had to be trusted for.</p>
       <div id="cf-out" class="deploy"><span class="muted">not asked yet</span></div>
-      <div id="dep-out" class="deploy">loading&hellip;</div>
     </div>
   </section>
 </main>
+
+<!-- ============================================================ BLUEPRINT ===
+     Takes the place of <main> rather than floating over it. A modal would make
+     this a thing you glance at; it is a thing you work in, and the whole point
+     is to see the workspace at once instead of one lane at a time.
+
+     Three views, because there are three separable questions and answering them
+     on one screen would mean answering none of them well:
+
+       Map      - how the lanes layer. Rows are the evidence rung a lane has
+                  been JUDGED to reach, so nobody can promote a lane by dragging
+                  it. Columns are layers the operator names and assigns.
+       Triggers - what fires between the layers. Every one of them writes an
+                  unscored proposal and stops. Nothing here starts a worker.
+       Context  - what a given call is actually sent, block by block, built for
+                  real at the moment you ask. No model is called.
+-->
+<section id="blueprint" class="blueprint hidden">
+  <nav class="bp-tabs">
+    <button class="bp-tab active" data-bp="flow">Flow</button>
+    <button class="bp-tab" data-bp="map">Map</button>
+    <button class="bp-tab" data-bp="triggers">Triggers</button>
+    <button class="bp-tab" data-bp="context">Context</button>
+    <span class="bp-note" id="bp-note"></span>
+    <button id="bp-reload">Reload</button>
+    <button id="bp-close" title="back to the board">Close</button>
+  </nav>
+
+  <!-- Agents is who does the work and what governs each rung; the other three
+       are the same things the three panes below show, drawn instead of listed.
+       Same data from the same functions - a lens, not a fourth source of truth.
+
+       Agents is the one lens that writes, and every control on it posts to an
+       endpoint that already existed somewhere else in the console. What it does
+       NOT let you do is drag an arrow: the order of the rungs is what the code
+       does. The arrows you can author are on Triggers. -->
+  <div class="bp-pane active" id="bp-pane-flow">
+    <div class="bp-bar">
+      <span class="bp-lens">
+        <button class="bp-lensb active" data-lens="agents">Agents</button>
+        <button class="bp-lensb" data-lens="map">Map</button>
+        <button class="bp-lensb" data-lens="triggers">Triggers</button>
+        <button class="bp-lensb" data-lens="context">Context</button>
+      </span>
+      <span id="bp-flow-args" class="bp-flow-args hidden">
+        <!-- The four levels are the same lens at four scales, so they are a
+             picker rather than four more pills: the pills are different
+             questions, the levels are the same question about a bigger thing.
+             The lane picker hides on the three levels that are not about one
+             lane - shown and ignored, it reads as a control that broke. -->
+        <label id="bp-flow-lvl-l">level <select id="bp-flow-lvl"></select></label>
+        <label id="bp-flow-act-l">call <select id="bp-flow-act"></select></label>
+        <label id="bp-flow-lane-l">lane <select id="bp-flow-lane"></select></label>
+      </span>
+      <button id="bp-flow-fit">Fit</button>
+      <span class="muted" id="bp-flow-note"></span>
+    </div>
+    <div id="bp-flow" class="bp-flow"></div>
+    <div id="bp-flow-empty" class="empty hidden"></div>
+    <div id="bp-flow-legend" class="bp-legend"></div>
+    <div id="bp-flow-tip" class="bp-tip hidden"></div>
+  </div>
+
+  <div class="bp-pane" id="bp-pane-map">
+    <div class="bp-bar">
+      <span class="muted">Rows are the rung a lane's evidence has been judged to
+        reach &mdash; they are read from the reviews, not set here. Columns are
+        yours to name.</span>
+      <button id="bp-seed">Suggest layers</button>
+      <button id="bp-stack-add">+ layer</button>
+    </div>
+    <div id="bp-draft" class="bp-draft hidden"></div>
+    <div id="bp-map" class="bp-map"><div class="empty">Loading&hellip;</div></div>
+    <div id="bp-node" class="bp-node hidden"></div>
+  </div>
+
+  <div class="bp-pane" id="bp-pane-triggers">
+    <div class="bp-bar">
+      <span class="muted">A trigger writes a proposal into Direction and stops.
+        It is scored and gated like anything else &mdash; nothing here starts a
+        worker or spends money.</span>
+      <button id="bp-trig-draft">Draft the wiring</button>
+      <button id="bp-trig-step">Run the pass now</button>
+      <button id="bp-trig-new" class="primary">+ trigger</button>
+    </div>
+    <div id="bp-trig-draft-box" class="bp-draft hidden"></div>
+    <div id="bp-trig-form" class="bp-form hidden"></div>
+    <div id="bp-trigs" class="bp-trigs"><div class="empty">Loading&hellip;</div></div>
+  </div>
+
+  <div class="bp-pane" id="bp-pane-context">
+    <div class="bp-bar">
+      <label>call <select id="bp-act"></select></label>
+      <label>lane <select id="bp-lane"></select></label>
+      <button id="bp-ctx-go" class="primary">Build it</button>
+      <span class="muted" id="bp-ctx-sub"></span>
+    </div>
+    <div id="bp-ctx" class="bp-ctx"><div class="empty">Pick a call and build it.
+      Nothing is sent to a model &mdash; this is the same code path the real call
+      takes, stopped one step before it goes out.</div></div>
+  </div>
+</section>
 
 <!-- The three strips that used to stack under the header. They were pushing the
      board itself below the fold, and a permanent wall of text is one nobody
@@ -389,6 +564,13 @@ If the architect asks for a file by name it is fetched and sent without another 
   <div class="dock-head" id="dock-head">
     <span class="dock-title">[&amp;] orchestrator</span>
     <span class="muted" id="dock-sub">the thread that runs the others</span>
+    <!-- Lives in the head, so it is on screen whether the dock is open or shut:
+         the moment you most want the short version is the moment the thread is
+         too long to have open. -->
+    <span class="dock-mode" id="dock-mode">
+      <button data-mode="feed" title="every line, in the order it happened">everything</button>
+      <button data-mode="brief" title="someone watching the board for you: tells you what matters, answers when you ask">briefing</button>
+    </span>
     <span class="dock-toggle" id="dock-toggle">&minus;</span>
   </div>
   <div id="dock-feed" class="dock-feed"></div>
@@ -452,6 +634,7 @@ If the architect asks for a file by name it is fetched and sent without another 
       <button id="btn-ws-add">Create</button>
       <span class="muted" id="mi-ws-status"></span>
     </div>
+
     <h4>Move a lane</h4>
     <p class="muted">A lane belongs to one workspace, and so do its goals and its
     worktree &mdash; so moving it moves all three, and uncommitted work in the
@@ -466,7 +649,6 @@ If the architect asks for a file by name it is fetched and sent without another 
       <button id="btn-mv-do" class="primary hidden">Move it</button>
     </div>
     <div id="mv-out" class="mv-out"></div>
-
 
     <div class="row"><button id="btn-mi-close">Close</button></div>
   </div>
@@ -555,6 +737,21 @@ If the architect asks for a file by name it is fetched and sent without another 
     it ranks proposals against each other, and the ceiling on spending is the daily one.</p>
     <div id="set-cal" class="setcal"></div>
 
+    <h4>Sharpening a spec</h4>
+    <p class="muted">A spec run ends when the reviewer and the writer agree the
+    document is solid. This is only the spend backstop underneath that &mdash; the
+    point at which a pair that will not converge stops billing. A run that hits it
+    is reported as <b>capped</b>, which means it stopped without a verdict rather
+    than because the document was finished.</p>
+    <div class="row barrow">
+      <label for="set-spec-rounds">review rounds per document</label>
+      <input id="set-spec-rounds" type="number" min="1" max="100" step="1" class="num">
+    </div>
+    <p class="muted">Raise it when runs keep coming back capped on documents that
+    were still improving; lower it when they burn rounds arguing. Changing it
+    applies to the next round of every run &mdash; it does not restart one that
+    has already stopped.</p>
+
     <h4>Where your work is kept</h4>
     <p class="muted">Nothing here has ever lived in the browser &mdash; the board,
     this chat, every finding, goal and ruling are files on your disk. Alongside
@@ -615,6 +812,9 @@ If the architect asks for a file by name it is fetched and sent without another 
   </div>
 </div>
 
+<!-- Vendored, not a CDN link: this console has to draw its own graph on a
+     machine with no network. cytoscape 3.30.2, MIT. -->
+<script src="cytoscape.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
