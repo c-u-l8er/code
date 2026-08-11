@@ -147,9 +147,10 @@ const LINKS = {
 
   // Academy — the institutional loop: systems that teach & prove cognition.
   //
-  // Every entry below resolves to a page that exists in the academy repo. The host is the one
-  // assumption here; if Academy lands somewhere other than academy.opensentience.org, these six
-  // hrefs are the only thing to change. Supervisor was a nav peer until 2026-08-10 and is now a
+  // Every entry below resolves to a live page. Cloudflare Pages serves this site extensionless
+  // — /read is canonical and /read.html 308-redirects to it — so the hrefs carry no extension.
+  // Pointing at the .html form worked but advertised a redirect from 22 sites, which is the same
+  // canonical hygiene the atlas crawl flagged (finding A6). Supervisor was a nav peer until 2026-08-10 and is now a
   // spec doc under Docs — it is a specification, not a surface.
   //
   // Statuses are deliberately unflattering. The whole category is a prototype, and a menu that
@@ -164,35 +165,35 @@ const LINKS = {
   academy_read: {
     label: "Read",
     tagline: "Grounded articles — every sentence shows its source",
-    href: "https://academy.opensentience.org/read.html",
+    href: "https://academy.opensentience.org/read",
     status: "prototype",
     tier: "spec",
   },
   academy_practice: {
     label: "Practice",
     tagline: "Real repository tasks, not exercises",
-    href: "https://academy.opensentience.org/practice.html",
+    href: "https://academy.opensentience.org/practice",
     status: "blocked",
     tier: "spec",
   },
   academy_prove: {
     label: "Prove",
     tagline: "Signed, replayable evidence — six proof gates",
-    href: "https://academy.opensentience.org/prove.html",
+    href: "https://academy.opensentience.org/prove",
     status: "prototype",
     tier: "spec",
   },
   academy_refusals: {
     label: "The refusal log",
     tagline: "Pages we declined to write, and what was missing",
-    href: "https://academy.opensentience.org/refusals.html",
+    href: "https://academy.opensentience.org/refusals",
     status: "prototype",
     tier: "spec",
   },
   academy_method: {
     label: "Method",
     tagline: "How Academy is allowed to be wrong",
-    href: "https://academy.opensentience.org/method.html",
+    href: "https://academy.opensentience.org/method",
     status: "prototype",
     tier: "spec",
   },
