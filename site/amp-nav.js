@@ -146,10 +146,59 @@ const LINKS = {
   },
 
   // Academy — the institutional loop: systems that teach & prove cognition.
-  // Workbench is the proof layer, not a peer product: a run here is what turns practice into
-  // a signed, replayable SkillBundle that PRISM can score. Supervisor was a nav peer until
-  // 2026-08-10 and is now a spec doc under Docs — it is a specification, not a surface, and a
-  // category whose every entry is a spec page teaches the visitor nothing.
+  //
+  // Every entry below resolves to a page that exists in the academy repo. The host is the one
+  // assumption here; if Academy lands somewhere other than academy.opensentience.org, these six
+  // hrefs are the only thing to change. Supervisor was a nav peer until 2026-08-10 and is now a
+  // spec doc under Docs — it is a specification, not a surface.
+  //
+  // Statuses are deliberately unflattering. The whole category is a prototype, and a menu that
+  // read "shipped" across a placeholder would be the exact failure the pages themselves refuse.
+  academy_home: {
+    label: "Academy",
+    tagline: "The institutional loop — teach, apply, prove",
+    href: "https://academy.opensentience.org",
+    status: "prototype",
+    tier: "spec",
+  },
+  academy_read: {
+    label: "Read",
+    tagline: "Grounded articles — every sentence shows its source",
+    href: "https://academy.opensentience.org/read.html",
+    status: "prototype",
+    tier: "spec",
+  },
+  academy_practice: {
+    label: "Practice",
+    tagline: "Real repository tasks, not exercises",
+    href: "https://academy.opensentience.org/practice.html",
+    status: "blocked",
+    tier: "spec",
+  },
+  academy_prove: {
+    label: "Prove",
+    tagline: "Signed, replayable evidence — six proof gates",
+    href: "https://academy.opensentience.org/prove.html",
+    status: "prototype",
+    tier: "spec",
+  },
+  academy_refusals: {
+    label: "The refusal log",
+    tagline: "Pages we declined to write, and what was missing",
+    href: "https://academy.opensentience.org/refusals.html",
+    status: "prototype",
+    tier: "spec",
+  },
+  academy_method: {
+    label: "Method",
+    tagline: "How Academy is allowed to be wrong",
+    href: "https://academy.opensentience.org/method.html",
+    status: "prototype",
+    tier: "spec",
+  },
+  // Workbench is the proof layer, not a peer product: a run here is what turns practice into a
+  // signed, replayable SkillBundle that PRISM can score. It is the one thing in this category
+  // that actually runs.
   workbench: {
     label: "Workbench",
     tagline: "Teach once, replay forever — signed SkillBundles, 6 proof gates",
@@ -481,7 +530,12 @@ const PROPERTY_MAP = {
   // The Academy prototype identifies as `academy`. It has no nav item of its own yet — the
   // entry lands when the reading layer serves a page (ACADEMY.md §6, C1) — so it highlights
   // the category without claiming an item inside it.
-  academy: { category: "academy" },
+  academy: { category: "academy", item: "academy_home" },
+  academy_read: { category: "academy", item: "academy_read" },
+  academy_practice: { category: "academy", item: "academy_practice" },
+  academy_prove: { category: "academy", item: "academy_prove" },
+  academy_refusals: { category: "academy", item: "academy_refusals" },
+  academy_method: { category: "academy", item: "academy_method" },
   // Other categories
   ampersand: { category: "protocols", item: "ampersand" },
   ampersandboxdesign: { category: "company", item: "home" },
@@ -589,7 +643,21 @@ const CATEGORIES = [
   {
     id: "academy",
     label: "Academy",
-    items: ["workbench"],
+    mega: true,
+    columns: [
+      {
+        label: "The loop",
+        items: ["academy_home", "academy_method"],
+      },
+      {
+        label: "Three layers",
+        items: ["academy_read", "academy_practice", "academy_prove"],
+      },
+      {
+        label: "Evidence",
+        items: ["workbench", "academy_refusals"],
+      },
+    ],
   },
   {
     id: "docs",
