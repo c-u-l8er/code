@@ -145,20 +145,17 @@ const LINKS = {
     tier: "alpha",
   },
 
-  // Academy — the institutional loop: systems that teach & prove cognition
+  // Academy — the institutional loop: systems that teach & prove cognition.
+  // Workbench is the proof layer, not a peer product: a run here is what turns practice into
+  // a signed, replayable SkillBundle that PRISM can score. Supervisor was a nav peer until
+  // 2026-08-10 and is now a spec doc under Docs — it is a specification, not a surface, and a
+  // category whose every entry is a spec page teaches the visitor nothing.
   workbench: {
     label: "Workbench",
-    tagline: "Skill workshop + 6-gate proof harness",
+    tagline: "Teach once, replay forever — signed SkillBundles, 6 proof gates",
     href: "https://workbench.opensentience.org",
     status: "v0.3.0-alpha",
     tier: "alpha",
-  },
-  supervisor: {
-    label: "Supervisor",
-    tagline: "Teacher loop — invariant curricula",
-    href: "https://opensentience.org/supervisor.html",
-    status: "spec",
-    tier: "spec",
   },
 
   // Protocols — the three-protocol stack ([&] + PULSE + PRISM)
@@ -338,82 +335,82 @@ const LINKS = {
   d_index: {
     label: "[&] Protocol docs",
     tagline: "The protocol documentation hub",
-    href: "https://docs.ampersandboxdesign.com/#/AmpersandBoxDesign/docs/index.md",
+    href: "https://docs.ampersandboxdesign.com/AmpersandBoxDesign/docs/index.md/",
   },
   d_eco: {
     label: "Ecosystem overview",
     tagline: "Every product in the stack, at a glance",
-    href: "https://docs.ampersandboxdesign.com/#/ECOSYSTEM.md",
+    href: "https://docs.ampersandboxdesign.com/ECOSYSTEM.md/",
   },
   d_arch: {
     label: "Architecture",
     tagline: "How the core artifacts fit together",
-    href: "https://docs.ampersandboxdesign.com/#/AmpersandBoxDesign/docs/architecture.md",
+    href: "https://docs.ampersandboxdesign.com/AmpersandBoxDesign/docs/architecture.md/",
   },
   d_compose: {
     label: "Capability composition",
     tagline: "[&] structural composition (CC2)",
-    href: "https://docs.ampersandboxdesign.com/#/AmpersandBoxDesign/docs/CC2-capability-composition.md",
+    href: "https://docs.ampersandboxdesign.com/AmpersandBoxDesign/docs/CC2-capability-composition.md/",
   },
   d_three: {
     label: "The three-protocol stack",
     tagline: "[&] · PULSE · PRISM, working together",
-    href: "https://docs.ampersandboxdesign.com/#/PULSE/docs/THREE_PROTOCOL_STACK.md",
+    href: "https://docs.ampersandboxdesign.com/PULSE/docs/THREE_PROTOCOL_STACK.md/",
   },
   d_memory: {
     label: "Graphonomous — memory",
     tagline: "The continual-learning engine",
-    href: "https://docs.ampersandboxdesign.com/#/graphonomous/docs/spec/README.md",
+    href: "https://docs.ampersandboxdesign.com/graphonomous/docs/spec/README.md/",
   },
   d_prism: {
     label: "PRISM — evaluation",
     tagline: "Benchmark what's broken & what fits",
-    href: "https://docs.ampersandboxdesign.com/#/opensentience.org/docs/spec/OS-009-PRISM-SPECIFICATION.md",
+    href: "https://docs.ampersandboxdesign.com/opensentience.org/docs/spec/OS-009-PRISM-SPECIFICATION.md/",
   },
   d_govern: {
     label: "&govern — governance",
     tagline: "Policy, identity, telemetry, cost",
-    href: "https://docs.ampersandboxdesign.com/#/AmpersandBoxDesign/docs/capabilities/govern.md",
+    href: "https://docs.ampersandboxdesign.com/AmpersandBoxDesign/docs/capabilities/govern.md/",
   },
   d_quickstart: {
     label: "Quickstart",
     tagline: "Run the [&] reference CLI in five minutes",
-    href: "https://docs.ampersandboxdesign.com/#/AmpersandBoxDesign/docs/quickstart.md",
+    href: "https://docs.ampersandboxdesign.com/AmpersandBoxDesign/docs/quickstart.md/",
   },
   d_faq: {
     label: "FAQ",
     tagline: "Straight answers to the common questions",
-    href: "https://docs.ampersandboxdesign.com/#/AmpersandBoxDesign/docs/faq.md",
+    href: "https://docs.ampersandboxdesign.com/AmpersandBoxDesign/docs/faq.md/",
   },
   d_umbrella: {
     label: "The [&] umbrella",
     tagline: "One pipeline: declare → compose → govern → observe",
-    href: "https://docs.ampersandboxdesign.com/#/AmpersandBoxDesign/docs/UMBRELLA.md",
+    href: "https://docs.ampersandboxdesign.com/AmpersandBoxDesign/docs/UMBRELLA.md/",
   },
   d_bendscript: {
     label: "BendScript — documents",
     tagline: "The graph-first doc protocol these pages run on",
-    href: "https://docs.ampersandboxdesign.com/#/bendscript.com/docs/spec/README.md",
+    href: "https://docs.ampersandboxdesign.com/bendscript.com/docs/spec/README.md/",
   },
   d_wrl: {
     label: "WallRiderLang — worlds",
     tagline: "Seal a topology to a SemanticArtifactID",
-    href: "https://docs.ampersandboxdesign.com/#/wrl",
+    href: "https://docs.ampersandboxdesign.com/WRL/",
   },
   d_trvm: {
     label: "TRVM — reduction",
     tagline: "One spec, four packed-word implementations",
-    href: "https://docs.ampersandboxdesign.com/#/trvm",
+    href: "https://docs.ampersandboxdesign.com/TRVM/",
   },
   d_wrlm: {
     label: "WRLM — proposal",
     tagline: "The only statistical layer in the chain",
-    href: "https://docs.ampersandboxdesign.com/#/wrlm",
+    href: "https://docs.ampersandboxdesign.com/TRVM/WRLM_RESEARCH_BRIEF.md/",
   },
   d_traaviis: {
     label: "TRAAVIIS — evidence",
     tagline: "trvs: content-addressed evaluation environments",
-    href: "https://docs.ampersandboxdesign.com/#/traaviis",
+    href: "https://docs.ampersandboxdesign.com/TRAAVIIS/",
   },
   d_code: {
     label: "Code — the console",
@@ -481,7 +478,10 @@ const PROPERTY_MAP = {
   webhost: { category: "compose", item: "webhost" },
   // Academy — institutional loop
   workbench: { category: "academy", item: "workbench" },
-  supervisor: { category: "academy", item: "supervisor" },
+  // The Academy prototype identifies as `academy`. It has no nav item of its own yet — the
+  // entry lands when the reading layer serves a page (ACADEMY.md §6, C1) — so it highlights
+  // the category without claiming an item inside it.
+  academy: { category: "academy" },
   // Other categories
   ampersand: { category: "protocols", item: "ampersand" },
   ampersandboxdesign: { category: "company", item: "home" },
@@ -589,7 +589,7 @@ const CATEGORIES = [
   {
     id: "academy",
     label: "Academy",
-    items: ["workbench", "supervisor"],
+    items: ["workbench"],
   },
   {
     id: "docs",
