@@ -1928,6 +1928,13 @@ pre.diff, .ruling {
 .calb { display: inline-block; margin-left: 10px; }
 .calb i { font-style: normal; color: var(--fg); font-variant-numeric: tabular-nums; }
 .calrow { margin-top: 2px; }
+/* The held-out Δ. Set apart from the table above it because it is a different
+   kind of claim: everything above is the scorer's accuracy measured on data the
+   scorer was shown, and this is the one line measured on data it was not. */
+.cal.split { border-left: 2px solid var(--line); padding-left: 10px; margin-top: -4px; }
+.cal.split .sl { display: block; }
+.calb.dim { opacity: .55; }
+.calb.bad i { color: var(--warn); }
 .barrow { align-items: center; gap: 10px; }
 .barrow input[type=range] { flex: 1; max-width: 260px; }
 .barout { font-variant-numeric: tabular-nums; color: var(--fg); }

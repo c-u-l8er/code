@@ -50,12 +50,36 @@ SKIP_DIRS = {
     "worktrees",       # git checkouts: large, and reproducible from the repos
     "__pycache__",
 }
-SKIP_SUFFIX = (".tmp", ".lock")
+# `.lock` keeps the console lock out. `.token` keeps the console's inbound
+# credential out: a secret with a full revision history is still a secret with
+# a full revision history, and this mirror never forgets anything on purpose.
+SKIP_SUFFIX = (".tmp", ".lock", ".token")
 
 # A board is already 1.3 MB, so the cap is not tight; it exists so that one
 # stray core dump or video in the state directory cannot balloon the file the
 # operator is being told to treat as their backup.
 MAX_BYTES = 16 * 1024 * 1024
+
+class SchemaTooNew(RuntimeError):
+    """The file on disk was written by a build that knows more than this one.
+
+    Refusing is the point. An older reader that opens a newer file does not
+    fail - it runs its own migrations against it, drops a column it does not
+    recognise, and writes a worse version of the file back. That is the shape
+    of loss this whole module exists to prevent, and the only moment it can be
+    stopped is before the first write.
+
+    An OLDER file is not this. Older is a migration, and migrations are what
+    `_connect` already does.
+    """
+
+    def __init__(self, found: int, known: int):
+        self.found, self.known = found, known
+        super().__init__(
+            f"{DB_NAME} says its schema is {found}; this build knows {known}. "
+            "Refusing to open it - a newer file was written by a program this "
+            "one would migrate backwards. Update amp, or move the file aside.")
+
 
 _LOCK = threading.RLock()
 _CONN: sqlite3.Connection | None = None
@@ -87,6 +111,28 @@ def db_path() -> Path | None:
     return None if _ROOT is None else _ROOT / DB_NAME
 
 
+def _stored_schema(c: sqlite3.Connection) -> int | None:
+    """The schema number the FILE claims, or None if it has not said.
+
+    None is two situations kept together on purpose: a database this build is
+    about to create, and one written before `meta` existed. Both are
+    older-or-equal by definition, and only a number GREATER than ours is a
+    refusal - so nothing is lost by not telling them apart.
+
+    A value that is present but not a number is also None. It cannot be
+    compared, and refusing to open the mirror over an unparseable string would
+    take the harness's backup away on the strength of a guess.
+    """
+    try:
+        row = c.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
+    except sqlite3.OperationalError:
+        return None  # no `meta` table: a file this build is about to create
+    try:
+        return int(row[0]) if row else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _connect() -> sqlite3.Connection:
     """Open (creating if needed) the one connection this process uses.
 
@@ -104,6 +150,13 @@ def _connect() -> sqlite3.Connection:
     c = sqlite3.connect(str(_ROOT / DB_NAME), check_same_thread=False, timeout=15)
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
+    # Before anything is created, altered or written. Every line below this
+    # point changes the file, and the whole value of the check is that it
+    # happens while the file is still exactly as the newer build left it.
+    found = _stored_schema(c)
+    if found is not None and found > SCHEMA:
+        c.close()
+        raise SchemaTooNew(found, SCHEMA)
     c.executescript(
         """
         CREATE TABLE IF NOT EXISTS meta(
@@ -147,9 +200,16 @@ def _connect() -> sqlite3.Connection:
     # a database written before this existed still reads.
     if "zip" not in {r[1] for r in c.execute("PRAGMA table_info(revisions)")}:
         c.execute("ALTER TABLE revisions ADD COLUMN zip INTEGER NOT NULL DEFAULT 0")
+    # Written AFTER the migrations above, and updated rather than ignored. The
+    # old `INSERT OR IGNORE` meant the number never moved once the file
+    # existed, so a file migrated by a newer build still claimed the old
+    # schema - and a field that cannot change is a field that cannot disagree,
+    # which is the same as not having it.
+    if found is None or found < SCHEMA:
+        c.execute("INSERT INTO meta(key, value) VALUES('schema', ?) "
+                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(SCHEMA),))
     # A device id, so a future sync can tell this machine's writes from another
     # machine's without asking anyone to name their laptop.
-    c.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('schema', ?)", (str(SCHEMA),))
     c.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('device', ?)", (uuid.uuid4().hex[:12],))
     c.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('created_at', ?)", (_now(),))
     c.commit()
@@ -355,6 +415,27 @@ def backup() -> dict:
 # ------------------------------------------------------------------ reading
 
 
+def stored_schema() -> int | None:
+    """The schema the FILE claims, read without going through `_connect`.
+
+    `_connect` is the thing that refuses a newer file, so asking it would
+    produce the number only in the cases where nobody needs it. Read-only, so
+    a report cannot be the thing that touches a file this build has just
+    decided it must not touch.
+    """
+    p = db_path()
+    if not (p and p.exists()):
+        return None
+    try:
+        c = sqlite3.connect(f"{p.as_uri()}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        return _stored_schema(c)
+    finally:
+        c.close()
+
+
 def status() -> dict:
     p = db_path()
     out = {
@@ -364,7 +445,11 @@ def status() -> dict:
         "root": str(_ROOT) if _ROOT else None,
         "settings": settings(),
         "failures": dict(_FAILS),
-        "schema": SCHEMA,
+        # Two numbers, because one number cannot disagree with itself. The old
+        # `"schema": SCHEMA` reported the running code to a reader who was
+        # being invited to check the file.
+        "schema_code": SCHEMA,
+        "schema_db": stored_schema(),
         "max_mb": MAX_BYTES // (1024 * 1024),
         "excluded": sorted(SKIP_NAMES | SKIP_DIRS),
     }
@@ -399,16 +484,31 @@ def status() -> dict:
 def verify() -> dict:
     """Compare the mirror against the files, and say exactly how they differ.
 
-    Four verdicts, kept apart because they mean four different things:
-      current   the mirror has this file as it is on disk
-      stale     the file changed since it was mirrored (a sweep fixes it)
-      missing   on disk, never mirrored
-      held      in the mirror, no longer on disk - the point of the exercise
+    Five verdicts, kept apart because they mean five different things:
+      current    the mirror has this file as it is on disk
+      stale      the file changed since it was mirrored (a sweep fixes it)
+      missing    on disk, never mirrored (a sweep fixes it)
+      too_large  over the cap, so no sweep will ever mirror it
+      held       in the mirror, no longer on disk - the point of the exercise
+
+    `too_large` exists because without it those files were filed under
+    `missing`, next to a verdict whose docstring says a sweep fixes it. The
+    operator sweeps, the report does not change, and there is nothing in the
+    output to tell them there is no sweep that would. Nothing is broken there;
+    the report was unfalsifiable, which is worse.
     """
     on_disk = {}
+    too_large = []
     for p in _walk():
         rel = _rel(p)
         try:
+            size = p.stat().st_size
+            # Asked of the file, not of the bytes: `_record` refuses by size
+            # without reading, and a verify that reads a 4 GB file into memory
+            # to decide it is too large to store has already lost.
+            if size > MAX_BYTES:
+                too_large.append({"path": rel, "bytes": size, "cap": MAX_BYTES})
+                continue
             on_disk[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
         except OSError:
             continue
@@ -423,11 +523,20 @@ def verify() -> dict:
             stale.append(rel)
         else:
             n_current += 1
+    over = {t["path"] for t in too_large}
     for rel in sorted(rows):
-        if rel not in on_disk:
+        # An oversized file is not `held`. It is on disk; it is the mirror that
+        # cannot hold it, and a path in both lists reads as two different
+        # problems when it is one.
+        if rel not in on_disk and rel not in over:
             held.append(rel)
     return {"ok": True, "current": n_current, "stale": stale,
-            "missing": missing, "held": held,
+            "missing": missing, "too_large": sorted(too_large, key=lambda t: t["path"]),
+            "held": held,
+            # `too_large` is deliberately NOT dirty. Clean means "a sweep has
+            # nothing left to do", and a sweep has nothing it can do about
+            # these - reporting the mirror as permanently dirty over a file it
+            # was designed to refuse teaches the operator to ignore the flag.
             "clean": not stale and not missing}
 
 
@@ -464,6 +573,77 @@ def body(path: str, seq: int | None = None) -> bytes | None:
             row = c.execute("SELECT body, zip FROM revisions WHERE path=? AND seq=?",
                             (path, seq)).fetchone()
     return _unpack(row[0], row[1]) if row else None
+
+
+def restorable(path: str, seq: int | None = None) -> dict:
+    """Which held revision a restore would write back, and why that one.
+
+    Read-only. It chooses and explains; it does not write. The write belongs
+    to `amp`, which owns `save_text` and therefore owns the one durable way
+    anything in this harness reaches disk - a restore that wrote its own bytes
+    would be the one write in the program not subject to D1.
+
+    With no `seq`, the default is the newest revision whose body DIFFERS from
+    what is on disk now. Not simply the newest: the newest is usually the
+    corruption, because the mirror faithfully copied it. "Give me back the
+    last version that was not this" is the request an operator actually has,
+    and making them work out the seq for it at the exact moment their console
+    will not start is the gap this closes.
+
+    Failures are named rather than raised - every one of them is something the
+    operator has to be told, and `die("unknown")` is not that.
+    """
+    out = {"ok": False, "path": path, "seq": None, "body": None,
+           "on_disk": None, "error": None}
+    try:
+        rows = history(path, limit=10_000)
+    except Exception as e:
+        _note_fail(e)
+        out["error"] = f"cannot read the mirror: {e}"
+        return out
+    if not rows:
+        out["error"] = f"nothing is held at {path}"
+        return out
+    out["held"] = len(rows)
+
+    p = (_ROOT / path) if _ROOT else None
+    live = None
+    if p and p.exists():
+        try:
+            live = hashlib.sha256(p.read_bytes()).hexdigest()
+        except OSError as e:
+            out["error"] = f"cannot read {path} on disk: {e}"
+            return out
+    out["on_disk"] = live
+
+    if seq is not None:
+        pick = next((r for r in rows if r["seq"] == seq), None)
+        if pick is None:
+            out["error"] = (f"{path} has no revision {seq} - "
+                            f"held: {', '.join(str(r['seq']) for r in rows[:20])}")
+            return out
+        out["reason"] = "asked for"
+    else:
+        # `rows` is newest-first, so the first differing one IS the newest.
+        pick = next((r for r in rows if r["sha"] != live), None)
+        if pick is None:
+            out["error"] = (f"every held revision of {path} is byte-identical to "
+                            "what is on disk - there is nothing to go back to")
+            return out
+        out["reason"] = ("newest revision that differs from disk"
+                         if live else "newest revision (nothing on disk)")
+
+    b = body(path, pick["seq"])
+    if b is None:
+        # `history` named it and `body` cannot produce it: the two tables
+        # disagree, which is worth saying in those words rather than as a
+        # missing file.
+        out["error"] = f"revision {pick['seq']} of {path} is indexed but has no body"
+        return out
+    out.update({"ok": True, "seq": pick["seq"], "body": b, "sha": pick["sha"],
+                "bytes": pick["bytes"], "written_at": pick["written_at"],
+                "unchanged": pick["sha"] == live})
+    return out
 
 
 def changes(since: int = 0, limit: int = 500) -> dict:

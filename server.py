@@ -19,6 +19,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import secrets
 import socket
 import sys
 import tempfile
@@ -42,6 +43,107 @@ ROOT = amp.ROOT  # workspace holding the lane worktrees
 
 HOST = "127.0.0.1"
 PORT = 8787
+
+# --------------------------------------------------------------- inbound auth
+#
+# Binding to loopback stops a REMOTE attacker. It does not stop a PAGE, and a
+# page is the thing to stop: downstream of these routes are three `shell=True`
+# call sites, so a request that arrives is a command that runs. Three checks,
+# applied in this order, because they stop three different attacks and the
+# cheapest one stops the worst:
+#
+#   1. `Host`. The only defence against DNS REBINDING, where the attacker's
+#      page is served from a name whose DNS re-answers as 127.0.0.1. The
+#      browser then believes that name IS this server, so the page is
+#      SAME-ORIGIN: it reads every response, it reads the token straight out of
+#      the index.html it is entitled to fetch, and it sends exactly the
+#      `Origin` and `Sec-Fetch-Site` a real console sends. Every other check
+#      here is carried along by that attack. `Host` is not, because the browser
+#      writes it from the name in the address bar, so it says the attacker's
+#      name. This is why the check also covers GET and covers `/`: serving the
+#      page at all to a rebound origin is what hands over everything else.
+#   2. `Sec-Fetch-Site`. Sent by browsers to loopback (it counts as a
+#      trustworthy origin) and NOT settable by page JavaScript, which is what
+#      makes it worth more than the token against a browser. `Origin` is the
+#      fallback for a client that sends neither.
+#   3. The token. Last, not first: it is what covers a client that is not a
+#      browser and sends no fetch metadata at all, and it is the layer
+#      rebinding defeats.
+#
+# What is deliberately NOT here: a password, a login, or accounts. The
+# requirement is "a web page cannot drive it and cannot read it", not "identify
+# the human". A local process running as this user can already read the token,
+# the OpenRouter key and the whole state directory, so nothing here is aimed at
+# one.
+# The file name and the header name are `amp`'s, not this module's. The server
+# writes the file and the prompts in `amp` tell a worker to read it; two
+# spellings of one name is the arrangement where the reader and the writer
+# disagree about where the credential is and nothing says so.
+#
+# `none` is a user typing the URL or opening a bookmark - no initiator. A page
+# cannot manufacture it. `same-site` is excluded on purpose: nothing here is
+# served from a sibling subdomain, so a `same-site` request is not us.
+_FETCH_SITE_OK = ("same-origin", "none")
+
+# Set once the socket is bound, because the port is not known until then and
+# `Host` includes it.
+_ALLOWED_HOSTS: set[str] = set()
+_TOKEN = ""
+
+
+def read_console_token() -> str:
+    """The running console's token, for a client in another process.
+
+    Absent is not an error here: the CLI and the harness's own callers ask for
+    this before they know whether a console is up, and "" simply fails the
+    header check with the ordinary refusal.
+    """
+    try:
+        return amp.console_token_path().read_text().strip()
+    except OSError:
+        return ""
+
+
+def mint_console_token() -> str:
+    """A fresh token per console, written 0600 before the socket opens.
+
+    Fresh rather than persistent so that a token seen once cannot drive the
+    next console, and because there is nothing to migrate: the page is served
+    the current one on load. The `.token` suffix is what keeps it out of the
+    mirror (`store.SKIP_SUFFIX`) - a secret with a full revision history is a
+    secret with a full revision history.
+    """
+    global _TOKEN
+    _TOKEN = secrets.token_urlsafe(32)
+    p = amp.console_token_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # Written the way every other durable file here is written, and 0600 from
+    # the moment it exists rather than chmod-ed after: a world-readable window,
+    # however short, is the whole of the exposure this file has.
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(_TOKEN + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+    amp._fsync_dir(p.parent)
+    return _TOKEN
+
+
+def set_allowed_hosts(host: str, port: int) -> None:
+    """The names this console will answer to, and no others.
+
+    Both spellings of loopback plus the bare name, since a browser omits the
+    port only for 80. A console explicitly bound to some other address is
+    added as given - binding elsewhere is the operator saying so, and refusing
+    the address they chose would be a refusal they cannot act on.
+    """
+    _ALLOWED_HOSTS.clear()
+    for h in {"127.0.0.1", "localhost", "[::1]", host}:
+        _ALLOWED_HOSTS.add(f"{h}:{port}")
+        if port == 80:
+            _ALLOWED_HOSTS.add(h)
 
 # Where the orchestrator reaches this console. It drives the board over the
 # same HTTP API the browser uses, so every guard behind those endpoints - the
@@ -361,46 +463,56 @@ def rulings_payload() -> list[dict]:
 def do_poll(lane_filter: str | None) -> dict:
     """Refresh codex lanes. Claude lanes settle themselves as their threads finish."""
     cfg = amp.config()
-    b = amp.board()
     names = [lane_filter] if lane_filter else sorted(cfg["lanes"])
     names = [n for n in names if amp.lane_backend(cfg["lanes"].get(n, {})) == "codex"]
     if names and not amp.codex_logged_in():
         return {"ok": False, "error": "codex is not logged in. Run: codex login"}
-    seen, errors = 0, {}
+    seen, errors, remote = 0, {}, {}
     for name in names:
         lane = cfg["lanes"].get(name)
         if not lane or not lane.get("env_id"):
             continue
         try:
             tasks = amp.codex_list(env_id=lane["env_id"])
-            b.setdefault("remote", {})[name] = tasks
+            remote[name] = tasks
             seen += len(tasks)
         except SystemExit as e:
             errors[name] = str(e) or "codex cloud list failed"
-    b["polled_at"] = amp.now()
-    amp.save_json(amp.BOARD_PATH, b)
-    return {"ok": True, "tasks_seen": seen, "errors": errors, "polled_at": b["polled_at"]}
+    # The board is read AFTER the network, under the lock. Held across the
+    # poll it would write back a board from before every worker that finished
+    # while this ran - see `amp.record_remote`.
+    polled_at = amp.record_remote(remote)
+    return {"ok": True, "tasks_seen": seen, "errors": errors, "polled_at": polled_at}
 
 
 def _run_claude_bg(name: str, rec: dict):
-    """Workers take minutes; the browser polls /api/state for the settled record."""
+    """Workers take minutes; the browser polls /api/state for the settled record.
+
+    `SystemExit` is named alongside `Exception` in all three handlers because
+    `amp.die` raises one - `amp.Died` subclasses it to keep the reason attached -
+    and a refusal from anywhere down these call paths is an ordinary outcome
+    here, not a reason to stop. It would not be caught otherwise: `SystemExit`
+    is a `BaseException`, and `threading.excepthook` discards it without a word,
+    so the record below would sit on `running` forever and the slot this worker
+    just freed would never be handed to whoever was queued for it.
+    """
     lock = lane_lock(name)
     with lock:
         try:
             amp.run_claude_task(name, rec)
-        except Exception as e:  # never leave a record stuck on `running`
+        except (Exception, SystemExit) as e:  # never leave a record stuck on `running`
             traceback.print_exc()
             amp.update_task(name, rec["task_id"], {"status": "failed", "error": str(e)})
     try:
         _settle(name, rec)
-    except Exception:
+    except (Exception, SystemExit):
         # An escalation that fails must not rewrite a worker's real outcome.
         traceback.print_exc()
     # The slot is free now. Whoever was waiting on it is started here, by the
     # worker that freed it - there is no other moment when anyone is looking.
     try:
         _drain_queue()
-    except Exception:
+    except (Exception, SystemExit):
         traceback.print_exc()
 
 
@@ -650,22 +762,19 @@ def do_dispatch(body: dict, *, queue: bool = True) -> dict:
         out = (p.stdout + p.stderr).strip()
         if p.returncode != 0:
             return {"ok": False, "error": out or f"codex exited {p.returncode}"}
-        b = amp.board()
-        b["tasks"].setdefault(name, [])
-        b["tasks"][name].insert(
-            0,
-            {
-                "backend": "codex",
-                "dispatched_at": amp.now(),
-                "prompt": prompt,
-                "branch": branch,
-                "attempts": attempts,
-                "env_id": env_id,
-                "submit_output": out,
-                "status": "submitted",
-            },
-        )
-        amp.save_json(amp.BOARD_PATH, b)
+        # `record_task`, not a second copy of it: this one read and wrote the
+        # whole board without the board lock, under a lock that only excludes
+        # other dispatches.
+        amp.record_task(name, {
+            "backend": "codex",
+            "dispatched_at": amp.now(),
+            "prompt": prompt,
+            "branch": branch,
+            "attempts": attempts,
+            "env_id": env_id,
+            "submit_output": out,
+            "status": "submitted",
+        })
     return {"ok": True, "output": out}
 
 
@@ -3120,12 +3229,23 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _static(self, rel: str):
-        # confine to this directory
+        # Confined to this directory, by PATH and not by prefix. `startswith`
+        # on the string was true of any sibling whose name merely begins with
+        # this one - `/api/../code-backup/x` resolves outside the tree and
+        # passes a prefix test, which is the whole of the check it was.
         target = (HERE / rel).resolve()
-        if not str(target).startswith(str(HERE)) or not target.is_file():
+        if not target.is_relative_to(HERE) or not target.is_file():
             return self._send(404, {"error": "not found"})
         ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-        self._send(200, target.read_bytes(), ctype)
+        body = target.read_bytes()
+        if target.name == "index.html":
+            # The token reaches the page here and only here, so that no route
+            # hands it out and it is never in a file on disk that a build step
+            # could commit. The page has already passed the Host check to get
+            # this far, which is the check that decides whether it should have
+            # it at all.
+            body = body.replace(b"__AMP_TOKEN__", _TOKEN.encode())
+        self._send(200, body, ctype)
 
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
@@ -3136,10 +3256,53 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
+    def _refuse(self, path: str) -> tuple[int, str] | None:
+        """Why this request is not allowed in, or None. See the note by HOST.
+
+        Returns rather than sends, so that one function decides and the two
+        verbs cannot drift apart - the same reason `merge_blockers` is one
+        function with three callers. A gate that each handler re-implements is
+        a gate a handler forgets.
+        """
+        # 1. Host. Before anything else and for every path including `/`,
+        #    because under rebinding the page is same-origin and everything
+        #    below this line is something the attacker also has.
+        host = (self.headers.get("Host") or "").strip().lower()
+        if _ALLOWED_HOSTS and host not in _ALLOWED_HOSTS:
+            return (403, f"this console answers to {sorted(_ALLOWED_HOSTS)[0]}, "
+                         f"not {host or '(no Host header)'}")
+
+        # Static assets are the delivery path for the token, so they stop here.
+        # They are files on disk next to this one; there is nothing behind them
+        # to drive, and a page that has got past the Host check to read app.css
+        # has read a file it could have read from the repository anyway.
+        if not path.startswith("/api/"):
+            return None
+
+        # 2. Fetch metadata, with Origin as the fallback. Neither is settable
+        #    by page JavaScript, which is the whole point; an absent pair is a
+        #    non-browser client and is left to the token below.
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site and site not in _FETCH_SITE_OK:
+            return (403, f"cross-site request refused (Sec-Fetch-Site: {site})")
+        origin = (self.headers.get("Origin") or "").strip().lower()
+        if origin and urlparse(origin).netloc not in _ALLOWED_HOSTS:
+            return (403, f"cross-origin request refused (Origin: {origin})")
+
+        # 3. The token.
+        if _TOKEN and not secrets.compare_digest(
+                (self.headers.get(amp.TOKEN_HEADER) or "").strip(), _TOKEN):
+            return (401, f"no {amp.TOKEN_HEADER} - the console mints one into "
+                         f"{amp.console_token_path()} and the page is served it on load")
+        return None
+
     def do_GET(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         try:
+            stop = self._refuse(u.path)
+            if stop:
+                return self._send(stop[0], {"error": stop[1]})
             if u.path in ("/", "/index.html"):
                 return self._static("index.html")
             if u.path == "/api/state":
@@ -3303,6 +3466,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
         try:
+            stop = self._refuse(u.path)
+            if stop:
+                # Read the body first even when refusing. The client has
+                # already sent it, and leaving it in the socket makes the next
+                # request on a kept-alive connection start mid-JSON, which
+                # surfaces as an unrelated parse error somewhere else.
+                self._body()
+                return self._send(stop[0], {"error": stop[1]})
             body = self._body()
             if u.path == "/api/poll":
                 return self._send(200, do_poll(body.get("lane")))
@@ -3635,6 +3806,11 @@ def main(argv=None):
     # start at all. Taken after `free_port` only so the refusal can say which
     # port THIS console would have used.
     lock = take_console_lock(port, a.host)
+    # Before the socket, so there is no window in which a request could be
+    # served without a token to check it against. The port has to be settled
+    # first because `Host` carries it.
+    set_allowed_hosts(a.host, port)
+    mint_console_token()
     srv = ThreadingHTTPServer((a.host, port), Handler)
     url = f"http://{a.host}:{port}"
     BASE_URL = url
@@ -3701,9 +3877,18 @@ def main(argv=None):
     if store.enabled():
         r = store.backup()
         s = store.status()
-        print(f"  database {s['path']} - {s['docs']} documents, "
-              f"{s['revisions']} revisions ({r['written']} mirrored just now)")
-        threading.Thread(target=_mirror_ticker, daemon=True).start()
+        if not s.get("ok"):
+            # The JSON files are the authoritative ones, so a mirror that
+            # cannot be opened is a thing to say out loud and carry on past -
+            # not a reason to refuse to start the console. The sweep is left
+            # off because it would fail every ten minutes and the only fix is
+            # off this machine's hot path anyway.
+            print(f"  ! the database is not usable, and is not being written: "
+                  f"{s.get('error') or 'cannot read it'}")
+        else:
+            print(f"  database {s['path']} - {s['docs']} documents, "
+                  f"{s['revisions']} revisions ({r['written']} mirrored just now)")
+            threading.Thread(target=_mirror_ticker, daemon=True).start()
     else:
         print("  ! the SQLite mirror is off - only the JSON files are being kept")
     print(f"amp console -> {url}")
@@ -3723,6 +3908,14 @@ def main(argv=None):
         # A preview's dev server is our child and holds a lane's worktree open.
         # Left behind, it survives every restart of this file and accumulates.
         preview.stop_all()
+        # The token names a console that is gone. Leaving it would hand the
+        # next reader a credential for nothing, and the next console mints its
+        # own anyway. Best effort - an orphaned token authenticates against no
+        # listener.
+        try:
+            amp.console_token_path().unlink()
+        except OSError:
+            pass
         # Last, so a crash in the line above still hands the directory back.
         # A lock left behind is recoverable - the next console reads the pid,
         # finds nothing, and says it cleared a stale one.

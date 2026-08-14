@@ -142,6 +142,22 @@ class _StaticHandler(SimpleHTTPRequestHandler):
         super().__init__(*a, **kw)
 
     def send_head(self):
+        # The same Host allow-list the console runs, for the same reason and by
+        # the same argument: under DNS rebinding a page served from the
+        # attacker's name is same-origin with this port, and what it reads is
+        # whatever a lane just built - a worktree of the operator's source. It
+        # runs in `send_head` because that is the one place GET and HEAD both
+        # pass through. Returning None is how this handler declines: the caller
+        # writes no body.
+        #
+        # Only the `static` mode is ours to guard. A `command` preview is a
+        # foreign dev server on its own socket; this process does not see its
+        # requests and cannot speak for it.
+        allowed = getattr(self.preview, "hosts", None)
+        host = (self.headers.get("Host") or "").strip().lower()
+        if allowed and host not in allowed:
+            self.send_error(403, "wrong Host")
+            return None
         # A 304 is the correct answer and the wrong behaviour here: you clicked
         # reload to see the edit a worker just made, not to be told nothing has
         # changed since you first opened it.
@@ -175,6 +191,9 @@ class Preview:
         self.log: deque[str] = deque(maxlen=500)
         self.state = "starting"      # starting | running | failed | stopped
         self.url: str | None = None
+        # Empty until a static preview binds a port; a command preview never
+        # fills it, and an empty set is the handler's "not mine to judge".
+        self.hosts: set[str] = set()
         self.error: str | None = None
         self.started_at = time.time()
         self.proc: subprocess.Popen | None = None
@@ -194,6 +213,9 @@ class Preview:
 
     def _start_static(self):
         port = free_port()
+        # Set before the socket opens, so there is no window in which the
+        # handler has no allow-list to consult.
+        self.hosts = {f"{h}:{port}" for h in ("127.0.0.1", "localhost", "[::1]")}
         handler = functools.partial(_StaticHandler, directory=str(self.root), preview=self)
         self.httpd = ThreadingHTTPServer((HOST, port), handler)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()

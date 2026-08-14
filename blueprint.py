@@ -2218,7 +2218,6 @@ def _agents_workspaces(_arg: dict) -> dict:
     v = ports_view()
     els: list[dict] = []
     panels: dict[str, dict] = {}
-    reg = amp.workspaces()
 
     for w in v["workspaces"]:
         nid = "P:" + w["slug"]

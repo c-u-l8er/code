@@ -1,0 +1,81 @@
+# amp is run, not installed - `python3 server.py`, no build step, no
+# dependencies outside the standard library. This file is here for the tools
+# that look for it, and it deliberately declares no package: adding one would
+# invite `pip install -e .`, and an installed copy of `amp` importable from
+# anywhere is a second `amp` that can be pointed at the wrong `.amp`.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# No `addopts`, deliberately, and this is the interesting line in the file.
+# It held `-q --no-header -p no:cacheprovider`, which is what the harnesses in
+# `docs/HARDENING.md` §0.3 already pass on the command line - and pytest ADDS
+# the two rather than noticing they agree. Two `-q` is `-qq`, which still runs
+# every test and still prints the progress dots but drops the final
+# `232 passed in 54s` line. The revert prover reads that line, so a config
+# whose whole content was a duplicate of the defaults quietly turned a proof
+# into a crash. Flags belong to whoever is running it.
+
+[tool.ruff]
+line-length = 90
+# 3.12, and this was measured rather than chosen. It said `py311` first, and
+# ruff answered with two `invalid-syntax` errors: `amp.py:19478` and
+# `server.py:2723` both put a line break inside an f-string replacement field,
+# which is PEP 701 and does not parse before 3.12. So the harness has required
+# 3.12 for some time and nothing anywhere said so - no `requires-python`, no
+# README line, no check. There is deliberately no runtime guard either: the
+# SyntaxError is raised when the module is COMPILED, before its first line
+# runs, so a version check inside `amp.py` or `server.py` could never reach the
+# operator. It can only be declared, and now it is.
+target-version = "py312"
+
+[tool.ruff.lint]
+# Deliberately narrow. `F` is undefined and unused names - the class of thing
+# that is simply wrong - and `E9` is a syntax or IO error. A style opinion
+# imposed on 37,000 lines written to a different one produces thousands of
+# findings nobody reads, which is how a linter stops being consulted.
+select = ["F", "E9"]
+
+# The remaining 21 findings after the F821 decision below were all F541, and all
+# 21 were read rather than counted. Every one is the same idiom: a segment of a
+# multi-line implicit concatenation that happens not to interpolate, sitting
+# beside siblings that do -
+#
+#     + (f"\n  - claims: {d['claim']}" if d.get("claim") else "")
+#     + f"\n  - reviews have judged it at: "
+#     + (f"`{rungs[n]}`" if rungs.get(n) else "no rung ever recorded")
+#
+# Stripping the prefix from the middle line makes that expression harder to read,
+# not easier, and none of the 21 was a forgotten `{}`. F541 does catch that
+# mistake, and turning the rule off gives it up; the trade is 21 lines of noise
+# in every future run against a bug that has not once occurred in 37,000 lines.
+ignore = ["F541"]
+
+[tool.ruff.lint.per-file-ignores]
+# 116 of ruff's 133 findings were one thing: `F821 Undefined name` at every use
+# of a name `_bind_state` writes into `globals()`. Declaring them (`amp.py`, just
+# above `_bind_state`) satisfied mypy and silenced all 106 of its `name-defined`
+# errors. It did NOT satisfy ruff, and that was measured rather than assumed - a
+# nine-line probe file with `DECLARED: Path` bound only through `globals()` still
+# draws `F821 Undefined name `DECLARED``, next to an genuinely undeclared name
+# drawing the identical error. Ruff does not treat an annotation-only statement
+# as a binding; mypy does.
+#
+# So the rule is turned off here, and the reason this is not a loss is that the
+# check does not go away: `name-defined` is mypy's F821, mypy runs over `amp.py`,
+# and mypy reads the declarations correctly. A real typo is still caught, by the
+# tool that can tell the difference. Leaving 116 explained errors in the output
+# would cost the other 17, which is how a linter stops being consulted.
+#
+# Scoped to this file on purpose. Every one of the 116 was in `amp.py`; nothing
+# else in the tree binds a global this way, and if something starts, it should
+# have to say so here.
+"amp.py" = ["F821"]
+
+[tool.mypy]
+python_version = "3.12"
+# Non-strict on purpose. This code is annotated in places and not in others,
+# so `disallow_untyped_defs` would report the absence of annotations rather
+# than any disagreement between the ones that are there.
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true

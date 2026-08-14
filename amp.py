@@ -40,8 +40,10 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NoReturn
 
 import store
 
@@ -50,7 +52,15 @@ ROOT = Path(os.environ.get("AMP_ROOT") or HERE.parent)   # workspace holding the
 
 # State lives OUTSIDE this repo so the program stays shareable and no key,
 # board, packet, or ruling is ever committed. Override with AMP_HOME.
-STATE_ROOT = Path(os.environ.get("AMP_HOME") or (ROOT / ".amp"))
+#
+# Resolved, and that is not tidying. A relative `AMP_HOME` used to reach
+# `store.stored_schema`, which builds a `file:` URI to open the mirror read-only,
+# and `Path.as_uri()` refuses a relative path - so the console died at startup on
+# `ValueError: relative paths can't be expressed as file URIs`, a sentence with
+# nothing in it about the setting that caused it. A relative path is also a
+# different directory to every worker, since each one runs in its own worktree:
+# the setting would have meant several state directories rather than one.
+STATE_ROOT = Path(os.environ.get("AMP_HOME") or (ROOT / ".amp")).resolve()
 
 # Two things live at the root and are deliberately NOT per-workspace:
 #
@@ -62,6 +72,36 @@ STATE_ROOT = Path(os.environ.get("AMP_HOME") or (ROOT / ".amp"))
 #   the workspace registry itself, for the obvious reason.
 SECRETS_PATH = STATE_ROOT / ".secrets.json"
 WORKSPACES_PATH = STATE_ROOT / ".workspaces.json"
+
+# The console's inbound credential, minted per run by `server.mint_console_token`
+# and read by every client that is not the page. Named here, next to the state
+# root, so that ONE place decides where it lives: the server writes it, the
+# prompts below tell a worker to read it, and the `.token` suffix keeps it out
+# of the mirror (`store.SKIP_SUFFIX`).
+CONSOLE_TOKEN_FILE = ".console.token"
+TOKEN_HEADER = "X-Amp-Token"
+
+
+def console_token_path() -> Path:
+    return STATE_ROOT / CONSOLE_TOKEN_FILE
+
+
+def with_console_auth(text: str) -> str:
+    """Add the console's token header to every curl in a prompt.
+
+    Done by rewriting the text rather than by writing the header into each of
+    the twenty-odd curl lines by hand, because the failure mode of the second
+    is one line added later without it - and that line is a 401 the model will
+    try to reason its way around.
+
+    The header carries `$(cat <path>)`, never the token itself. A prompt is
+    sent to a model provider and is written into the worker transcript on
+    disk; a local credential should be in neither. The shell expands it on this
+    machine, and if there is no console the file is absent, the header is empty
+    and the call gets the ordinary refusal instead of a confusing success.
+    """
+    return text.replace(
+        "curl -s ", f'curl -s -H "{TOKEN_HEADER}: $(cat {console_token_path()})" ')
 
 # Everything else is workspace state, and this table is the only place that
 # says so. `_bind_state` builds every one of these names from a base directory,
@@ -99,6 +139,54 @@ _STATE_LAYOUT = (
     ("BLUEPRINT_PATH", ".blueprint.json"),
     ("OUTBOX_PATH", ".outbox.json"),
 )
+
+
+# The same names again, as declarations. Nothing here binds anything - these are
+# annotations only, so no assignment happens and `_bind_state` remains the single
+# place a value is set. What they buy is that the names now EXIST to a reader.
+#
+# Before this block, `CONFIG_PATH` appeared 36 times in this file and zero times
+# on the left of an `=`. Grep found no definition, go-to-definition found no
+# definition, ruff reported `F821 Undefined name` at every use and mypy reported
+# `Name "CONFIG_PATH" is not defined`; `server.py` was told `Module has no
+# attribute "CONFIG_PATH"`. All of that was wrong, and the way it was wrong is
+# the problem: every one of those readers concluded the harness was full of
+# NameErrors. Two of them were tools and could be ignored. The third was a person
+# reading the file, and there is no reason to think they will conclude otherwise.
+#
+# The cost is that this list and `_STATE_LAYOUT` must agree, which is a real
+# hazard and not a theoretical one - so it is checked, by
+# `tests/test_derived.py::test_every_bound_state_name_is_declared`, rather than
+# left to whoever adds the twenty-eighth line.
+STATE: Path
+CONFIG_PATH: Path
+BOARD_PATH: Path
+CHAT_PATH: Path
+ORCH_PATH: Path
+BRIEF_PATH: Path
+QUEUE_PATH: Path
+DOCTRINE_PIN_PATH: Path
+FINDINGS_PATH: Path
+IDEAS_PATH: Path
+OBLIGATIONS_PATH: Path
+DIRECTION_PATH: Path
+DEPLOY_PATH: Path
+HANDOFF_PATH: Path
+SUPERVISOR_PATH: Path
+REPORT_PATH: Path
+REPORT_DIR: Path
+PACKET_DIR: Path
+RULING_DIR: Path
+WORKTREE_DIR: Path
+CONSULT_DIR: Path
+GOAL_DIR: Path
+SPECRUN_DIR: Path
+SPECRATE_PATH: Path
+SPECPLAN_PATH: Path
+SPECAUTO_PATH: Path
+HANDAUTO_PATH: Path
+BLUEPRINT_PATH: Path
+OUTBOX_PATH: Path
 
 
 def _bind_state(base: Path) -> None:
@@ -275,7 +363,16 @@ class Died(SystemExit):
         return self.msg
 
 
-def die(msg: str, code: int = 1):
+def die(msg: str, code: int = 1) -> NoReturn:
+    """Say why, and stop.
+
+    `NoReturn` is not decoration. `die` is how nearly every guard in this file
+    ends, and without it a reader that follows types believes execution can
+    continue past the guard - so `if not c: die(...)` narrows nothing, and the
+    line after it is checked as though `c` could still be `None`. That is most
+    of what mypy had to say about this file, and the noise hid the places where
+    the guard really is missing.
+    """
     print(f"amp: {msg}", file=sys.stderr)
     raise Died(msg, code)
 
@@ -296,8 +393,9 @@ def load_json(path: Path, default):
             pass
         die(f"{path.name} is not valid JSON: {e}\n"
             f"      every earlier version of it is in the mirror:\n"
-            f"        amp db history {rel}\n"
-            f"        amp db show {rel} --seq <n> > {path}")
+            f"        amp db restore {rel}      # the newest one that differs\n"
+            f"        amp db history {rel}      # or pick: --seq <n>\n"
+            f"        amp db show {rel} --seq <n>")
 
 
 def _fsync_dir(d: Path) -> None:
@@ -320,28 +418,201 @@ def _fsync_dir(d: Path) -> None:
         os.close(fd)
 
 
-def save_json(path: Path, data):
+# --------------------------------------------- one writer at a time, across processes
+#
+# A state document here is always written WHOLE, from a dict that was read a
+# moment earlier. Two writers, one read each, and the earlier write is gone -
+# not corrupted, gone, which is the failure that leaves nothing behind to find.
+#
+# The locks further down this file were `threading.Lock`, which is exactly half
+# of the interlock those documents need. The console runs workers on background
+# threads, so the in-process half is real and was never wrong. The other half is
+# `amp <cmd>` on a terminal, writing the same documents while a console runs.
+#
+# `store.py` has been on the right side of this the whole time: `journal_mode=
+# WAL` with a timeout is sqlite's own cross-process interlock. The mirror was
+# never the problem. The mirror faithfully records both halves of a lost update.
+#
+# What is NOT built here is compare-and-swap. That is a decision, written up in
+# `docs/HARDENING.md`: CAS answers "did this change under me", which is the
+# question an editor asks and needs a retry loop and a merge policy to act on.
+# Every read-modify-write in this file already declares itself a critical
+# section by taking one of these locks, and the answer it wants is "nobody else
+# is in here" - which is stronger, and which no caller has to remember to check.
+
+_LOCK_WAIT = 20.0
+
+_DOC_RLOCKS: dict[str, threading.RLock] = {}
+_DOC_HELD: dict[str, list] = {}          # path -> [fd, depth]
+_DOC_GUARD = threading.Lock()
+
+
+class Busy(RuntimeError):
+    """A state document was held by somebody else for an unreasonable time."""
+
+
+def _doc_rlock(key: str) -> threading.RLock:
+    with _DOC_GUARD:
+        rl = _DOC_RLOCKS.get(key)
+        if rl is None:
+            rl = _DOC_RLOCKS[key] = threading.RLock()
+        return rl
+
+
+def _flock_wait(fd: int, timeout: float, lp: Path) -> None:
+    """Take the lock, or say who to go and look at.
+
+    Polled rather than blocking, because a blocking `flock` cannot be given a
+    deadline without signals, and 20Hz against a lock held for a millisecond
+    costs nothing. A lock that waits forever turns one stuck process into a
+    hung machine, and a hang is the failure this file spends the most words
+    trying not to produce.
+    """
+    end = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if time.monotonic() >= end:
+                raise Busy(
+                    f"another amp process has held {lp.stem} for {timeout:.0f}s. "
+                    f"Nothing was written. If no other amp is running, the file "
+                    f"holding it open is {lp}.")
+            time.sleep(0.05)
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path, timeout: float = _LOCK_WAIT):
+    """Hold one state document against every other process, and every thread.
+
+    Re-entrant on purpose. `flock` is per open file description, so a second
+    `flock` on a second descriptor blocks even inside ONE process - a
+    self-deadlock, and an invisible one, because producing it takes two nested
+    writers to the same document. The `RLock` is what makes that nesting safe
+    and what keeps other threads out; the `flock` is what keeps other processes
+    out; the depth count is what stops an inner frame unlocking the outer one's
+    file on the way past.
+    """
+    key = str(path)
+    rl = _doc_rlock(key)
+    rl.acquire()
+    try:
+        held = _DOC_HELD.get(key)
+        if held is None:
+            # `.lock` is in `store.SKIP_SUFFIX`, so these are not mirrored.
+            # Renaming the suffix means changing that too.
+            lp = path.with_suffix(path.suffix + ".lock")
+            lp.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lp, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                _flock_wait(fd, timeout, lp)
+            except BaseException:
+                os.close(fd)
+                raise
+            held = _DOC_HELD[key] = [fd, 0]
+        held[1] += 1
+        try:
+            yield
+        finally:
+            held[1] -= 1
+            if held[1] == 0:
+                _DOC_HELD.pop(key, None)
+                try:
+                    fcntl.flock(held[0], fcntl.LOCK_UN)
+                finally:
+                    os.close(held[0])
+    finally:
+        rl.release()
+
+
+class _DocLock:
+    """`with _BOARD_LOCK:` - unchanged at every call site, wider than it was.
+
+    Holds the NAME of the path rather than the path, because `_bind_state`
+    rebinds these when the workspace switches. A lock that captured the `Path`
+    at import would go on excluding writers to the workspace you left while the
+    writes went to the one you are in, which is worse than not locking: it
+    looks like it is working.
+    """
+
+    def __init__(self, name: str):
+        self._name = name
+        self._tl = threading.local()
+
+    @property
+    def path(self) -> Path:
+        return globals()[self._name]
+
+    def __enter__(self):
+        cm = _file_lock(self.path)
+        cm.__enter__()
+        stack = getattr(self._tl, "stack", None)
+        if stack is None:
+            stack = self._tl.stack = []
+        stack.append(cm)
+        return self
+
+    def __exit__(self, *exc):
+        return self._tl.stack.pop().__exit__(*exc)
+
+
+def save_text(path: Path, text: str):
+    """Write a text file the way every state file here is written.
+
+    The one write path. `save_json` is this function plus a serializer, and
+    every `.md` and `.html` the harness produces goes through it too, because
+    "the durable way to write a file" was a property of `save_json` and
+    therefore a property of JSON, which is not a distinction a filesystem
+    makes. Four writers had missed it: a ruling, a doctrine, and both halves of
+    a report.
+
+    Flushed and fsynced BEFORE the rename, never after. `replace` is atomic
+    against another READER - it is not a claim about power loss, and the two
+    get conflated because the word is the same. The rename is a metadata
+    change that can reach the disk while the bytes it now points at have not,
+    and what that leaves behind is a zero-length `board.json` that `load_json`
+    can only meet with `die`. The substrate this harness governs already writes
+    this way (`TRVM/forge/wrl_store.py`); the harness did not.
+
+    The temp file is a SIBLING, deliberately. A rename is only atomic within
+    one filesystem; a temp file somewhere else turns `replace` into a copy and
+    a delete, which is the failure this function exists to prevent.
+
+    It is also PER-WRITER. It was `<name>.tmp` flat, one name shared by every
+    writer of a document, which is safe for exactly as long as there is only
+    ever one. Two of them open that one file, interleave their bytes into it,
+    and then both rename it - so the document ends up holding a mixture of two
+    writes that is not either of them and may still parse. The version of this
+    that raises `FileNotFoundError` on the second rename is the LUCKY ordering,
+    and it is the one that gets noticed. `config.json` has twelve writers and
+    no lock, so this is not hypothetical there.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(data, indent=2, sort_keys=True) + "\n"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    # Flushed and fsynced BEFORE the rename, never after. `replace` is atomic
-    # against another READER - it is not a claim about power loss, and the two
-    # get conflated because the word is the same. The rename is a metadata
-    # change that can reach the disk while the bytes it now points at have not,
-    # and what that leaves behind is a zero-length `board.json` that
-    # `load_json` can only meet with `die`. The substrate this harness governs
-    # already writes this way (`TRVM/forge/wrl_store.py`); the harness did not.
-    with open(tmp, "w") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.replace(path)
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident():x}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+    except BaseException:
+        # A unique name is litter where a shared one was self-cleaning: a write
+        # that dies before the rename used to leave one stale `.tmp` and now
+        # leaves one per attempt. Unlinked here rather than swept later,
+        # because a sweep cannot tell a dead writer's file from a live one's.
+        tmp.unlink(missing_ok=True)
+        raise
     _fsync_dir(path.parent)
     # The second copy, taken from the bytes we just wrote rather than by
     # reading the file back - so the mirror holds this write even if the next
     # one lands a millisecond later. It cannot raise and the file above is
     # already durable, so a broken mirror costs history, never state.
     store.record(path, text)
+
+
+def save_json(path: Path, data):
+    save_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
 def config() -> dict:
@@ -570,6 +841,15 @@ def switch_blocked() -> str | None:
                 + (f" in {', '.join(where)}" if where else ""))
     if orch_busy():
         return "the orchestrator is mid-turn"
+    # A consult is neither a worker nor the orchestrator, so it used to be waved
+    # straight through. It is the longest-running thing the console does - an
+    # architect call can be out on the wire for minutes - and when it comes back
+    # it re-reads its own file through `CONSULT_DIR`, which this switch rebinds.
+    # See `_CONSULT_INFLIGHT`.
+    waiting = consults_in_flight()
+    if waiting:
+        return (f"{len(waiting)} consult{'s' if len(waiting) != 1 else ''} "
+                f"waiting on the architect in {', '.join(waiting)}")
     return None
 
 
@@ -692,7 +972,9 @@ def run(cmd: list[str], cwd: Path | None = None, check: bool = False,
 
 # The console runs claude workers on background threads, so board writes are
 # serialized: two workers finishing at once must not lose each other's record.
-_BOARD_LOCK = threading.Lock()
+# And `amp <cmd>` on a terminal writes this same file while the console runs,
+# which is why the lock reaches across processes - see `_DocLock`.
+_BOARD_LOCK = _DocLock("BOARD_PATH")
 
 
 def record_task(lane_name: str, rec: dict):
@@ -700,6 +982,23 @@ def record_task(lane_name: str, rec: dict):
         b = board()
         b.setdefault("tasks", {}).setdefault(lane_name, []).insert(0, rec)
         save_json(BOARD_PATH, b)
+
+
+def record_remote(remote: dict[str, list]) -> str:
+    """Write down what a poll saw - and nothing else.
+
+    A poll reads the board, spends however long the network takes, and then
+    writes the whole board back. Everything the console recorded while it was
+    waiting is inside that stale copy, and writing it back is how a finished
+    worker's record disappears. So the read happens HERE, after the waiting,
+    with the lock held, and only the polled lanes are touched.
+    """
+    with _BOARD_LOCK:
+        b = board()
+        b.setdefault("remote", {}).update(remote)
+        b["polled_at"] = now()
+        save_json(BOARD_PATH, b)
+    return b["polled_at"]
 
 
 def update_task(lane_name: str, task_id: str, patch: dict):
@@ -712,7 +1011,7 @@ def update_task(lane_name: str, task_id: str, patch: dict):
         save_json(BOARD_PATH, b)
 
 
-_CHAT_LOCK = threading.Lock()
+_CHAT_LOCK = _DocLock("CHAT_PATH")
 
 
 def add_note(text: str, lane: str | None = None, kind: str | None = None) -> dict:
@@ -739,7 +1038,7 @@ def notes() -> list[dict]:
 
 # ---------------------------------------------------------------- orchestrator
 
-_ORCH_LOCK = threading.Lock()
+_ORCH_LOCK = _DocLock("ORCH_PATH")
 
 
 def orchestrator() -> dict:
@@ -1622,6 +1921,12 @@ rather than reimplementing it: every guard (one worker per lane, the global
 worker cap, budgets, timeouts, the memory ceiling) lives behind these
 endpoints, and none of them apply to anything you run yourself.
 
+Every call below already carries the console's token header. If you write a
+curl that is not listed here, copy that -H onto it: the console refuses an
+/api request without it, and it refuses one that arrives from a browser page,
+because a request that arrives here is a command that runs. A 401 from these
+endpoints is that check, not a broken URL - do not work around it.
+
   curl -s {base}/api/state
       lanes with their paths and backends, recent tasks per lane, how many
       workers are running and the cap
@@ -1801,9 +2106,9 @@ git, specifically:
 
 
 def orchestrator_brief(base_url: str) -> str:
-    return ORCH_BRIEF.format(
+    return with_console_auth(ORCH_BRIEF.format(
         root=ROOT, base=base_url, landing=landing_rule(), ideas=idea_rule(),
-        doctrine=mission_block() + doctrine_block("What we are held to"))
+        doctrine=mission_block() + doctrine_block("What we are held to")))
 
 
 def orchestrator_ask(text: str, *, base_url: str, model: str | None = None,
@@ -4195,15 +4500,6 @@ def adopt_orphans() -> list[dict]:
     return out
 
 
-def _epoch(iso: str | None) -> float:
-    if not iso:
-        return 0.0
-    try:
-        return datetime.fromisoformat(iso).timestamp()
-    except ValueError:
-        return 0.0
-
-
 def claude_worktree(lane_name: str, lane: dict, branch: str) -> Path:
     """The isolated tree a lane's claude worker edits.
 
@@ -5322,22 +5618,19 @@ def cmd_dispatch(args):
     if p.returncode != 0:
         die(f"dispatch failed (exit {p.returncode})")
 
-    b = board()
-    b["tasks"].setdefault(args.lane, [])
-    b["tasks"][args.lane].insert(
-        0,
-        {
-            "backend": "codex",
-            "dispatched_at": now(),
-            "prompt": prompt,
-            "branch": branch,
-            "attempts": args.attempts,
-            "env_id": env_id,
-            "submit_output": out,
-            "status": "submitted",
-        },
-    )
-    save_json(BOARD_PATH, b)
+    # `record_task`, not a second copy of it. This read-mutate-write predated
+    # the lock and did not take it, so a dispatch from a terminal could drop a
+    # worker record the console had just written.
+    record_task(args.lane, {
+        "backend": "codex",
+        "dispatched_at": now(),
+        "prompt": prompt,
+        "branch": branch,
+        "attempts": args.attempts,
+        "env_id": env_id,
+        "submit_output": out,
+        "status": "submitted",
+    })
     print("\nrecorded on board. Poll with: ./amp poll")
     return 0
 
@@ -5377,24 +5670,22 @@ def cmd_reply(args):
 def cmd_poll(args):
     """Refresh codex lanes. Claude lanes settle themselves - nothing to poll."""
     cfg = config()
-    b = board()
 
     lanes = [args.lane] if args.lane else sorted(cfg["lanes"])
     codex_lanes = [n for n in lanes if lane_backend(cfg["lanes"].get(n, {})) == "codex"]
     if codex_lanes and not codex_logged_in():
         die("codex is not logged in. Run: codex login")
 
-    seen = 0
+    seen, remote = 0, {}
     for name in codex_lanes:
         lane = cfg["lanes"].get(name)
         if not lane or not lane.get("env_id"):
             continue
         tasks = codex_list(env_id=lane["env_id"])
-        b.setdefault("remote", {})[name] = tasks
+        remote[name] = tasks
         seen += len(tasks)
-    b["polled_at"] = now()
-    save_json(BOARD_PATH, b)
-    print(f"polled {len(lanes)} lane(s), {seen} remote task(s) at {b['polled_at']}")
+    polled_at = record_remote(remote)
+    print(f"polled {len(lanes)} lane(s), {seen} remote task(s) at {polled_at}")
     return cmd_board(args)
 
 
@@ -5679,6 +5970,24 @@ def architect_chat(messages: list[dict], model_key: str, max_tokens: int = 8000,
 
 _CONSULT_LOCK = threading.Lock()
 
+# Consults whose architect call is out on the wire right now: cid -> lane.
+#
+# In memory rather than on disk, and for the same reason `live_workers` counts
+# `_PROCS`: this is a fact about THIS process, and a file saying "in flight"
+# survives a crash as a lie. It exists so `switch_blocked` can see a consult at
+# all. That guard already refuses to move the ground under a running worker or a
+# mid-turn orchestrator, and a consult is neither, so a switch during one used to
+# be waved straight through - rebinding `CONSULT_DIR` under a call that will come
+# back in a minute wanting to write to it.
+_CONSULT_INFLIGHT: dict[str, str] = {}
+_CONSULT_INFLIGHT_LOCK = threading.Lock()
+
+
+def consults_in_flight() -> list[str]:
+    """Lanes waiting on an architect answer right now, named, deduplicated."""
+    with _CONSULT_INFLIGHT_LOCK:
+        return sorted(set(_CONSULT_INFLIGHT.values()))
+
 # How a turn is introduced to the architect. The packet is already a document.
 TURN_PREFIX = {
     "packet": "",
@@ -5695,6 +6004,14 @@ def consult_path(cid: str) -> Path:
 def load_consult(cid: str) -> dict | None:
     p = consult_path(cid)
     return json.loads(p.read_text()) if p.is_file() else None
+
+
+def require_consult(cid: str) -> dict:
+    """`load_consult`, for the reader that is about to index it. See `require_goal`."""
+    c = load_consult(cid)
+    if c is None:
+        die(f"no consult {cid!r} in {CONSULT_DIR} - it was there a moment ago")
+    return c
 
 
 def save_consult(c: dict):
@@ -5852,12 +6169,35 @@ def advance_consult(cid: str) -> dict:
             else:
                 msgs.append({"role": "user", "content": TURN_PREFIX.get(t["role"], "") + t["text"]})
 
-    resp = architect_chat(msgs, c["model"])
+    with _CONSULT_INFLIGHT_LOCK:
+        _CONSULT_INFLIGHT[cid] = c.get("lane") or "?"
+    try:
+        resp = architect_chat(msgs, c["model"])
+    finally:
+        with _CONSULT_INFLIGHT_LOCK:
+            _CONSULT_INFLIGHT.pop(cid, None)
     text = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or "(empty)"
     usage = resp.get("usage") or {}
 
     with _CONSULT_LOCK:
         c = load_consult(cid)
+        if not c:
+            # The same read is guarded twenty lines up and was not guarded here,
+            # and the gap between them is a network call to the architect that
+            # can take minutes. `load_consult` resolves through `CONSULT_DIR`,
+            # which `_bind_state` rebinds on a workspace switch, so a switch
+            # while the architect is thinking makes this look in the wrong
+            # workspace and find nothing.
+            #
+            # What that cost was a `TypeError: 'NoneType' object is not
+            # subscriptable` on the next line - and with it the answer, which
+            # has already been paid for and exists only in `text`. So the reply
+            # is printed before anything else: an operator can paste it back,
+            # and a stack trace gives them nothing to paste.
+            print(f"amp: consult {cid!r} is gone from {CONSULT_DIR} - it was "
+                  f"there when this turn started. The architect answered anyway, "
+                  f"and this is the whole of it:\n\n{text}\n", file=sys.stderr)
+            die(f"consult {cid!r} vanished mid-turn; its answer is above")
         c["turns"].append({"role": "gpt", "at": now(), "text": text,
                            "model": resp.get("model"), "usage": usage})
         c["needs"] = parse_needs(text)
@@ -5940,7 +6280,7 @@ def _need_key(needs: list[str]) -> list[str]:
 
 def _block(cid: str, why: str | None) -> dict:
     with _CONSULT_LOCK:
-        c = load_consult(cid)
+        c = require_consult(cid)
         c["blocked_on"] = why
         save_consult(c)
     return c
@@ -5961,7 +6301,7 @@ def auto_continue(cid: str) -> dict:
     to build, what counts as done, what to spend - halts the thread and says so,
     because that answer is not on this machine to be fetched.
     """
-    c = load_consult(cid)
+    c = require_consult(cid)
     needs = parse_typed_needs(last_ruling(c))
     if not needs:
         return _block(cid, None)
@@ -5977,7 +6317,7 @@ def auto_continue(cid: str) -> dict:
         return _halted(cid, "tokens", needs)
 
     with _CONSULT_LOCK:
-        c = load_consult(cid)
+        c = require_consult(cid)
         c["auto_rounds"] = rounds + 1
         c["need_trail"] = (trail + [key])[-8:]
         save_consult(c)
@@ -6116,7 +6456,7 @@ def write_ruling(c: dict):
         head = {"packet": "Packet", "gpt": "Ruling", "you": "You",
                 "supplied": "Supplied", "worker": "Worker"}.get(t["role"], t["role"])
         body.append(f"\n## {head} — {t['at']}\n\n{t['text']}\n")
-    (RULING_DIR / f"{c['lane']}-{c['id']}.md").write_text("".join(body))
+    save_text(RULING_DIR / f"{c['lane']}-{c['id']}.md", "".join(body))
 
 
 def worker_report(lane_name: str, rec: dict) -> str:
@@ -6214,7 +6554,13 @@ def goal_token_ceiling(g: dict) -> int:
 
 # Set by the console to (goal, task) -> dispatch result. Starting a worker is
 # the console's job; amp.py cannot import it.
-ON_GOAL_DISPATCH = None
+#
+# `| None` is the honest type and it is load-bearing: run amp as a command
+# rather than under the console and nothing ever sets this, so the one caller
+# has to say what happens then. Unguarded it said
+# `TypeError: 'NoneType' object is not callable`, which reads as a fault in the
+# goal rather than as "no console is running".
+ON_GOAL_DISPATCH: Callable[[dict, dict], dict] | None = None
 
 GOAL_STOPPED = {
     "operator": "it needs a decision only you can make",
@@ -6299,6 +6645,27 @@ def goal_path(gid: str) -> Path:
 def load_goal(gid: str) -> dict | None:
     p = goal_path(gid)
     return json.loads(p.read_text()) if p.is_file() else None
+
+
+def require_goal(gid: str) -> dict:
+    """`load_goal`, for the reader that is about to index it.
+
+    Every long operation on a goal reads it, spends a minute somewhere else -
+    the architect, a shell check, a worker - and then reads it AGAIN to write
+    the answer down. The second read went unguarded, and `GOAL_DIR` is a module
+    global that a workspace switch rebinds, so the second read can miss a file
+    the first read found. What that cost was `TypeError: 'NoneType' object is
+    not subscriptable`, thrown from a line that has nothing to do with the
+    cause.
+
+    `load_goal` is still the right call wherever a missing goal is an ordinary
+    answer - those sites say `or {}` and mean it. This one is for the sites that
+    were going to crash.
+    """
+    g = load_goal(gid)
+    if g is None:
+        die(f"no goal {gid!r} in {GOAL_DIR} - it was there a moment ago")
+    return g
 
 
 def save_goal(g: dict):
@@ -6463,7 +6830,7 @@ def goal_log(gid: str, text: str, **extra) -> dict:
 
 def _goal_stop(gid: str, why: str | None, note: str = "") -> dict:
     with _GOAL_LOCK:
-        g = load_goal(gid)
+        g = require_goal(gid)
         g["stopped_on"] = why
         if why:
             g["state"] = "blocked"
@@ -6490,14 +6857,14 @@ def goal_plan_prompt(g: dict) -> str:
 
 
 def plan_goal(gid: str) -> dict:
-    g = load_goal(gid)
+    g = require_goal(gid)
     user = goal_plan_prompt(g)
     plan, raw = _goal_chat(g, GOAL_PLAN_SYSTEM, user)
     if not plan:
         goal_log(gid, "the architect's plan could not be read as JSON", raw=raw[:2000])
         return _goal_stop(gid, "no-plan")
     with _GOAL_LOCK:
-        g = load_goal(gid)
+        g = require_goal(gid)
         g["done"] = [{"text": str(d.get("text") or "").strip(),
                       "check": (d.get("check") or None), "met": False, "evidence": ""}
                      for d in (plan.get("done") or []) if (d.get("text") or "").strip()]
@@ -6638,14 +7005,14 @@ def recalculate_goal(gid: str) -> dict:
         return {"ok": False, "error": why}
 
     checks = run_goal_checks(gid)          # so the architect judges live results
-    g = load_goal(gid)
+    g = require_goal(gid)
     plan, raw = _goal_chat(g, GOAL_REPLAN_SYSTEM, _reopen_doc(g))
     if not plan:
         goal_log(gid, "the architect's replan could not be read as JSON", raw=raw[:2000])
         return {"ok": False, "error": "the architect's answer could not be read as JSON"}
 
     with _GOAL_LOCK:
-        g = load_goal(gid)
+        g = require_goal(gid)
         was_done = {d["text"]: d for d in g.get("done") or []}
         was_tasks = {t["text"]: t for t in g.get("tasks") or []}
         kept_done = kept_tasks = 0
@@ -6741,7 +7108,7 @@ def improve_goal(gid: str, *, apply: bool = False) -> dict:
         return ans
 
     with _GOAL_LOCK:
-        cur = load_goal(gid)
+        cur = require_goal(gid)
         cur.setdefault("objective_history", []).append(
             {"at": now(), "was": cur["objective"], "what_changed": ans["what_changed"]})
         cur["objective"] = revised[:2000]
@@ -6837,7 +7204,7 @@ def idea_rule() -> str:
 
 def goal_dispatch(gid: str) -> dict:
     """Send the next task out. One worker per goal at a time, by construction."""
-    g = load_goal(gid)
+    g = require_goal(gid)
     if g.get("state") not in ("running",):
         return g
     if any(t.get("state") == "running" for t in g["tasks"]):
@@ -6859,19 +7226,24 @@ def goal_dispatch(gid: str) -> dict:
     if held:
         return _goal_stop(gid, "stage", held)
     with _GOAL_LOCK:
-        g = load_goal(gid)
+        g = require_goal(gid)
         for t in g["tasks"]:
             if t["id"] == nxt["id"]:
                 t["state"] = "running"
         save_goal(g)
-    try:
-        out = ON_GOAL_DISPATCH(g, nxt)
-    except Exception as e:
-        print(f"amp: goal dispatch hook failed: {e}", file=sys.stderr)
-        out = {"ok": False, "error": str(e)}
+    if ON_GOAL_DISPATCH is None:
+        # Down the same path as a hook that failed, deliberately: the task above
+        # is already marked `running`, and that path is the one that puts it back.
+        out = {"ok": False, "error": "nothing is wired to start workers"}
+    else:
+        try:
+            out = ON_GOAL_DISPATCH(g, nxt)
+        except Exception as e:
+            print(f"amp: goal dispatch hook failed: {e}", file=sys.stderr)
+            out = {"ok": False, "error": str(e)}
     if not out.get("ok"):
         with _GOAL_LOCK:
-            g = load_goal(gid)
+            g = require_goal(gid)
             for t in g["tasks"]:
                 if t["id"] == nxt["id"]:
                     t["state"] = "todo"
@@ -6938,7 +7310,7 @@ def run_goal_checks(gid: str, only: set[str] | None = None) -> list[dict]:
     ignores conditions it has no result for, so a narrowed run cannot clear the
     dates on the ones it skipped.
     """
-    g = load_goal(gid)
+    g = require_goal(gid)
     wt = WORKTREE_DIR / g["lane"]
     if not wt.exists():
         return []
@@ -6955,7 +7327,7 @@ def run_goal_checks(gid: str, only: set[str] | None = None) -> list[dict]:
             out.append({"text": d["text"], "check": cmd, "exit": None,
                         "output": f"(could not run: {e})"})
     with _GOAL_LOCK:
-        g = load_goal(gid)
+        g = require_goal(gid)
         by_text = {c["text"]: c for c in out}
         for d in g["done"]:
             c = by_text.get(d["text"])
@@ -7025,20 +7397,20 @@ def goal_review(gid: str, report: str) -> dict:
 
 
 def _goal_review(gid: str, report: str) -> dict:
-    g = load_goal(gid)
+    g = require_goal(gid)
     if g.get("cost_tokens", 0) >= goal_token_ceiling(g):
         return _goal_stop(gid, "tokens")
     if g.get("rounds", 0) >= goal_round_ceiling(g):
         return _goal_stop(gid, "rounds")
     checks = run_goal_checks(gid)
-    g = load_goal(gid)
+    g = require_goal(gid)
     verdict, raw = _goal_chat(g, GOAL_REVIEW_SYSTEM, goal_state_doc(g, checks, report))
     if not verdict:
         goal_log(gid, "the architect's review could not be read as JSON", raw=raw[:2000])
         return _goal_stop(gid, "no-plan", "its review was not readable")
 
     with _GOAL_LOCK:
-        g = load_goal(gid)
+        g = require_goal(gid)
         stated = {str(d.get("text") or "").strip(): d for d in (verdict.get("done") or [])}
         for d in g["done"]:
             said = stated.get(d["text"])
@@ -7088,7 +7460,7 @@ def _goal_review(gid: str, report: str) -> dict:
     met = all(d.get("met") for d in g["done"]) and bool(g["done"])
     if verdict.get("verdict") == "done" and met:
         with _GOAL_LOCK:
-            g = load_goal(gid)
+            g = require_goal(gid)
             g["state"], g["stopped_on"] = "done", None
             save_goal(g)
         add_note(f"goal {gid} ({g['lane']}) is finished: {g['objective'][:200]}",
@@ -7312,7 +7684,7 @@ def goal_worker_done(gid: str, lane_name: str, rec: dict) -> dict:
         return load_goal(gid) or {}
     killed = rec.get("killed") or (rec.get("status") == "failed")
     with _GOAL_LOCK:
-        g = load_goal(gid)
+        g = require_goal(gid)
         for t in g["tasks"]:
             if t["id"] == task_id or (not task_id and t.get("state") == "running"):
                 t["state"] = "blocked" if killed else "done"
@@ -7648,10 +8020,11 @@ def triage_goal(gid: str, base_url: str) -> dict:
     mark_triaged(gid)
     try:
         orchestrator_ask(
-            TRIAGE_RULES.format(
+            with_console_auth(TRIAGE_RULES.format(
                 gid=gid, lane=row["lane"], base=base_url,
                 objective=row["objective"][:1500],
-                questions="\n".join(f"{i}. {q}" for i, q in enumerate(row["questions"], 1)))
+                questions="\n".join(f"{i}. {q}"
+                                    for i, q in enumerate(row["questions"], 1))))
             # Concatenated, not interpolated: all three are operator-written text
             # and a single brace in the doctrine would make `.format` above raise
             # rather than triage a goal.
@@ -7888,7 +8261,7 @@ def publish_goal(gid: str, *, dry_run: bool = True) -> dict:
     if not rep["ok"] or dry_run:
         return rep
 
-    g = load_goal(gid)
+    g = require_goal(gid)
     wt = Path(rep["worktree"])
     p = _git(wt, "push", "-u", PUBLISH_REMOTE, rep["branch"])
     if p.returncode != 0:
@@ -7910,7 +8283,7 @@ def publish_goal(gid: str, *, dry_run: bool = True) -> dict:
     url = next((w for w in out.split() if w.startswith("https://")), out)
     rep["pr_url"] = url
     with _GOAL_LOCK:
-        g = load_goal(gid)
+        g = require_goal(gid)
         g["pr_url"] = url
         g["published_at"] = now()
         g.setdefault("log", []).append({"at": now(), "text": f"opened a pull request: {url}"})
@@ -8422,7 +8795,7 @@ def write_checks(gid: str, *, apply: bool = False) -> dict:
         return out
 
     with _GOAL_LOCK:
-        g = load_goal(gid)
+        g = require_goal(gid)
         by_text = {p["text"]: p for p in proposed}
         wrote = ruled = 0
         for d in g.get("done") or []:
@@ -8489,7 +8862,7 @@ def write_checks(gid: str, *, apply: bool = False) -> dict:
         if broke:
             bad = {b["text"] for b in broke}
             with _GOAL_LOCK:
-                g = load_goal(gid)
+                g = require_goal(gid)
                 for d in g.get("done") or []:
                     if d["text"] in bad and d.get("check_by") == "architect":
                         for k in ("check", "check_by", "check_written_at", "check_why",
@@ -10517,7 +10890,7 @@ def _verify_deploy(t: dict, rec: dict) -> dict | None:
 # and defaults off.
 
 # DIRECTION_PATH is bound by _bind_state; see _STATE_LAYOUT.
-_DIRECTION_LOCK = threading.Lock()
+_DIRECTION_LOCK = _DocLock("DIRECTION_PATH")
 _SECTION_HEAD = re.compile(r"^##\s+(.+?)\s*$", re.M)
 
 
@@ -11788,7 +12161,66 @@ def _refine_record() -> dict:
             "floor": SHARPEN_FLOOR}
 
 
-def calibration() -> dict:
+# One proposal in four is held back from the table the scorer is shown, so that
+# there is always something to check the shown half against. See `_held_out` for
+# which four, and `calibration_split` for what the pair is for.
+CALIBRATION_HOLDOUT = 4
+
+# Below this, a half is reported as "not enough to say" rather than as a rate.
+# Four judged cases cannot support a percentage - one of them is 25 points - and
+# a Δ computed from two such numbers is noise wearing the clothes of a finding.
+CALIBRATION_MIN_N = 5
+
+
+def _held_out(pid: str) -> bool:
+    """Whether a proposal is in the half the scorer is never shown.
+
+    Decided by hashing the proposal's own id, which is the only thing about it
+    that never changes. Both obvious alternatives break the claim the split
+    exists to support:
+
+    - A random draw is not a split. A proposal shown last week and held back
+      today was never held out, and a number computed from it measures nothing.
+    - Every fourth by position is stable only until a proposal is added, which
+      happens constantly. An insertion moves everything after it across the line.
+
+    Not stratified by lane, deliberately, even though C3 is written per lane.
+    Stratifying would buy balance at small `n` by making one proposal's
+    membership depend on how many OTHER proposals its lane has - the insertion
+    problem again, in a different coat. Each lane gets a quarter in expectation
+    anyway, and where it does not, the honest answer is that there is not enough
+    to say. `calibration_split` gives that answer instead of a number, and
+    reports the per-lane counts so a Δ that is really a statement about lane mix
+    can be seen for what it is.
+    """
+    return int(hashlib.sha256(pid.encode()).hexdigest()[:8], 16) % CALIBRATION_HOLDOUT == 0
+
+
+def _calibration_cases(half: str | None = None) -> list[tuple[dict, dict]]:
+    """Every proposal whose outcome is in, paired with the goal that settled it.
+
+    One definition of "judged", used by the table and by the split. It began as
+    two copies of the same four lines, which is how two numbers that are supposed
+    to be the same number quietly stop being it.
+
+    `half` is `"shown"`, `"held"`, or `None` for everything. `None` is what the
+    operator's console asks for: withholding a quarter of the record from the
+    person auditing it would serve nobody.
+    """
+    out = []
+    for p in direction_store().get("proposals", []):
+        if p.get("state") != "adopted" or not p.get("goal_id"):
+            continue
+        if half and _held_out(str(p.get("id") or "")) != (half == "held"):
+            continue
+        g = load_goal(p["goal_id"])
+        if not g or g.get("state") in ("planning", "running"):
+            continue
+        out.append((p, g))
+    return out
+
+
+def calibration(half: str | None = None) -> dict:
     """What the four scores turned out to be worth.
 
     Reads only what was already recorded: an adopted proposal names the goal it
@@ -11800,6 +12232,10 @@ def calibration() -> dict:
     Goals still open are counted nowhere. They are not evidence yet, and
     counting them as failures is how a calibration table talks itself into
     saying the estimates are worse than anyone has established.
+
+    `half` restricts it to one side of the held-out split. The prompt is only
+    ever built from `"shown"`; everything the operator reads is built from all
+    of it.
     """
     edges = [0.0, 0.5, 0.7, 0.85]
     bands = [{"from": lo, "to": (edges[i + 1] if i + 1 < len(edges) else 1.0),
@@ -11810,13 +12246,8 @@ def calibration() -> dict:
     need_said = 0.0
     cost_n = 0
     cost_said = cost_real = 0.0
-    for p in direction_store().get("proposals", []):
+    for p, g in _calibration_cases(half):
         c = p.get("confidence")
-        if p.get("state") != "adopted" or not p.get("goal_id"):
-            continue
-        g = load_goal(p["goal_id"])
-        if not g or g.get("state") in ("planning", "running"):
-            continue
         if c is not None:
             row = [b for b in bands if c >= b["from"]][-1]
             row["n"] += 1
@@ -11851,7 +12282,171 @@ def calibration() -> dict:
                  "stated": round(cost_said / cost_n, 2) if cost_n else None,
                  "actual": round(cost_real / cost_n, 2) if cost_n else None},
         "refine": _refine_record(),
+        # Which table this is. A caller holding one of these and not knowing
+        # which half it came from is the one way this split can silently lie.
+        "half": half,
     }
+
+
+def _gap(part: dict, said: str, got: str) -> float | None:
+    """What a score was off by: what it said, minus what happened."""
+    a, b = part.get(said), part.get(got)
+    return None if a is None or b is None else round(float(a) - float(b), 3)
+
+
+# The three scores the split can speak about, as (name, where, said, got, unit).
+# `refine` is deliberately absent: it is measured from the sharpen log rather
+# than from adopted proposals, so there is no proposal id to hash and nothing to
+# hold out. Reporting a Δ for it would mean reporting the same number twice.
+_CAL_MEASURES = [
+    ("odds", None, "stated", "actual", "probability"),
+    ("need", "need", "stated", "moved", "probability"),
+    ("cost", "cost", "stated", "actual", "usd"),
+]
+
+
+def calibration_split() -> dict:
+    """The same table twice: the half the scorer is shown, and the half it is not.
+
+    C2 put the calibration table into the prompt that produces the scores. Every
+    calibration number measured afterwards is therefore measured on data the
+    scorer was shown, and a scorer that has learned to restate the table it was
+    given looks, by that measurement, perfectly calibrated. The shown half alone
+    cannot tell the difference between a scorer that got better and a scorer that
+    learned to agree with itself.
+
+    So one proposal in four never enters the block. The Δ between the two halves
+    is the only number here that means anything, and it is the whole output:
+
+      Δ = |gap on the half it never saw| - |gap on the half it was shown|
+
+    A large positive Δ says the shown half is flattering. Near zero says the
+    scoring generalises. **Negative is not better than zero** - it means the
+    scorer does worse on what it was shown, which is not a thing improvement
+    looks like, and is a reason to go and look at the two samples rather than to
+    celebrate.
+
+    Where a half is too small, this says so instead of dividing. That is the same
+    discipline `calibration` already applies by counting open goals nowhere: the
+    refusal is the finding, and a percentage resting on three cases invites
+    exactly the confidence it cannot support.
+    """
+    shown, held = calibration("shown"), calibration("held")
+    measures = []
+    for name, where, said, got, unit in _CAL_MEASURES:
+        s = (shown.get(where) or {}) if where else shown
+        h = (held.get(where) or {}) if where else held
+        sn, hn = int(s.get("n") or 0), int(h.get("n") or 0)
+        sg, hg = _gap(s, said, got), _gap(h, said, got)
+        row = {"name": name, "unit": unit, "shown_n": sn, "held_n": hn,
+               "shown_gap": sg, "held_gap": hg, "delta": None, "short": None}
+        if sn < CALIBRATION_MIN_N or hn < CALIBRATION_MIN_N:
+            # Reads as "not enough in ..." wherever it is shown, so it names the
+            # side rather than the verdict.
+            row["short"] = ("either half" if sn < CALIBRATION_MIN_N and hn < CALIBRATION_MIN_N
+                            else "the held-out half" if hn < CALIBRATION_MIN_N
+                            else "the shown half")
+        elif sg is not None and hg is not None:
+            row["delta"] = round(abs(hg) - abs(sg), 3)
+        measures.append(row)
+
+    # Per lane, because a Δ can be a statement about which lanes happen to be on
+    # which side rather than about the scoring. A lane sitting entirely in one
+    # half is the case that makes the headline number unreadable, and it is
+    # invisible in the totals.
+    # Counts only, keyed by lane, and the lane name is put back on the way out.
+    # Carrying it inside the row as well would make this a `dict[str, object]`,
+    # and `object + int` is not an addition - the counter would stop being one.
+    lanes: dict[str, dict[str, int]] = {}
+    for p, _g in _calibration_cases():
+        counts = lanes.setdefault(p.get("lane") or "-", {"shown": 0, "held": 0})
+        counts["held" if _held_out(str(p.get("id") or "")) else "shown"] += 1
+    return {"holdout": CALIBRATION_HOLDOUT, "min_n": CALIBRATION_MIN_N,
+            "measures": measures, "shown": shown, "held": held,
+            "lanes": [{"lane": k, **v} for k, v in sorted(lanes.items())],
+            "lopsided": sorted(k for k, v in lanes.items()
+                               if not v["shown"] or not v["held"])}
+
+
+@traced_block(".direction.json (proposals, their scores and the goals they opened)",
+              "goals/*.json (how each of those goals actually ended)",
+              "board.json (what those goals' workers actually billed)")
+def calibration_block(cal: dict | None = None) -> str:
+    """What the four scores turned out to be worth, for a prompt.
+
+    The measurement already reached the operator, the report and the generated
+    advice. It did not reach a single prompt - and the prompt it was missing
+    from is the one that states the bars. A model told the threshold is 0.60
+    and not told that the 0.85 band finishes 40% of the time is being asked to
+    score against a number whose reliability is being withheld from it. This
+    document's own argument for printing the dials ("asked to change a bar
+    without being told what it is, a model invents one") applies with more
+    force here.
+
+    Every line carries its `n`. "3 of 4" and "300 of 400" are not the same
+    evidence and a scorer has to be able to tell them apart; the wording
+    matches `report_actions` rather than inventing a second format for the
+    same numbers.
+
+    Returns "" when nothing has been measured, on purpose. An empty block shows
+    up in the Blueprint inspector's `empty[]` list, which is how you find out
+    the table was empty rather than the block unwired - the two look identical
+    in the assembled prompt.
+
+    **This is the block the split is against.** It is built from the shown half
+    and never from all of it, and the check is made here rather than trusted to
+    the callers: this function is the boundary between the record and a prompt,
+    and a held-out proposal that reaches a prompt through any other route has
+    stopped being held out for good. A caller that hands over the wrong table is
+    refused rather than quietly served, because a split that fails open is worse
+    than no split - it reports a Δ that is measured on nothing.
+    """
+    c = cal if cal is not None else calibration("shown")
+    if c.get("half") != "shown":
+        die("calibration_block was handed the "
+            f"{c.get('half') or 'whole'} table - a prompt only ever sees the shown half")
+    need, cost, ref = c.get("need") or {}, c.get("cost") or {}, c.get("refine") or {}
+    if not (c.get("n") or need.get("n") or cost.get("n") or ref.get("n")):
+        return ""
+
+    out = ["# What these scores have turned out to be worth",
+           "",
+           "Measured from what was recorded: an adopted proposal names the goal it "
+           "opened, and that goal has since finished or stopped. Goals still open "
+           "count nowhere. Each line says how many judged cases it rests on - a "
+           "line resting on three is a hint, not a fact, and should not move your "
+           "scoring much.",
+           ""]
+
+    if c.get("n"):
+        out.append(f"- **odds**: proposals were given {float(c['stated']):.0%} and "
+                   f"{float(c['actual']):.0%} of them actually finished, over "
+                   f"{c['n']} judged. The adopt bar is {c.get('bar')}.")
+        for b in (c.get("bands") or []):
+            if b.get("n"):
+                out.append(f"  - scored {b['from']:.2f}-{b['to']:.2f}: "
+                           f"{b['finished']} of {b['n']} finished ({b['rate']})")
+    if need.get("n"):
+        out.append(f"- **need**: scored {float(need['stated']):.0%} on average, and "
+                   f"{float(need['moved']):.0%} of those objectives moved a claim up "
+                   f"the ladder, over {need['n']} judged. The need bar is "
+                   f"{c.get('need_bar')}.")
+    if cost.get("n") and cost.get("stated"):
+        ratio = float(cost["actual"]) / float(cost["stated"])
+        out.append(f"- **cost**: estimates said ${float(cost['stated']):.2f} and the "
+                   f"work cost ${float(cost['actual']):.2f} - off by {ratio:.1f}x "
+                   f"over {cost['n']} finished objective(s).")
+    if ref.get("n"):
+        out.append(f"- **headroom**: sharpening claimed {float(ref['stated'] or 0):.2f} "
+                   f"left and the score actually rose "
+                   f"{float(ref['actual'] or 0):.0%} of the time "
+                   f"(mean {ref.get('gain')}), over {ref['n']} attempts.")
+
+    out += ["",
+            "Read these as a correction to apply, not as a target to hit. If the "
+            "odds line says the estimates run high, score the next one lower than "
+            "it feels; do not restate the measured rate as your confidence."]
+    return "\n".join(out)
 
 
 # Stated once and used by both the review and the sharpener. They used to carry
@@ -12397,6 +12992,19 @@ def specrun_path(rid: str) -> Path:
 def load_specrun(rid: str) -> dict | None:
     p = specrun_path(rid)
     return json.loads(p.read_text()) if p.is_file() else None
+
+
+def require_specrun(rid: str) -> dict:
+    """`load_specrun`, for the reader that is about to index it. See `require_goal`.
+
+    A spec run is the longest of the three: it walks a lane's documents one at a
+    time and asks the architect about each, so the gap between the first read
+    and the last is measured in rounds, not seconds.
+    """
+    r = load_specrun(rid)
+    if r is None:
+        die(f"no spec run {rid!r} in {SPECRUN_DIR} - it was there a moment ago")
+    return r
 
 
 def save_specrun(r: dict):
@@ -12946,7 +13554,7 @@ def spec_review_open(lane_name: str, rels: list[str] | str) -> dict:
 
 def _spec_stop(rid: str, state: str, why: str) -> dict:
     with _SPECRUN_LOCK:
-        r = load_specrun(rid)
+        r = require_specrun(rid)
         r.update({"state": state, "why": why, "waiting_on": None,
                   "closed_at": now()})
         save_specrun(r)
@@ -12998,7 +13606,7 @@ def _spec_drop_unreachable(rid: str, lane: str, pending: list[str]) -> list[str]
     if not blocked:
         return pending
     with _SPECRUN_LOCK:
-        r = load_specrun(rid)
+        r = require_specrun(rid)
         r["dropped"] = {**(r.get("dropped") or {}), **blocked}
         save_specrun(r)
     return [x for x in pending if x not in blocked]
@@ -13013,7 +13621,7 @@ def _spec_settle(rid: str) -> dict:
     tenth document's rating out of reach - the tab reads a solid run as "this
     one is done".
     """
-    r = load_specrun(rid)
+    r = require_specrun(rid)
     rels = specrun_rels(r)
     dropped = r.get("dropped") or {}
     solid = r.get("solid") or {}
@@ -13059,7 +13667,7 @@ def _spec_review_turn(rid: str) -> dict:
     # end. Reviews are paid for one at a time, and an architect that dies on
     # document seven would otherwise take the six already bought with it.
     with _SPECRUN_LOCK:
-        r = load_specrun(rid)
+        r = require_specrun(rid)
         n = len(r["rounds"]) + 1
         r["rounds"].append({"n": n, "at": now(), "reviews": [],
                             "worker": None, "changed": None})
@@ -13085,7 +13693,7 @@ def _spec_review_turn(rid: str) -> dict:
               "defects": got["defects"], "review": text, "changed": None}
         reviewed.append(rv)
         with _SPECRUN_LOCK:
-            r2 = load_specrun(rid)
+            r2 = require_specrun(rid)
             r2["rounds"][i]["reviews"].append(rv)
             if got["verdict"] == "SOLID":
                 # Both of them. The writer's half of the agreement is not a
@@ -13111,7 +13719,7 @@ def _spec_review_turn(rid: str) -> dict:
     # The genuine deadlock: the writer says the items do not apply, the reviewer
     # keeps asking, and nothing on disk has moved for two rounds. That is not
     # something a third round settles - it is a disagreement, and it is yours.
-    done = load_specrun(rid)["rounds"]
+    done = require_specrun(rid)["rounds"]
     if all((rd.get("changed") is False) for rd in done[-3:-1]) and len(done) > 2:
         # This is now genuinely a disagreement, and only because the check at
         # the top of the turn has already ruled out the other way to get two
@@ -13126,7 +13734,7 @@ def _spec_review_turn(rid: str) -> dict:
         return _spec_stop(rid, "stopped", "no worker dispatch is wired up")
 
     with _SPECRUN_LOCK:
-        r = load_specrun(rid)
+        r = require_specrun(rid)
         r["waiting_on"] = "worker"
         # Before the writer exists, not after. The whole stop rule turns on
         # whether this round moved the document, and a baseline read once the
@@ -13152,11 +13760,11 @@ def _spec_review_turn(rid: str) -> dict:
     # That mis-files the id onto a round that dispatched nothing, which is how a
     # stopped run ends up saying a writer is still out on it.
     with _SPECRUN_LOCK:
-        r = load_specrun(rid)
+        r = require_specrun(rid)
         if i < len(r["rounds"]):
             r["rounds"][i]["task_id"] = out.get("task_id")
             save_specrun(r)
-    return load_specrun(rid)
+    return require_specrun(rid)
 
 
 def spec_worker_done(rid: str, lane_name: str, rec: dict) -> dict:
@@ -13172,7 +13780,7 @@ def spec_worker_done(rid: str, lane_name: str, rec: dict) -> dict:
     agreed = None if not m else (m.group(1).upper() == "SOLID")
 
     with _SPECRUN_LOCK:
-        r = load_specrun(rid)
+        r = require_specrun(rid)
         # The round this writer was sent on: the last one still waiting for a
         # reply. Not `[-1]`, which is only the same round while nothing else has
         # moved, and not a match on `task_id`, which is written after dispatch
@@ -13242,7 +13850,7 @@ def spec_resume(rid: str) -> dict:
                           f"{why} — and it has been picked back up {n} time(s) "
                           f"already, so another turn is not what it needs")
     with _SPECRUN_LOCK:
-        r = load_specrun(rid)
+        r = require_specrun(rid)
         r["resumes"] = n + 1
         r["resumed_at"] = now()
         save_specrun(r)
@@ -14365,6 +14973,14 @@ def _explore_context(lane: str | None, *, web: bool) -> str:
     if stands:
         parts.append(stands)
 
+    # This is the call that PRODUCES `confidence`, `need` and `cost_usd`, and
+    # until now it was the one surface the measurement of those three never
+    # reached. The report had it, the console had it, the generated advice
+    # reasoned over it; the prompt doing the scoring did not.
+    cal = calibration_block()
+    if cal:
+        parts.append(cal)
+
     # Each lane's PURPOSE, not just its throughput. Without it this block says
     # only how busy a lane is, and how busy a lane is has no bearing on whether
     # the next objective belongs in it - which is the single question this call
@@ -14724,9 +15340,7 @@ def set_doctrine(text: str) -> dict:
     was = doctrine_digest()
     if not text.endswith("\n"):
         text += "\n"
-    tmp = DOCTRINE_PATH.with_suffix(DOCTRINE_PATH.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(DOCTRINE_PATH)
+    save_text(DOCTRINE_PATH, text)
     _DOCTRINE_CACHE.update(mtime=None, text="")
 
     st = doctrine_state()
@@ -15712,9 +16326,10 @@ def explore_idle_lanes() -> list[dict]:
         # Stamped BEFORE the call, for the reason triage is: a call that dies
         # partway through has still been paid for, and a retry loop around a
         # model call is how an idle lane becomes an expensive idle lane.
-        d = direction_store()
-        d.setdefault("explored", {})[name] = now()
-        _save_direction(d)
+        with _DIRECTION_LOCK:
+            d = direction_store()
+            d.setdefault("explored", {})[name] = now()
+            _save_direction(d)
         rev = explore_direction(name, web=False)
         return [{"lane": name, "ok": bool(rev.get("ok")),
                  "error": rev.get("error"),
@@ -16165,7 +16780,10 @@ def direction_view(lane: str | None = None) -> dict:
         "auto_adopt": bool(store.get("auto_adopt")),
         "bar": adopt_bar(),
         "need_bar": need_bar(),
+        # The whole table for the operator, and the Δ that says whether it can be
+        # believed. Nothing here reaches a prompt - the Direction tab is a screen.
         "calibration": calibration(),
+        "calibration_split": calibration_split(),
         "rungs": lane_rungs(),
         # Sits with `rungs`, and is not lane-filtered for the same reason `rungs`
         # is not: this pair is the whole-stack record of what the workspace
@@ -16853,7 +17471,13 @@ def report_headed() -> dict:
         "thesis": _section(sections, "thesis"),
         "auto_adopt": bool(direction_store().get("auto_adopt")),
         "bar": adopt_bar(), "need_bar": need_bar(),
+        # Three keys, three readers, and they are not interchangeable. The whole
+        # table is what the operator reads; the shown half is the only thing that
+        # may reach a prompt; the split is the Δ between them, which is the only
+        # one of the three that says whether the first two mean anything.
         "calibration": calibration(),
+        "calibration_shown": calibration("shown"),
+        "calibration_split": calibration_split(),
     }
 
 
@@ -17579,7 +18203,15 @@ document.getElementById('copyjson').onclick = async (e) => {
 
 
 def _epoch(iso: str | None) -> int:
-    """A timestamp as a sortable number. 0 when there is nothing to read."""
+    """A timestamp as a sortable number. 0 when there is nothing to read.
+
+    There were two of these. The other one was thirteen thousand lines above,
+    returned a float, and did not strip a trailing `Z` - so `2026-07-31T00:00:00Z`
+    read as unparseable and came back 0.0. It was dead: Python binds the later
+    definition, and every one of the five call sites is inside a function, so all
+    five already resolved to this one. Deleting it changed nothing at runtime,
+    which is the only reason it was safe to delete rather than to reconcile.
+    """
     try:
         return int(datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp())
     except (ValueError, TypeError):
@@ -18385,14 +19017,16 @@ def make_report(*, web: bool = False) -> dict:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     name = f"report-{data['at'].replace(':', '').replace('-', '')[:15]}-{data['id']}.html"
     path = REPORT_DIR / name
-    path.write_text(render_report(data), encoding="utf-8")
+    save_text(path, render_report(data))
     # The same numbers the page was rendered from, kept beside it. The solver
     # reads THIS, not a fresh survey: solving report six against the workspace
     # as it is now would answer a question about today under the heading of a
     # report taken on Tuesday, and every claim it made would be unfalsifiable.
     data_name = name[:-len(".html")] + ".json"
-    (REPORT_DIR / data_name).write_text(json.dumps(data, indent=1, sort_keys=True) + "\n",
-                                        encoding="utf-8")
+    # Not `save_json`: the solver reads this file and `indent=1` is what it was
+    # written with. Re-indenting it here would be a formatting change that
+    # arrives as a diff in every mirrored revision.
+    save_text(REPORT_DIR / data_name, json.dumps(data, indent=1, sort_keys=True) + "\n")
     rec = {"id": data["id"], "at": data["at"], "workspace": data["workspace"]["slug"],
            "file": name, "data_file": data_name, "nth": data["nth"],
            "since": (data["since"] or {}).get("id"),
@@ -18561,6 +19195,18 @@ def _report_facts(d: dict) -> str:
         fs = d["findings_summary"]
         out.append(f"\n## Findings\n- {fs['unread']} unread, of which "
                    f"{fs.get('contradicted', 0)} contradict something we believed")
+    # From the report's own numbers, not a fresh survey - the whole point of the
+    # sidecar is that a report is solved against the day it was taken. `report_data`
+    # has always put this in the dict; this is the render that was missing.
+    #
+    # `calibration_shown`, not `calibration`: this is a prompt, and a prompt only
+    # ever sees the shown half. A report taken before the split existed carries
+    # neither key, and the block is omitted rather than filled from the whole
+    # table - the solver loses one block, which is recoverable, where a held-out
+    # proposal reaching a prompt is not.
+    cal = calibration_block(d["calibration_shown"]) if d.get("calibration_shown") else ""
+    if cal:
+        out.append("\n" + cal.replace("\n# ", "\n## ").replace("# ", "## ", 1))
     return "\n".join(out)
 
 
@@ -19056,15 +19702,20 @@ def settle_contradictions() -> dict | None:
                       if f.get("bearing") == "contradicted")
     if not open_ids:
         return None
-    d = direction_store()
-    if not set(open_ids) - set(d.get("settle_tried") or []):
-        return None
     # Recorded BEFORE the call, and as the ids asked about rather than a
     # timestamp: what makes a retry pointless is that the question is the same,
     # not that it was asked recently. A call that dies partway through has still
     # been paid for and may still have settled something.
-    d["settle_tried"] = open_ids
-    _save_direction(d)
+    #
+    # Under the lock, because "have we already asked this" and "write down that
+    # we asked" have to be one step. Two of these deciding at once is the paid
+    # call happening twice, which is the thing the record exists to stop.
+    with _DIRECTION_LOCK:
+        d = direction_store()
+        if not set(open_ids) - set(d.get("settle_tried") or []):
+            return None
+        d["settle_tried"] = open_ids
+        _save_direction(d)
     out = settle_findings()
     return {"settled": len(out.get("settled") or []),
             "kept": len(out.get("kept") or []),
@@ -19120,6 +19771,75 @@ def cmd_credits(args):
     return 0
 
 
+def _mirror_holds(rel: str, sha: str | None) -> bool:
+    """Is this exact content already a revision of this document?"""
+    return sha is not None and any(
+        h["sha"] == sha for h in store.history(rel, limit=10_000))
+
+
+def _db_restore(rel: str, seq: int | None = None) -> int:
+    """Put a held revision back on disk. The one operation the mirror lacked.
+
+    Recovery already existed - `amp db show` prints the good version - but it
+    was not an operation, so under the single condition it is for (a corrupt
+    state file the console will not start past) it was a hand-editing job
+    against live state at the worst possible moment.
+
+    Three things this deliberately does:
+
+    It writes through `save_text`, so the restore is itself atomic, fsynced
+    and mirrored. A recovery that is less durable than an ordinary write is a
+    recovery that can leave you worse off than the corruption did.
+
+    It mirrors the bytes it is about to destroy, first, if the mirror has not
+    already seen them. The rule this obeys is "do not lose what is on disk",
+    and the honest way to satisfy that is to keep it, not to refuse. The
+    version that refused instead needed `--force` in exactly the case the
+    command exists for - a corrupt file nobody has swept yet - which is the
+    same as not having the command.
+    """
+    r = store.restorable(rel, seq)
+    if not r["ok"]:
+        die(r["error"])
+    path = STATE_ROOT / rel
+    if r["unchanged"]:
+        print(f"{rel} is already revision {r['seq']} byte for byte - nothing to do")
+        return 0
+
+    kept = False
+    if path.exists() and not _mirror_holds(rel, r["on_disk"]):
+        store.record(path)
+        if not _mirror_holds(rel, r["on_disk"]):
+            die(f"what is on disk at {rel} right now is not in the mirror and "
+                f"cannot be put there ({store.skipped(rel) or 'too large, or the '
+                'mirror is off'}), so this restore would destroy it with no "
+                f"copy. Move the file aside yourself first.")
+        kept = True
+
+    try:
+        text = r["body"].decode("utf-8")
+    except UnicodeDecodeError:
+        die(f"revision {r['seq']} of {rel} is not UTF-8 text; this harness "
+            "writes only text, so restoring it would not give you back a file "
+            "it wrote")
+    was = path.stat().st_size if path.exists() else None
+    save_text(path, text)
+    # After the write, and it is the reason the restore is not a silent change.
+    # A state file that moved underneath the board with no trace is precisely
+    # what this whole subsystem exists to prevent.
+    add_note(
+        f"restored {rel} from mirror revision {r['seq']} "
+        f"(written {r['written_at']}, {r['bytes']} bytes, {r['reason']})",
+        kind="restore")
+    print(f"restored {rel} from revision {r['seq']} ({r['reason']})")
+    print(f"  written {r['written_at']}, {r['bytes']} bytes"
+          + (f", replacing {was} bytes on disk" if was is not None else ", disk had no file"))
+    if kept:
+        print("  the bytes that were on disk were not in the mirror; "
+              "they are now, and can be restored back")
+    return 0
+
+
 def cmd_db(args):
     """The mirror from a terminal, so a backup never needs the console running."""
     if args.sub == "status":
@@ -19128,6 +19848,14 @@ def cmd_db(args):
         if not s["exists"]:
             print("  not created yet - run `amp db backup`")
             return 0
+        if not s.get("ok"):
+            # A file this build refuses to open has no document count, and
+            # every line below would raise reaching for one. The exit code is
+            # non-zero because a script asking after the backup should be able
+            # to tell "there isn't one" from "here it is".
+            print(f"  ! {s.get('error') or 'cannot read the database'}")
+            return 1
+        print(f"  schema {s['schema_db']} in the file, {s['schema_code']} in this build")
         print(f"  {s['docs']} documents, {s['revisions']} revisions, "
               f"{s['bytes'] / 1e6:.2f} MB on disk")
         print(f"  mirror {'on' if s['settings']['mirror'] == '1' else 'OFF'}, "
@@ -19146,10 +19874,16 @@ def cmd_db(args):
     if args.sub == "verify":
         v = store.verify()
         print(f"{v['current']} current, {len(v['stale'])} stale, "
-              f"{len(v['missing'])} not mirrored, {len(v['held'])} held after deletion")
+              f"{len(v['missing'])} not mirrored, {len(v['held'])} held after deletion, "
+              f"{len(v['too_large'])} too large to mirror")
         for label, rows in (("stale", v["stale"]), ("missing", v["missing"])):
             for rel in rows[:20]:
                 print(f"  {label:<8} {rel}")
+        # Said last and in its own words, because the two lines above mean
+        # "sweep again" and this one means "sweeping will not help".
+        for t in v["too_large"][:20]:
+            print(f"  too big  {t['path']} - {t['bytes'] / 1e6:.1f} MB, "
+                  f"cap {t['cap'] / 1e6:.0f} MB")
         return 0 if v["clean"] else 1
     if args.sub == "prune":
         r = store.prune(args.keep)
@@ -19169,6 +19903,8 @@ def cmd_db(args):
                 + (f" revision {args.seq}" if args.seq else ""))
         sys.stdout.write(b.decode(errors="replace"))
         return 0
+    if args.sub == "restore":
+        return _db_restore(args.path, args.seq)
     if args.sub == "history":
         rows = store.history(args.path, args.limit)
         if not rows:
@@ -19292,6 +20028,10 @@ def main(argv=None):
     sh = dbs.add_parser("show", help="print a held document (does not write disk)")
     sh.add_argument("path")
     sh.add_argument("--seq", type=int, help="a revision, default the current one")
+    rs = dbs.add_parser("restore", help="put a held revision back on disk")
+    rs.add_argument("path", help="path relative to the state root, e.g. .board.json")
+    rs.add_argument("--seq", type=int,
+                    help="a revision; default is the newest one that differs from disk")
     dbp.set_defaults(func=cmd_db)
 
     args = p.parse_args(argv)

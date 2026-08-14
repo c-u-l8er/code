@@ -28,8 +28,20 @@ const state = {
   specRounds: {},
 };
 
+// Put into the page by the server as it served index.html. Read once: the
+// element is in the document the server sent, so a later DOM edit cannot
+// change what this page authenticates as.
+const AMP_TOKEN = document.querySelector('meta[name="amp-token"]')?.content || '';
+
 async function api(path, opts) {
-  const r = await fetch(path, opts);
+  const o = { ...(opts || {}) };
+  // Sent on every call including GET, because the reads are the board, the
+  // worker transcripts and the architect's rulings. The browser holds no copy
+  // of the rule that decides whether this is enough - it sends the header and
+  // the server alone decides, the same way the Adopt button posts plainly and
+  // only arms an override after the server has refused.
+  o.headers = { ...(o.headers || {}), 'X-Amp-Token': AMP_TOKEN };
+  const r = await fetch(path, o);
   return r.json();
 }
 const post = (path, body) =>
@@ -488,7 +500,14 @@ function renderDb(d) {
       `<div class="dbrow"><span class="k">change number</span>${d.cursor}` +
       ` <span class="muted">— a sync would resume from here</span></div>` +
       `<div class="dbrow"><span class="k">never stored</span><span class="v">` +
-      `${(d.excluded || []).map((e) => `<code>${esc(e)}</code>`).join('')}</span></div>`
+      `${(d.excluded || []).map((e) => `<code>${esc(e)}</code>`).join('')}</span></div>` +
+      // Both numbers, always, including when they agree. A field shown only on
+      // disagreement is a field nobody can check is working.
+      `<div class="dbrow"><span class="k">schema</span>` +
+      `${d.schema_db === d.schema_code
+        ? `${d.schema_code} <span class="muted">— the file and this build agree</span>`
+        : `<span class="err">file says ${esc(String(d.schema_db))}, this build ` +
+          `knows ${esc(String(d.schema_code))}</span>`}</div>`
     : '<span class="muted">Nothing to describe until the database exists.</span>';
 }
 
@@ -543,6 +562,20 @@ async function dbVerify() {
       (rows.length > 12 ? `<span class="muted">+${rows.length - 12} more</span>` : '') +
       '</span></div>'
     : '';
+  // Over the size cap. Reported apart from `not copied` because that line
+  // means "sweep again" and this one means "sweeping will not help" - which
+  // is the whole reason it is a verdict of its own. The size is shown next to
+  // the cap so the reader can see how far over it is without going to look.
+  const mb = (n) => `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  const big = (v.too_large || []).length
+    ? `<div class="dbrow"><span class="k">too large to copy</span><span class="v">` +
+      (v.too_large || []).slice(0, 12).map((t) =>
+        `<code>${esc(t.path)}</code> <span class="muted">${mb(t.bytes)} ` +
+        `of ${mb(t.cap)}</span>`).join('') +
+      ((v.too_large || []).length > 12
+        ? `<span class="muted">+${v.too_large.length - 12} more</span>` : '') +
+      '</span></div>'
+    : '';
   dbReport(
     `<div class="dbrow"><span class="k">matching</span>${v.current} files</div>` +
     list('changed since', v.stale) +
@@ -550,7 +583,14 @@ async function dbVerify() {
     // Not a fault. A file that is gone from disk but still held here is the
     // reason the database exists, so it is reported in its own words.
     list('kept after being deleted', v.held) +
-    (v.clean ? '<div class="dbrow good">The copy is current.</div>' : ''),
+    big +
+    (v.clean
+      ? (big
+        // Both facts, in one sentence. "The copy is current" on its own would
+        // be read as "everything is copied", and these files are not.
+        ? '<div class="dbrow good">Everything the copy can hold is current.</div>'
+        : '<div class="dbrow good">The copy is current.</div>')
+      : ''),
     v.clean ? 'good' : '');
 }
 
@@ -2037,6 +2077,49 @@ function calBlock(c, bar) {
     (bands ? `<div class="calrow">${bands}</div>` : '') + `</div>`;
 }
 
+/** The Δ between the half the scorer is shown and the half it never sees.
+ *
+ *  The block above is what the scorer is told about its own accuracy, so every
+ *  number in it is measured on data the scorer was shown. It cannot tell a
+ *  scorer that got better from one that learned to restate the table. One
+ *  proposal in four is kept out of that block for exactly this comparison, and
+ *  the gap between the two is the only number here that is not self-reported.
+ *
+ *  A half too small to divide says so. A percentage resting on three cases
+ *  invites the confidence it cannot support, and this screen is where that
+ *  confidence would be spent. */
+function calSplit(s) {
+  if (!s || !s.measures) return '';
+  const unit = (v, u) => u === 'usd'
+    ? `${v >= 0 ? '+' : '−'}$${Math.abs(v).toFixed(2)}`
+    : `${v >= 0 ? '+' : '−'}${Math.abs(Math.round(v * 100))}%`;
+  const rows = s.measures.map((m) => {
+    const name = `<i>${esc(m.name)}</i>`;
+    if (m.short)
+      return `<span class="calb dim">${name} not enough in ${esc(m.short)} ` +
+        `— shown ${m.shown_n}, held ${m.held_n}, need ${s.min_n} each</span>`;
+    // Positive means the held-out half is further off than the shown half:
+    // the block is flattering the scorer. Negative is NOT better than zero and
+    // is not drawn as though it were — it means the scorer does worse on what
+    // it was shown, which is not what improvement looks like.
+    const big = m.delta >= 0.1;
+    return `<span class="calb${big ? ' bad' : ''}">${name} shown ` +
+      `${unit(m.shown_gap, m.unit)} off, held out ${unit(m.held_gap, m.unit)} off ` +
+      `· Δ ${unit(m.delta, m.unit)} · ${m.shown_n}/${m.held_n}</span>`;
+  }).join('');
+  // A lane living entirely on one side makes the headline a statement about
+  // which lanes settled, not about the scoring. It is invisible in the totals,
+  // so it is said here.
+  const lop = (s.lopsided || []).length
+    ? `<div class="calrow muted">only one side has anything from: ` +
+      `${s.lopsided.map(esc).join(', ')} — so far the Δ is partly about which ` +
+      `lanes settled, not only about the scoring</div>`
+    : '';
+  return `<div class="cal split"><span class="sl">1 in ${s.holdout} of these is ` +
+    `kept out of the scorer's prompt, so there is something to check it against` +
+    `</span>${rows}${lop}</div>`;
+}
+
 /** The sharpen button, labelled with the odds that pressing it changes anything.
  *  That number is the whole reason `headroom` is scored: without it the choice
  *  between two held proposals is a coin toss, and half the calls buy nothing. */
@@ -2300,6 +2383,7 @@ function renderDirection(d) {
     `<section class="dsec"><h4>Where there is left to go</h4>` +
     exploreBar(d) +
     calBlock(d.calibration, bar) +
+    calSplit(d.calibration_split) +
     (props || '<div class="empty">No proposals. One appears when a goal finishes and the ' +
       'architect judges the lane has somewhere left to travel — or when you go looking ' +
       'above.</div>') +
