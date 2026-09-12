@@ -45,7 +45,7 @@
 // repositories and deploy on their own schedule, so "does this site know about
 // T&R yet" is a question that gets asked from a browser console, and a stale
 // version number is the one thing that makes it unanswerable.
-const VERSION = "0.12.2";
+const VERSION = "0.12.3";
 
 // The wordmark in the bar's brand link. Named rather than typed inline because
 // the placement band suppresses itself against it (see `renderPlacement`), and
@@ -506,16 +506,16 @@ const LINKS = {
   // no subset denominator to fix. Read from the page, 2026-08-15.
   arith_playground: {
     label: "Playground",
-    tagline: "The 103-law core suite, run live in your browser",
+    tagline: "The 109-law core suite, run live in your browser",
     href: "https://opensentience.org/playground.html",
   },
 
-  // Research / Runtime — OS-001..011 protocol family
+  // Research / Runtime — OS-001..012 protocol family
   opensentience: {
     label: "OpenSentience",
-    tagline: "11 open research protocols",
+    tagline: "12 open research protocols",
     href: "https://opensentience.org",
-    status: "11 protocols",
+    status: "12 protocols",
     tier: "shipped",
   },
   // `kappa` (an anchor, opensentience.org/#kappa) was deleted 2026-08-22. It was in no menu and
