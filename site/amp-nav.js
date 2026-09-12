@@ -45,7 +45,7 @@
 // repositories and deploy on their own schedule, so "does this site know about
 // T&R yet" is a question that gets asked from a browser console, and a stale
 // version number is the one thing that makes it unanswerable.
-const VERSION = "0.12.1";
+const VERSION = "0.12.2";
 
 // The wordmark in the bar's brand link. Named rather than typed inline because
 // the placement band suppresses itself against it (see `renderPlacement`), and
@@ -528,8 +528,22 @@ const LINKS = {
   // Only the six PROVED invariants get a proof page; the table holds all 43.
   invariants: {
     label: "Periodic Table of Invariants",
-    tagline: "43 agent invariants, by family",
-    href: "https://opensentience.org/invariants.html",
+    // 2026-09-13: the tagline said "43 agent invariants, by family" and the page says 46 cells,
+    // grouped by evidentiary register since v0.8. Both halves were stale and nothing here could
+    // notice: this file has no build step, so a count typed in it is a count that drifts alone.
+    // The replacement carries no number for that reason. The href lost its `.html` in the same
+    // pass — Pages 308s it to the clean URL, so every visitor was taking a redirect.
+    tagline: "The agent invariants, by evidentiary register",
+    href: "https://opensentience.org/invariants",
+  },
+  // Sits beside `invariants`: the same site, the same discipline, a different object. The table
+  // records invariants; the catalog records reusable shapes that CITE them, with what each does
+  // not establish, what its prior art shares and differs from, and a standing derived on every
+  // build rather than typed. No count here, for the reason given above it.
+  unboxed_patterns: {
+    label: "Unboxed Patterns",
+    tagline: "A governed pattern catalog — each one says what it does not establish",
+    href: "https://opensentience.org/patterns/",
   },
   // Sits beside `invariants` on purpose, and NOT under Compose. Compose means
   // "capabilities you combine into an agent system" and its Runtime column
@@ -1241,7 +1255,7 @@ const CATEGORIES = [
     columns: [
       {
         label: "Open research",
-        items: ["opensentience", "invariants", "a2atraffic", "topology_warrant", "weave"],
+        items: ["opensentience", "invariants", "unboxed_patterns", "a2atraffic", "topology_warrant", "weave"],
       },
       {
         label: "Results",
